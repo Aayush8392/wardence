@@ -1,0 +1,13 @@
+# Private working notes -- never committed
+wardence_context.md
+wardence_buildlog.md
+wardence_guide.html
+reviews/
+
+# Python
+p2_readonly_loop/venv/
+__pycache__/
+*.pyc
+
+# Stale local DB folder from before the DB moved to WSL2's native filesystem
+p2_readonly_loop/output/
