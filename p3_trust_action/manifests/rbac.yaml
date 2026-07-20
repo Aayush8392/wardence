@@ -1,0 +1,45 @@
+# Blast-radius cage for the Wardence agent.
+# Scoped to the sock-shop namespace only. No delete, no exec, no create —
+# anywhere. If a fix action isn't achievable with get/list/patch/scale,
+# it isn't a fix action this agent is allowed to have.
+
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wardence-agent
+  namespace: sock-shop
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wardence-agent-role
+  namespace: sock-shop
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets"]
+    verbs: ["get", "list", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale", "statefulsets/scale", "replicasets/scale"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["configmaps", "services"]
+    verbs: ["get", "list", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wardence-agent-binding
+  namespace: sock-shop
+subjects:
+  - kind: ServiceAccount
+    name: wardence-agent
+    namespace: sock-shop
+roleRef:
+  kind: Role
+  name: wardence-agent-role
+  apiGroup: rbac.authorization.k8s.io
