@@ -21,7 +21,6 @@ Usage:
 
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import jwt
@@ -29,19 +28,18 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import sqlite3  # noqa: E402
+
 from auth import decode_token  # noqa: E402
 from trust_engine import (  # noqa: E402
     CAN_ACT,
     DB_PATH,
     DEMOTED,
-    REPORT_ONLY,
+    PROMOTION_STREAK,
     ensure_trust_tables,
     get_trust_state,
     manual_set_state,
-    PROMOTION_STREAK,
 )
-
-import sqlite3  # noqa: E402
 
 app = FastAPI()
 

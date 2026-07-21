@@ -272,7 +272,8 @@ def _kill_main_process(pod_name: str, namespace: str, container: str, kill_patte
         text=True,
     )
     if result.returncode == 1:
-        print(f"    (pkill found no process matching '{kill_pattern}' in {pod_name} -- may be mid-restart, or the pattern may be stale)")
+        print(f"    (pkill found no process matching '{kill_pattern}' in {pod_name} "
+              f"-- may be mid-restart, or the pattern may be stale)")
         return False
     return result.returncode == 0
 
@@ -479,7 +480,8 @@ def _inject_and_verify_disk_full(cfg: dict) -> bool:
             _cleanup_disk_full_files(cfg["target"], cfg["namespace"], cfg["container"])
         if verified:
             return True
-        print(f"  attempt {attempt}: no eviction/pod-churn detected, retrying" if attempt < MAX_INJECT_ATTEMPTS else f"  attempt {attempt}: no eviction/pod-churn detected")
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: no eviction/pod-churn detected{suffix}")
     return False
 
 
@@ -491,7 +493,8 @@ def _inject_and_verify_crash_loop(cfg: dict) -> bool:
         verified = _verify_crash_loop_effect(cfg["target"], cfg["namespace"], baseline_restarts)
         if verified:
             return True
-        print(f"  attempt {attempt}: no restart detected, retrying" if attempt < MAX_INJECT_ATTEMPTS else f"  attempt {attempt}: no restart detected")
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: no restart detected{suffix}")
     return False
 
 
@@ -519,7 +522,8 @@ def _inject_and_verify_chaos_mesh(fault_class: str, cfg: dict, manifest_builder)
             delete_chaos_resource(chaos_kind, chaos_name)
         if verified:
             return chaos_name
-        print(f"  attempt {attempt}: no restart detected, retrying" if attempt < MAX_INJECT_ATTEMPTS else f"  attempt {attempt}: no restart detected")
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: no restart detected{suffix}")
     return None
 
 

@@ -1,0 +1,72 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  unit:
+    # No cluster needed -- trust_engine.py and circuit_breaker.py are
+    # pure SQLite logic, using throwaway TEST_CLASS names so they never
+    # touch real trust state. Safe to run on every push/PR.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: mkdir -p ~/wardence_p2_data
+      - run: python p3_trust_action/test_trust_engine.py
+      - run: python p3_trust_action/test_circuit_breaker.py
+
+  integration:
+    # Real k3d cluster -- manual trigger only (see wardence_buildlog.md
+    # for why: free tier is 2,000 CI minutes/month on this private repo,
+    # and this job is the expensive one).
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r p3_trust_action/requirements.txt
+      - uses: azure/setup-kubectl@v4
+
+      - name: Create k3d cluster
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+          k3d cluster create wardence-ci --wait
+
+      - name: Deploy Sock Shop
+        run: |
+          kubectl create namespace sock-shop
+          kubectl apply -n sock-shop -f https://raw.githubusercontent.com/microservices-demo/microservices-demo/master/deploy/kubernetes/complete-demo.yaml
+          kubectl wait --for=condition=Ready pods --all -n sock-shop --timeout=300s
+
+      - name: Fix session-db persistence (see wardence_buildlog.md 2026-07-21)
+        run: |
+          kubectl patch deployment session-db -n sock-shop --type=json -p \
+            '[{"op":"add","path":"/spec/template/spec/containers/0/args","value":["redis-server","--save",""]}]'
+          kubectl rollout status deployment/session-db -n sock-shop --timeout=120s
+
+      - name: Apply blast-radius cage RBAC
+        run: kubectl apply -f p3_trust_action/manifests/rbac.yaml
+
+      - name: Mint short-lived SA token
+        run: |
+          kubectl create token wardence-agent -n sock-shop --duration=1h \
+            > p3_trust_action/sa_token.txt
+
+      - run: mkdir -p ~/wardence_p2_data
+
+      - name: Cage enforcement test
+        run: python p3_trust_action/test_cage.py
+
+      # test_fix_and_verify.py and the 3-episode crash-loop smoke run
+      # need Chaos Mesh + Prometheus + the full episode pipeline wired
+      # up -- deliberately left as a next step once this base cluster
+      # job is confirmed working, not built blind in the same pass.
