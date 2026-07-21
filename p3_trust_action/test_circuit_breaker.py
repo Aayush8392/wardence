@@ -9,7 +9,6 @@ import sys
 sys.path.insert(0, "p3_trust_action")
 
 from circuit_breaker import (  # noqa: E402
-    check_circuit_breaker,
     ensure_circuit_breaker_table,
     record_failure,
 )
@@ -45,8 +44,7 @@ assert state["state"] == CAN_ACT
 
 print("\n-- recording 3 failures, checking breaker after each --")
 for i in range(3):
-    record_failure(conn, reason="test failure", fault_class=TEST_CLASS)
-    result = check_circuit_breaker(conn)
+    result = record_failure(conn, reason="test failure", fault_class=TEST_CLASS)
     print(i + 1, result)
 
 final_state = get_trust_state(conn, TEST_CLASS)
