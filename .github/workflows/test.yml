@@ -66,7 +66,38 @@ jobs:
       - name: Cage enforcement test
         run: python p3_trust_action/test_cage.py
 
-      # test_fix_and_verify.py and the 3-episode crash-loop smoke run
-      # need Chaos Mesh + Prometheus + the full episode pipeline wired
-      # up -- deliberately left as a next step once this base cluster
-      # job is confirmed working, not built blind in the same pass.
+      # Chaos Mesh is NOT needed here -- crash-loop is exec-based
+      # (kubectl exec ... pkill) since the bug fixed this session, not
+      # Chaos Mesh's container-kill. Only Prometheus is required for
+      # test_fix_and_verify.py's durability check and the agent's
+      # diagnosis tool.
+      - uses: azure/setup-helm@v4
+
+      - name: Install a trimmed kube-prometheus-stack
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm install monitoring prometheus-community/kube-prometheus-stack \
+            -n monitoring --create-namespace \
+            --set grafana.enabled=false \
+            --set alertmanager.enabled=false \
+            --wait --timeout 300s
+
+      - name: Port-forward Prometheus (background)
+        run: |
+          kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090 &
+          sleep 5
+
+      - name: Fix-and-verify test (real fix, real durability window)
+        run: python p3_trust_action/test_fix_and_verify.py
+
+      - name: Start P2 diagnose agent (background)
+        run: |
+          cd p2_readonly_loop
+          uvicorn agent:app --port 8000 &
+          sleep 5
+
+      - name: 3-episode crash-loop smoke run
+        run: |
+          cd p2_readonly_loop
+          python run_episodes.py --class crash-loop 3
