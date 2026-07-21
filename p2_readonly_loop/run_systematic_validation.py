@@ -110,7 +110,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-
 from injector import (
     FAULT_CONFIG,
     _cleanup_disk_full_files,
@@ -557,7 +556,8 @@ def main():
         if result is None:
             checkpoint["resume_index"] = original_index
             save_checkpoint(checkpoint)
-            print("Stopping -- a script crashed (not a wrong-verdict case). Resume by re-running -- starts right back at this pair.")
+            print("Stopping -- a script crashed (not a wrong-verdict case). "
+                  "Resume by re-running -- starts right back at this pair.")
             sys.exit(1)
         if result is False:
             checkpoint["resume_index"] = original_index
