@@ -36,11 +36,21 @@ def ensure_circuit_breaker_table(conn: sqlite3.Connection):
     conn.commit()
 
 
-def record_failure(conn: sqlite3.Connection, reason: str, fault_class: str | None = None):
+def record_failure(conn: sqlite3.Connection, reason: str, fault_class: str | None = None) -> dict:
+    """
+    Records the failure AND checks/trips the breaker in the same call.
+    Originally these were two separate calls (record here, check later
+    in the caller) -- if the caller crashed or raised anything in
+    between, the failure was logged but the breaker never got checked
+    for it, silently delaying a trip until some unrelated later
+    episode's scorer run happened to check again. Collapsing them here
+    removes that gap entirely.
+    """
     conn.execute(
         "INSERT INTO failure_log (reason, fault_class) VALUES (?, ?)", (reason, fault_class)
     )
     conn.commit()
+    return check_circuit_breaker(conn)
 
 
 def _recent_failure_count(conn: sqlite3.Connection) -> int:

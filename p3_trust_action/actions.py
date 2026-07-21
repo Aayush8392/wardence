@@ -106,7 +106,10 @@ def patch_memory_limit(
 
 
 def scale_deployment(name: str, replicas: int, namespace: str = DEFAULT_NAMESPACE) -> dict:
-    """Fix for disk-full (ephemeral): scale to 0 then back up to clear ephemeral storage."""
+    """Low-level primitive: one scale call to a given replica count. NOT
+    a disk-full fix by itself -- see restore_from_disk_full below, which
+    composes two calls (0, then back up) since that's what actually
+    clears a pod's ephemeral-storage breach."""
     api = _apps_v1()
     body = {"spec": {"replicas": replicas}}
 
@@ -149,6 +152,39 @@ def scale_deployment(name: str, replicas: int, namespace: str = DEFAULT_NAMESPAC
     }
 
 
+def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replicas: int = 1) -> dict:
+    """
+    Fix for disk-full: a single scale call clears nothing -- the pod's
+    writable layer (where the ephemeral-storage breach actually lives)
+    only gets wiped when the pod itself is replaced. Scaling to 0 then
+    back up forces exactly that: the old pod (and its full disk) is
+    deleted, the new one starts clean. Composes scale_deployment rather
+    than duplicating its dry-run/apply logic.
+    """
+    scale_down = scale_deployment(name, 0, namespace)
+    if not scale_down["applied"]:
+        return {
+            "action": "restore_from_disk_full",
+            "target": name,
+            "namespace": namespace,
+            "applied": False,
+            "error": f"scale-to-0 failed: {scale_down.get('error')}",
+            "scale_down": scale_down,
+            "scale_up": None,
+        }
+
+    scale_up = scale_deployment(name, replicas, namespace)
+    return {
+        "action": "restore_from_disk_full",
+        "target": name,
+        "namespace": namespace,
+        "applied": scale_up["applied"],
+        "error": scale_up.get("error"),
+        "scale_down": scale_down,
+        "scale_up": scale_up,
+    }
+
+
 # Fixed, named allowlist -- this dict IS the cage at the code level.
 # The trust engine and agent must only ever call through here, never
 # import the functions above directly, and never construct free-form
@@ -157,4 +193,5 @@ ALLOWED_ACTIONS = {
     "restart_deployment": restart_deployment,
     "patch_memory_limit": patch_memory_limit,
     "scale_deployment": scale_deployment,
+    "restore_from_disk_full": restore_from_disk_full,
 }

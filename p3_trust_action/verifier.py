@@ -4,11 +4,9 @@ durability window closes clean. If the fault reappears at any point
 during the window, the fix counts as WRONG (flapped) even if it looked
 fixed right after the action ran.
 
-Only crash-loop's "still faulty" check is implemented so far, reusing
-the same PromQL proven in p2_readonly_loop/agent.py. OOM and disk-full
-checks are stubbed until those fix actions are actually built and their
-detection logic is sanity-checked the same way crash-loop's was in P2
-(see wardence_buildlog.md -- container-kill vs pod-kill correction).
+crash-loop, oom, and disk-full "still faulty" checks are all
+implemented. disk-full's check is structurally different from the
+other two -- see _make_disk_full_check.
 """
 
 import time
@@ -52,6 +50,29 @@ def _current_pod_name(target: str, namespace: str) -> str:
     return pod_names[-1]
 
 
+BASELINE_CAPTURE_RETRY_S = 30
+BASELINE_CAPTURE_POLL_S = 5
+
+
+def _current_pod_name_with_retry(target: str, namespace: str) -> str:
+    """
+    scale_deployment (disk-full's fix) scales to 0 then back up -- there's
+    a real window with zero Running pods. Calling _current_pod_name
+    uncaught at baseline capture would crash the verifier (and the
+    scorer, unhandled) the first time a disk-full auto-fix runs. Retries
+    for up to BASELINE_CAPTURE_RETRY_S before giving up for real.
+    """
+    elapsed = 0
+    while True:
+        try:
+            return _current_pod_name(target, namespace)
+        except RuntimeError:
+            if elapsed >= BASELINE_CAPTURE_RETRY_S:
+                raise
+            time.sleep(BASELINE_CAPTURE_POLL_S)
+            elapsed += BASELINE_CAPTURE_POLL_S
+
+
 def _restart_count(pod_name: str, namespace: str) -> int:
     query = f'kube_pod_container_status_restarts_total{{namespace="{namespace}", pod="{pod_name}"}}'
     resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
@@ -84,12 +105,90 @@ def _make_crash_loop_check(pod_name: str, baseline_restarts: int):
     return check
 
 
-def _oom_still_faulty(target: str, namespace: str) -> bool:
-    raise NotImplementedError("OOM fix action + detection not built yet")
+def _make_oom_check(pod_name: str, baseline_restarts: int):
+    """
+    Originally also checked last_terminated_reason="OOMKilled" as a
+    fallback signal, same shape as the crash-loop check. Dropped after
+    mixed-class validation exposed why that's actually dangerous here:
+    last_terminated_reason is a gauge with no expiry -- it stays
+    "OOMKilled" until the SAME pod/container terminates again for a
+    different reason. A resource-limit patch fix (patch_memory_limit)
+    doesn't clear it, so every real OOM auto-fix would false-positive
+    as "flapped" on the very first poll, even when the fix genuinely
+    worked. Restart-count-vs-baseline alone is sufficient and doesn't
+    have this staleness problem -- it only trips on an ACTUAL new
+    restart since the durability window started.
+    """
+
+    def check(target: str, namespace: str) -> bool:
+        return _restart_count(pod_name, namespace) > baseline_restarts
+
+    return check
 
 
-def _disk_full_still_faulty(target: str, namespace: str) -> bool:
-    raise NotImplementedError("disk-full fix action + detection not built yet")
+def _evicted_recently(target: str, namespace: str) -> bool:
+    """
+    Time-bounded to pods EVICTED (not just created) in the last 3
+    minutes. Went through two wrong fixes before this one:
+      1. Bounded on kube_pod_created (pod age) -- wrong: a pod can run
+         healthy for a long time before being evicted, so its creation
+         time can be old even though the eviction just happened,
+         incorrectly excluding a genuine fresh eviction (proven wrong
+         empirically: disk-full false-negatived 5/5 in a mixed
+         validation run with that bound).
+      2. Bounded on kube_pod_deletion_timestamp -- also wrong,
+         empirically: queried this directly against genuinely-just-
+         evicted pods and it returned nothing at all, even though
+         status_reason clearly showed "Evicted". Eviction on this
+         cluster doesn't reliably populate that field.
+    Landed on: bound by whether the CURRENT Running pod for this
+    target was created recently, instead of trusting the evicted pod's
+    own metadata at all. A fresh healthy replacement pod existing is
+    itself direct evidence a churn just happened. Same fix applied to
+    agent.py's evicted_query -- see that file for the full derivation.
+    """
+    evicted_query = (
+        f'kube_pod_status_reason{{namespace="{namespace}", '
+        f'pod=~"{target}.*", reason="Evicted"}} == 1'
+    )
+    evicted_resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": evicted_query}, timeout=10)
+    evicted_resp.raise_for_status()
+    if not evicted_resp.json()["data"]["result"]:
+        return False
+
+    recent_running_pod_query = (
+        f'(kube_pod_status_phase{{namespace="{namespace}", pod=~"{target}.*", phase="Running"}} == 1) '
+        f'and on(namespace, pod) ((time() - kube_pod_created'
+        f'{{namespace="{namespace}", pod=~"{target}.*"}}) < 180)'
+    )
+    recent_resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": recent_running_pod_query}, timeout=10)
+    recent_resp.raise_for_status()
+    return len(recent_resp.json()["data"]["result"]) > 0
+
+
+def _make_disk_full_check(baseline_pod_name: str):
+    """
+    disk-full doesn't restart a container in place like crash-loop/oom --
+    an ephemeral-storage breach makes kubelet EVICT the whole pod, and
+    the ReplicaSet creates a brand-new pod object to replace it. There's
+    no single pod identity to accumulate a restart count on, so this
+    checks for the Evicted status reason directly, falling back to pod
+    IDENTITY CHURN (a different pod name than the one resolved when the
+    durability window started) in case Prometheus's scrape missed the
+    Evicted status before the pod object was already replaced.
+    """
+
+    def check(target: str, namespace: str) -> bool:
+        if _evicted_recently(target, namespace):
+            return True
+        try:
+            current_pod_name = _current_pod_name(target, namespace)
+        except RuntimeError:
+            # no Running pod right now -- mid eviction/recreation, treat as still faulty
+            return True
+        return current_pod_name != baseline_pod_name
+
+    return check
 
 
 def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop") -> dict:
@@ -105,13 +204,16 @@ def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop
         raise ValueError(f"no durability window defined for fault class '{fault_class}'")
 
     if fault_class == "crash-loop":
-        pod_name = _current_pod_name(target, namespace)
+        pod_name = _current_pod_name_with_retry(target, namespace)
         baseline = _restart_count(pod_name, namespace)
         check_fn = _make_crash_loop_check(pod_name, baseline)
     elif fault_class == "oom":
-        check_fn = _oom_still_faulty
+        pod_name = _current_pod_name_with_retry(target, namespace)
+        baseline = _restart_count(pod_name, namespace)
+        check_fn = _make_oom_check(pod_name, baseline)
     elif fault_class == "disk-full":
-        check_fn = _disk_full_still_faulty
+        baseline_pod_name = _current_pod_name_with_retry(target, namespace)
+        check_fn = _make_disk_full_check(baseline_pod_name)
 
     window_s = DURABILITY_WINDOWS[fault_class]
     elapsed = 0

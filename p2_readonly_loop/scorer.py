@@ -56,7 +56,11 @@ def get_unscored_episode(conn: sqlite3.Connection):
 
 
 def diagnosis_matches(predicted: str, actual: str) -> bool:
-    return predicted.strip().lower() == actual.strip().lower()
+    predicted = predicted.strip().lower()
+    actual = actual.strip().lower()
+    if actual == "none":
+        return predicted == "no anomaly detected"
+    return predicted == actual
 
 
 def main():

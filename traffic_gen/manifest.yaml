@@ -1,0 +1,49 @@
+# Wardence traffic generator -- runs continuously in sock-shop so
+# metrics/logs stay alive for the replay viewer (P4) and the future
+# DL detector (P5) has real "normal" traffic to learn from.
+#
+# Uses the official grafana/k6 image (no custom image build needed,
+# consistent with the project's off-the-shelf-pieces approach) with
+# the scripts mounted from a ConfigMap.
+#
+# The ConfigMap is NOT defined here as inline YAML -- baseline.js/
+# burst.js/run.sh stay the source of truth as plain files, and the
+# ConfigMap is generated straight from them so it can never drift out
+# of sync. Create/refresh it with:
+#   kubectl create configmap wardence-traffic-gen-scripts \
+#     -n sock-shop \
+#     --from-file=baseline.js=traffic_gen/baseline.js \
+#     --from-file=burst.js=traffic_gen/burst.js \
+#     --from-file=run.sh=traffic_gen/run.sh \
+#     --dry-run=client -o yaml | kubectl apply -f -
+# Then apply this file for the Deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wardence-traffic-gen
+  namespace: sock-shop
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: wardence-traffic-gen
+  template:
+    metadata:
+      labels:
+        app: wardence-traffic-gen
+    spec:
+      containers:
+        - name: k6
+          image: grafana/k6:latest
+          command: ["/bin/sh", "/scripts/run.sh"]
+          env:
+            - name: TARGET_URL
+              value: "http://front-end.sock-shop.svc.cluster.local"
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+      volumes:
+        - name: scripts
+          configMap:
+            name: wardence-traffic-gen-scripts
+            defaultMode: 0755

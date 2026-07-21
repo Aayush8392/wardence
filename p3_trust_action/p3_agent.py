@@ -43,9 +43,36 @@ stub_diagnose = _p2_agent.stub_diagnose
 
 app = FastAPI()
 
-# predicted diagnosis string -> (fault_class key, action name, action kwargs builder)
+# Extra static params each fix needs beyond the request's own
+# target/namespace -- container+new limit for oom, target replica count
+# for disk-full. Deliberately NOT shared with p2/injector.py's
+# FAULT_CONFIG: these are FIX-side details, injector.py and the blinded
+# diagnosis agent should never know about them.
+FIX_PARAMS = {
+    "oom": {"container": "catalogue", "limit": "400Mi"},  # catalogue's original limit is 200Mi
+    "disk-full": {"replicas": 1},
+}
+
+# predicted diagnosis string -> (fault_class key, action name, action kwargs builder).
+# kwargs builders take (target, namespace) -- crash-loop's only ever needed
+# target, but oom/disk-full's actions need extra fixed params from
+# FIX_PARAMS too, so all three take the same two args for consistency.
 ACTION_MAP = {
-    "crash-loop": ("crash-loop", "restart_deployment", lambda target: {"name": target}),
+    "crash-loop": (
+        "crash-loop",
+        "restart_deployment",
+        lambda target, namespace: {"name": target, "namespace": namespace},
+    ),
+    "oom": (
+        "oom",
+        "patch_memory_limit",
+        lambda target, namespace: {"name": target, "namespace": namespace, **FIX_PARAMS["oom"]},
+    ),
+    "disk-full": (
+        "disk-full",
+        "restore_from_disk_full",
+        lambda target, namespace: {"name": target, "namespace": namespace, **FIX_PARAMS["disk-full"]},
+    ),
 }
 
 
@@ -86,7 +113,7 @@ def handle(req: HandleRequest):
         return response
 
     action_fn = ALLOWED_ACTIONS[action_name]
-    action_result = action_fn(**kwargs_fn(req.target))
+    action_result = action_fn(**kwargs_fn(req.target, req.namespace))
     response["action_taken"] = action_name
     response["action_result"] = action_result
 

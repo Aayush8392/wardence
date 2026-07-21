@@ -30,11 +30,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from circuit_breaker import (  # noqa: E402
-    check_circuit_breaker,
-    ensure_circuit_breaker_table,
-    record_failure,
-)
+from circuit_breaker import ensure_circuit_breaker_table, record_failure  # noqa: E402
 from trust_engine import DB_PATH, PROMOTION_STREAK, ensure_trust_tables, record_outcome  # noqa: E402
 from verifier import verify_durability  # noqa: E402
 
@@ -115,17 +111,20 @@ def main():
     durability_verdict = None
     trust_correct = None
 
+    breaker_result = None
     if action_taken is not None:
         # An action was taken -- the trust state was Can-Act at handle time.
         if not diagnosis_correct or not action_applied:
             trust_correct = False
-            record_failure(conn, reason="action failed or misdiagnosed", fault_class=actual_class)
+            breaker_result = record_failure(
+                conn, reason="action failed or misdiagnosed", fault_class=actual_class
+            )
         else:
             verdict = verify_durability(actual_class, target, namespace)
             durability_verdict = verdict["verdict"]
             trust_correct = durability_verdict == "confirmed"
             if not trust_correct:
-                record_failure(conn, reason="fix flapped", fault_class=actual_class)
+                breaker_result = record_failure(conn, reason="fix flapped", fault_class=actual_class)
     elif actual_class in PROMOTION_STREAK:
         # Report-Only (or Demoted) auto-fix class: diagnosis-only track record.
         trust_correct = diagnosis_correct
@@ -160,10 +159,8 @@ def main():
     if trust_correct is not None:
         trust_result = record_outcome(conn, actual_class, trust_correct, episode_id=episode_id)
         print("trust update:", trust_result)
-        if not trust_correct:
-            breaker_result = check_circuit_breaker(conn)
-            if breaker_result["tripped"]:
-                print("CIRCUIT BREAKER TRIPPED:", breaker_result)
+        if breaker_result and breaker_result["tripped"]:
+            print("CIRCUIT BREAKER TRIPPED:", breaker_result)
 
     conn.close()
 
