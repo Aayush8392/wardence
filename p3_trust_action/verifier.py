@@ -9,6 +9,7 @@ implemented. disk-full's check is structurally different from the
 other two -- see _make_disk_full_check.
 """
 
+import subprocess
 import time
 
 import requests
@@ -50,8 +51,56 @@ def _current_pod_name(target: str, namespace: str) -> str:
     return pod_names[-1]
 
 
+def _current_pod_name_live(target: str, namespace: str) -> str | None:
+    """
+    Resolves the current Running pod straight from the Kubernetes API,
+    NOT Prometheus. Prometheus's kube-state-metrics scrape lags ~30s,
+    which is fatal for disk-full specifically: its fix
+    (restore_from_disk_full) DELIBERATELY replaces the pod, so a
+    Prometheus-sourced baseline captured moments after the fix routinely
+    returned the OLD, already-deleted pod name -- and then, the instant
+    the scrape caught up to reality, current != baseline and the
+    verifier declared a perfectly good fix "flapped". Confirmed
+    2026-07-22: this happened on every disk-full fix-and-verify run even
+    after the fix itself was proven to genuinely apply
+    (action_applied=1). _current_pod_name_with_retry did not protect
+    against it -- it only retried when NO pod was found, never when a
+    STALE one was returned.
+
+    The live API has no such lag: it is the authoritative source
+    kube-state-metrics is itself derived from. Returns None when there
+    is genuinely no Running pod (mid eviction/recreation).
+    """
+    result = subprocess.run(
+        [
+            "kubectl", "get", "pods", "-n", namespace,
+            "-l", f"name={target}",
+            "--field-selector=status.phase=Running",
+            "-o", "jsonpath={.items[0].metadata.name}",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    name = result.stdout.strip()
+    return name or None
+
+
 BASELINE_CAPTURE_RETRY_S = 30
 BASELINE_CAPTURE_POLL_S = 5
+
+
+def _current_pod_name_live_with_retry(target: str, namespace: str) -> str:
+    """Live-API twin of _current_pod_name_with_retry -- retries through
+    the real zero-Running-pods window a scale-to-0-then-up fix creates."""
+    elapsed = 0
+    while True:
+        name = _current_pod_name_live(target, namespace)
+        if name is not None:
+            return name
+        if elapsed >= BASELINE_CAPTURE_RETRY_S:
+            raise RuntimeError(f"no Running pod found matching '{target}' in {namespace}")
+        time.sleep(BASELINE_CAPTURE_POLL_S)
+        elapsed += BASELINE_CAPTURE_POLL_S
 
 
 def _current_pod_name_with_retry(target: str, namespace: str) -> str:
@@ -126,10 +175,10 @@ def _make_oom_check(pod_name: str, baseline_restarts: int):
     return check
 
 
-def _evicted_recently(target: str, namespace: str) -> bool:
+def _evicted_recently(target: str, namespace: str, baseline_pod_name: str) -> bool:
     """
     Time-bounded to pods EVICTED (not just created) in the last 3
-    minutes. Went through two wrong fixes before this one:
+    minutes. Went through three wrong fixes before this one:
       1. Bounded on kube_pod_created (pod age) -- wrong: a pod can run
          healthy for a long time before being evicted, so its creation
          time can be old even though the eviction just happened,
@@ -141,11 +190,21 @@ def _evicted_recently(target: str, namespace: str) -> bool:
          evicted pods and it returned nothing at all, even though
          status_reason clearly showed "Evicted". Eviction on this
          cluster doesn't reliably populate that field.
-    Landed on: bound by whether the CURRENT Running pod for this
-    target was created recently, instead of trusting the evicted pod's
-    own metadata at all. A fresh healthy replacement pod existing is
-    itself direct evidence a churn just happened. Same fix applied to
-    agent.py's evicted_query -- see that file for the full derivation.
+      3. Bounded on "any current Running pod created <180s ago",
+         with NO comparison against baseline_pod_name -- wrong,
+         empirically (2026-07-22): disk-full's own fix
+         (restore_from_disk_full) recreates the pod as part of a
+         SUCCESSFUL fix, so the freshly-fixed pod itself always
+         satisfies "created recently", making every successful fix
+         look "flapped" moments later regardless of whether a real
+         re-eviction happened. Confirmed via real eviction-event
+         timestamps: a "flapped" verdict lined up with the fix's own
+         restart, not an independent new eviction.
+    Landed on: bound by whether the CURRENT Running pod is BOTH
+    recently created AND a DIFFERENT pod than baseline_pod_name (the
+    pod resolved when the durability window started, i.e. right after
+    the fix ran) -- a fresh pod existing is only real evidence of a
+    NEW churn if it isn't the fix's own recreation.
     """
     evicted_query = (
         f'kube_pod_status_reason{{namespace="{namespace}", '
@@ -163,7 +222,11 @@ def _evicted_recently(target: str, namespace: str) -> bool:
     )
     recent_resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": recent_running_pod_query}, timeout=10)
     recent_resp.raise_for_status()
-    return len(recent_resp.json()["data"]["result"]) > 0
+    for result in recent_resp.json()["data"]["result"]:
+        pod_name = result.get("metric", {}).get("pod")
+        if pod_name and pod_name != baseline_pod_name:
+            return True
+    return False
 
 
 def _make_disk_full_check(baseline_pod_name: str):
@@ -179,11 +242,14 @@ def _make_disk_full_check(baseline_pod_name: str):
     """
 
     def check(target: str, namespace: str) -> bool:
-        if _evicted_recently(target, namespace):
-            return True
-        try:
-            current_pod_name = _current_pod_name(target, namespace)
-        except RuntimeError:
+        # Pod IDENTITY, resolved live, is the whole signal here. A real
+        # re-eviction ALWAYS produces a new pod name, so this single
+        # check covers it -- the previous Prometheus-based
+        # _evicted_recently call was both redundant and actively harmful
+        # (scrape lag + it matched ANY historical Evicted pod object,
+        # and evicted pods linger here indefinitely).
+        current_pod_name = _current_pod_name_live(target, namespace)
+        if current_pod_name is None:
             # no Running pod right now -- mid eviction/recreation, treat as still faulty
             return True
         return current_pod_name != baseline_pod_name
@@ -212,7 +278,10 @@ def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop
         baseline = _restart_count(pod_name, namespace)
         check_fn = _make_oom_check(pod_name, baseline)
     elif fault_class == "disk-full":
-        baseline_pod_name = _current_pod_name_with_retry(target, namespace)
+        # Live API, not Prometheus -- see _current_pod_name_live. The fix
+        # just replaced this pod, so a lagging source would hand back the
+        # dead pod as "baseline" and guarantee a false flap.
+        baseline_pod_name = _current_pod_name_live_with_retry(target, namespace)
         check_fn = _make_disk_full_check(baseline_pod_name)
 
     window_s = DURABILITY_WINDOWS[fault_class]

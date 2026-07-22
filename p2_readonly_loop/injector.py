@@ -82,7 +82,10 @@ so nothing written there would ever count as real disk usage (it'd
 silently stress memory instead, misrepresenting this as an oom fault).
 queue-master has a writable, disk-backed /tmp (confirmed via exec) and
 had no ephemeral-storage limit until patched
-(patch_queue_master_ephemeral_limit.sh, 100Mi).
+(patch_queue_master_ephemeral_limit.sh, 300Mi -- raised from the
+original 100Mi on 2026-07-22, after repeated real evictions on a
+freshly-fixed pod showed 100Mi had become too tight relative to
+queue-master's real accumulated baseline usage after a long session).
 
 Like crash-loop, this repeats on an interval rather than firing once:
 an ephemeral-storage breach doesn't restart the container in place --
@@ -197,7 +200,7 @@ OOM_STRESS_SIZE = "250M"  # catalogue's memory limit is 200Mi; stress-ng format,
 OOM_BASELINE_MEMORY_LIMIT = "200Mi"
 
 DISK_FULL_FIRE_INTERVAL_S = 15  # wait between write attempts, giving kubelet time to detect+evict
-DISK_STRESS_BYTES = 150_000_000  # queue-master's ephemeral-storage limit is 100Mi
+DISK_STRESS_BYTES = 450_000_000  # queue-master's ephemeral-storage limit is 300Mi
 
 NETWORK_LATENCY_DELAY = "500ms"
 NETWORK_LATENCY_JITTER = "50ms"
@@ -691,19 +694,62 @@ def _verify_disk_full_effect(
     return False
 
 
-def run_disk_full_injection(cfg: dict, duration_s: int):
+def run_disk_full_injection(
+    cfg: dict, duration_s: int, baseline_pod_name: str | None = None, since_ts: float | None = None
+):
     """
     Repeatedly resolves the CURRENT pod (which changes identity each
     time kubelet evicts and the ReplicaSet recreates it) and writes a
     file past the ephemeral-storage limit into it. Not a Chaos Mesh
     resource -- see module docstring for why.
+
+    Stops as soon as ONE real eviction is confirmed (via
+    baseline_pod_name/since_ts, the same signals _verify_disk_full_effect
+    checks separately), rather than always running the full duration_s.
+    Found 2026-07-22: continuing to fill after the first eviction was
+    also filling the freshly-created REPLACEMENT pod -- exactly the pod
+    the later fix (restore_from_disk_full) acts on. That contaminated
+    the fix's own target before the fix ever ran, causing a second,
+    independent eviction that the trust ladder's durability check
+    correctly (but confusingly) read as a fresh post-fix flap. One
+    confirmed eviction is already sufficient proof of the fault --
+    unlike network-latency, where stopping early starved the traffic
+    generator of a chance to ever observe the fault, disk-full's proof
+    doesn't depend on continued injection once eviction is confirmed.
+    baseline_pod_name/since_ts are optional so this can still be called
+    standalone (e.g. from a test script) without early-stop behavior.
     """
     end_time = time.time() + duration_s
     while time.time() < end_time:
-        pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
-        if pod_name is None:
-            time.sleep(2)
-            continue
+        if baseline_pod_name is not None:
+            # Check BEFORE writing, and only ever write to the ORIGINAL
+            # baseline pod. The first version checked AFTER the write and
+            # re-resolved the current pod each pass, which meant: write to
+            # POD_A -> sleep -> kubelet evicts POD_A and creates POD_B ->
+            # next pass re-resolves to POD_B and writes a full 450MB into
+            # the brand-new REPLACEMENT pod -> only then notices the pod
+            # changed and stops. That guaranteed the replacement pod was
+            # already contaminated before the fix ever ran, and its later
+            # eviction cascaded into the durability window, where the
+            # verifier correctly reported real churn -- making a working
+            # fix look flapped every single time (found 2026-07-22).
+            # Once the baseline pod is gone, the fault has landed; there
+            # is nothing more to inject.
+            current_pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
+            if current_pod_name is None or current_pod_name != baseline_pod_name:
+                return
+            if since_ts is not None and _pod_evicted_since(
+                cfg["target"], cfg["namespace"], since_ts
+            ):
+                return
+            pod_name = baseline_pod_name
+        else:
+            # Standalone call (no baseline given) -- original behaviour,
+            # re-resolve each pass and run the full duration.
+            pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
+            if pod_name is None:
+                time.sleep(2)
+                continue
         _write_large_file(pod_name, cfg["namespace"], cfg["container"])
         time.sleep(DISK_FULL_FIRE_INTERVAL_S)
 
@@ -790,9 +836,23 @@ def record_episode(
 def _inject_and_verify_disk_full(cfg: dict) -> bool:
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
         baseline_pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
+        if baseline_pod_name is None:
+            # No Running pod at all -- writing nothing would spin for the
+            # full window and then report a misleading "no eviction
+            # detected". This is an infra/state problem, not a failed
+            # injection: almost always the deployment is scaled to 0 or
+            # thrashing (e.g. a fix left it at replicas=0). Fail loudly
+            # and immediately with the real cause instead of retrying.
+            print(
+                f"  ABORT: no Running pod for {cfg['target']} in {cfg['namespace']} "
+                f"-- deployment may be scaled to 0 or unhealthy. Check "
+                f"`kubectl get deployment {cfg['target']} -n {cfg['namespace']}` "
+                f"and scale back to 1 if needed. NOT a diagnosis/verifier issue."
+            )
+            return False
         since_ts = time.time()
         print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: running exec-based disk fill for {cfg['duration_s']}s...")
-        run_disk_full_injection(cfg, cfg["duration_s"])
+        run_disk_full_injection(cfg, cfg["duration_s"], baseline_pod_name, since_ts)
         try:
             verified = _verify_disk_full_effect(cfg["target"], cfg["namespace"], since_ts, baseline_pod_name)
         finally:

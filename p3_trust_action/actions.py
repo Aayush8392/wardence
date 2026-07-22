@@ -49,6 +49,15 @@ DEFAULT_NAMESPACE = "sock-shop"
 # real fix attempt gets caught mid-episode.
 TOKEN_EXPIRY_WARNING_HOURS = 24
 
+# Must comfortably EXCEED the target's terminationGracePeriodSeconds --
+# queue-master's is 30s (confirmed directly, not assumed), so a 30s wait
+# was a guaranteed race: Kubernetes may use the full grace period before
+# SIGKILLing, so the wait expired at the exact moment the pod was still
+# legitimately terminating (found 2026-07-22 -- caused a real
+# applied=False plus a deployment left stuck at replicas=0).
+POD_TERMINATE_TIMEOUT_S = 60
+POD_START_TIMEOUT_S = 60
+
 
 def _check_token_expiry(token: str):
     """Decodes the JWT's own `exp` claim directly (no signature
@@ -99,6 +108,56 @@ def _apps_v1() -> client.AppsV1Api:
     cfg.api_key_prefix = {}
 
     return client.AppsV1Api(client.ApiClient(cfg))
+
+
+def _core_v1() -> client.CoreV1Api:
+    """CoreV1Api twin of _apps_v1() -- same auth setup, needed to list
+    pods directly (AppsV1Api only covers Deployments/ReplicaSets)."""
+    config.load_kube_config()
+    cfg = client.Configuration.get_default_copy()
+    cfg.cert_file = None
+    cfg.key_file = None
+    with open(SA_TOKEN_PATH) as f:
+        token = f.read().strip()
+    _check_token_expiry(token)
+    cfg.api_key = {"authorization": f"Bearer {token}"}
+    cfg.api_key_prefix = {}
+    return client.CoreV1Api(client.ApiClient(cfg))
+
+
+def _wait_for_pod_count(name: str, namespace: str, expected_count: int, timeout_s: int = 30) -> bool:
+    """Polls until exactly expected_count pods match label name=<name>.
+    Needed because patch_namespaced_deployment_scale returns as soon as
+    the API server ACCEPTS the patch, not once it's actually reconciled
+    -- found 2026-07-22: restore_from_disk_full's scale-to-0-then-back-
+    to-1 calls, issued back-to-back with no wait, could report
+    applied=True on both while Kubernetes coalesced them into a no-op
+    (the old, already-contaminated pod never actually got deleted and
+    replaced), silently defeating the entire point of the fix. Returns
+    False on timeout rather than raising -- caller decides how to treat
+    a fix that couldn't be confirmed."""
+    api = _core_v1()
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        pods = api.list_namespaced_pod(namespace, label_selector=f"name={name}")
+        # Count only LIVE pods (phase == "Running"). This deliberately
+        # excludes Failed/Unknown pods: evicted disk-full pods pile up
+        # as Failed objects that kubelet does NOT garbage-collect on
+        # this cluster (queue-master routinely has a dozen+ dead pods
+        # sitting around), so counting every object would never reach 0
+        # and this wait would always time out -- which is exactly what
+        # left the deployment stuck at replicas=0 (found 2026-07-22, the
+        # first version counted len(pods.items) and broke disk-full's
+        # own fix). A gracefully terminating pod keeps phase=="Running"
+        # until it is actually removed, so it is still counted here --
+        # preserving the real guarantee restore_from_disk_full needs:
+        # wait until the old, contaminated pod is genuinely gone before
+        # scaling back up, not merely until the API accepted the patch.
+        running = [p for p in pods.items if p.status.phase == "Running"]
+        if len(running) == expected_count:
+            return True
+        time.sleep(2)
+    return False
 
 
 def _patch_deployment(name: str, namespace: str, body: dict) -> dict:
@@ -219,6 +278,16 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
     back up forces exactly that: the old pod (and its full disk) is
     deleted, the new one starts clean. Composes scale_deployment rather
     than duplicating its dry-run/apply logic.
+
+    Waits for the pod count to actually reach 0 before scaling back up
+    -- found 2026-07-22: without this wait, scale-to-0 and scale-to-1
+    issued back-to-back could get coalesced by Kubernetes into a no-op
+    (patch_namespaced_deployment_scale returns success the instant the
+    API server ACCEPTS a patch, not once it's reconciled), leaving the
+    SAME, already-contaminated pod running the whole time -- action_
+    applied would report True while the fault silently never actually
+    cleared, then reappeared minutes later and got misread as a fresh
+    post-fix flap.
     """
     scale_down = scale_deployment(name, 0, namespace)
     if not scale_down["applied"]:
@@ -232,7 +301,40 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
             "scale_up": None,
         }
 
+    pod_gone = _wait_for_pod_count(
+        name, namespace, expected_count=0, timeout_s=POD_TERMINATE_TIMEOUT_S
+    )
+
+    # ALWAYS scale back up, even if the terminate-wait timed out. Leaving
+    # the deployment at replicas=0 is far worse than a failed fix: it
+    # takes the service down for every SUBSEQUENT episode too, and the
+    # injector then finds no Running pod and reports a misleading "no
+    # eviction detected" (found 2026-07-22 -- this exact state wedged the
+    # cluster twice). A timed-out wait still reports applied=False below,
+    # so the fix is judged honestly; it just doesn't leave wreckage.
     scale_up = scale_deployment(name, replicas, namespace)
+    if scale_up["applied"]:
+        pod_back = _wait_for_pod_count(
+            name, namespace, expected_count=replicas, timeout_s=POD_START_TIMEOUT_S
+        )
+        if not pod_back:
+            scale_up = {**scale_up, "applied": False, "error": "timed out waiting for new pod to start Running"}
+
+    if not pod_gone:
+        return {
+            "action": "restore_from_disk_full",
+            "target": name,
+            "namespace": namespace,
+            "applied": False,
+            "error": (
+                "timed out waiting for old pod to terminate before scaling back up -- "
+                "the fix cannot be trusted to have cleared the disk (scaled back up "
+                "anyway to avoid leaving the deployment at 0)"
+            ),
+            "scale_down": scale_down,
+            "scale_up": scale_up,
+        }
+
     return {
         "action": "restore_from_disk_full",
         "target": name,

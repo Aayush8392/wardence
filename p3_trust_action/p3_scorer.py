@@ -130,7 +130,14 @@ def main():
 
     episode_id, actual_class, target, namespace = episode
 
-    resp = requests.post(AGENT_URL, json={"target": target, "namespace": namespace}, timeout=15)
+    # 180s, not 15s -- restore_from_disk_full (2026-07-22) now genuinely
+    # polls for pod replacement instead of returning the instant the API
+    # accepts a patch: up to POD_TERMINATE_TIMEOUT_S (60s) waiting for
+    # the old pod to actually go, plus up to POD_START_TIMEOUT_S (60s)
+    # for the replacement to reach Running = 120s worst case, plus
+    # diagnosis time. A real disk-full fix legitimately takes far longer
+    # than crash-loop/oom's near-instant actions.
+    resp = requests.post(AGENT_URL, json={"target": target, "namespace": namespace}, timeout=180)
     resp.raise_for_status()
     result = resp.json()
 

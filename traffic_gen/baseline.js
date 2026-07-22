@@ -114,7 +114,9 @@ export default function () {
   }
 
   // 5. view item detail
-  const detailRes = http.get(`${BASE_URL}/catalogue/${itemId}`);
+  const detailRes = http.get(`${BASE_URL}/catalogue/${itemId}`, {
+    tags: { name: "catalogue_detail" },
+  });
   check(detailRes, { "detail 200": (r) => r.status === 200 });
 
   sleep(0.3);

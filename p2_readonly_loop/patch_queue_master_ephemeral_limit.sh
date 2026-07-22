@@ -17,7 +17,7 @@ kubectl patch deployment queue-master -n sock-shop --type=strategic -p '
             "name": "queue-master",
             "resources": {
               "limits": {
-                "ephemeral-storage": "100Mi"
+                "ephemeral-storage": "300Mi"
               }
             }
           }

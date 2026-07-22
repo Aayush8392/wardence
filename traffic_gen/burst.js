@@ -46,7 +46,9 @@ export default function () {
     return;
   }
 
-  const detailRes = http.get(`${BASE_URL}/catalogue/${itemId}`);
+  const detailRes = http.get(`${BASE_URL}/catalogue/${itemId}`, {
+    tags: { name: "catalogue_detail" },
+  });
   check(detailRes, { "detail 200": (r) => r.status === 200 });
 
   const cartRes = http.post(
