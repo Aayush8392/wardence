@@ -22,6 +22,7 @@ Usage:
     python3 p3_scorer.py
 """
 
+import datetime
 import sqlite3
 import sys
 from pathlib import Path
@@ -35,6 +36,23 @@ from trust_engine import DB_PATH, PROMOTION_STREAK, ensure_trust_tables, record_
 from verifier import verify_durability  # noqa: E402
 
 AGENT_URL = "http://localhost:8001/handle"
+
+# Found the hard way (2026-07-21): get_unscored_episode always picked
+# the most recent unscored episode by t0, with no check on how OLD
+# "most recent" actually was. A day-old leftover crash-loop episode
+# (from the original 2026-07-20 P3 session, never scored) got picked
+# up and scored against TODAY's live cluster state -- guaranteed to
+# read as "no anomaly" since that fault's window was long gone,
+# producing a false WRONG and a real (if harmless that time, since the
+# class was at streak 0) trust-state write. Caught only because it
+# happened to hit a class with nothing to lose -- the SAME backlog
+# also contains 2 stale oom episodes, and oom had JUST been promoted
+# to can_act, so the next scorer run could have used one of those to
+# trigger a FALSE DEMOTION from garbage data. 10 minutes is
+# comfortably above the longest durability window (5 min, oom/
+# cascading) plus normal settle/scorer overhead -- anything older is a
+# stale leftover, not a live fault.
+MAX_EPISODE_AGE_MINUTES = 10
 
 
 def ensure_scores_table(conn: sqlite3.Connection):
@@ -69,7 +87,7 @@ def ensure_scores_table(conn: sqlite3.Connection):
 def get_unscored_episode(conn: sqlite3.Connection):
     row = conn.execute(
         """
-        SELECT e.episode_id, e.fault_class, e.target, e.namespace
+        SELECT e.episode_id, e.fault_class, e.target, e.namespace, e.t0
         FROM episodes e
         LEFT JOIN scores s ON e.episode_id = s.episode_id
         WHERE s.episode_id IS NULL
@@ -77,7 +95,22 @@ def get_unscored_episode(conn: sqlite3.Connection):
         LIMIT 1
         """
     ).fetchone()
-    return row
+    if row is None:
+        return None
+    episode_id, fault_class, target, namespace, t0_str = row
+    t0 = datetime.datetime.fromisoformat(t0_str)
+    age_minutes = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds() / 60
+    if age_minutes > MAX_EPISODE_AGE_MINUTES:
+        print(
+            f"WARNING: most recent unscored episode ({episode_id}, {fault_class}) is "
+            f"{age_minutes:.1f} minutes old -- refusing to score it. Its ground-truth "
+            f"window is long gone; scoring it now would falsely read as 'no anomaly' "
+            f"against the CURRENT live cluster and corrupt trust with stale data, same "
+            f"principle as injector.py refusing to record ground truth on total failure "
+            f"rather than silently recording bad data."
+        )
+        return None
+    return episode_id, fault_class, target, namespace
 
 
 def diagnosis_matches(predicted: str, actual: str) -> bool:

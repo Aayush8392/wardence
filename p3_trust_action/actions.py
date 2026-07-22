@@ -9,16 +9,74 @@ cluster. Every action:
   3. Is one of a fixed, named function -- no free-form kubectl/API calls.
 
 Requires a live SA token at p3_trust_action/sa_token.txt:
-    kubectl create token wardence-agent -n sock-shop --duration=24h > p3_trust_action/sa_token.txt
-Regenerate when it expires (401 errors are the signal).
+    kubectl create token wardence-agent -n sock-shop --duration=720h > p3_trust_action/sa_token.txt
+
+30 days (720h), not permanent -- deliberately. Kubernetes deprecated
+permanent auto-mounted SA tokens (pre-1.24) specifically because a
+leaked/forgotten permanent credential is a much bigger liability than
+a bounded one; kubectl create token (TokenRequest API) is bounded-
+lifetime by design, no "forever" option without working against that.
+Also thematically consistent with this whole project: trust here is
+supposed to be earned/bounded, not permanently granted, and that
+should hold for the action layer's own credential too. 24h (the
+original duration) was arbitrary and too easy to silently run past
+mid-session -- confirmed the hard way (2026-07-21): a stale, EXPIRED
+token caused every real oom fix attempt to fail with 401, which the
+trust engine correctly (if confusingly, until diagnosed) read as "fix
+didn't apply" and used to demote oom out of can_act. 720h gives a
+comfortable, session-spanning margin while still keeping the
+rotation principle intact.
+
+_apps_v1() checks the token's own `exp` claim before use and raises a
+clear, loud error immediately if it's expired or expiring soon,
+instead of letting a stale token surface later as a confusing 401 deep
+inside a fix attempt (which is exactly what happened before this
+check existed).
 """
 
+import base64
+import json
 import os
+import time
 
 from kubernetes import client, config
 
 SA_TOKEN_PATH = os.path.join(os.path.dirname(__file__), "sa_token.txt")
 DEFAULT_NAMESPACE = "sock-shop"
+
+# Warn/refuse this far ahead of actual expiry, not just at the exact
+# moment it lapses -- gives enough lead time to regenerate before a
+# real fix attempt gets caught mid-episode.
+TOKEN_EXPIRY_WARNING_HOURS = 24
+
+
+def _check_token_expiry(token: str):
+    """Decodes the JWT's own `exp` claim directly (no signature
+    verification needed, we're only reading a field we already trust
+    since it came from our own sa_token.txt) and raises immediately if
+    the token is expired or within TOKEN_EXPIRY_WARNING_HOURS of
+    expiring -- found the hard way that a silently-expired token
+    doesn't fail loudly, it just makes every real API call 401 and
+    looks like an application-level failure."""
+    payload_b64 = token.split(".")[1]
+    payload_b64 += "=" * (-len(payload_b64) % 4)
+    payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+    exp = payload.get("exp")
+    if exp is None:
+        return  # no exp claim -- can't check, don't block on it
+    seconds_left = exp - time.time()
+    if seconds_left < 0:
+        raise RuntimeError(
+            f"sa_token.txt EXPIRED {abs(seconds_left) / 3600:.1f}h ago. Regenerate with: "
+            f"kubectl create token wardence-agent -n sock-shop --duration=720h > "
+            f"{SA_TOKEN_PATH}"
+        )
+    if seconds_left < TOKEN_EXPIRY_WARNING_HOURS * 3600:
+        print(
+            f"WARNING: sa_token.txt expires in {seconds_left / 3600:.1f}h -- regenerate soon: "
+            f"kubectl create token wardence-agent -n sock-shop --duration=720h > "
+            f"{SA_TOKEN_PATH}"
+        )
 
 
 def _apps_v1() -> client.AppsV1Api:
@@ -36,6 +94,7 @@ def _apps_v1() -> client.AppsV1Api:
 
     with open(SA_TOKEN_PATH) as f:
         token = f.read().strip()
+    _check_token_expiry(token)
     cfg.api_key = {"authorization": f"Bearer {token}"}
     cfg.api_key_prefix = {}
 

@@ -81,6 +81,7 @@ jobs:
             -n monitoring --create-namespace \
             --set grafana.enabled=false \
             --set alertmanager.enabled=false \
+            --set prometheus.prometheusSpec.enableRemoteWriteReceiver=true \
             --wait --timeout 300s
 
       - name: Port-forward Prometheus (background)

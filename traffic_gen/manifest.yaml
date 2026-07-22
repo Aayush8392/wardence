@@ -39,6 +39,10 @@ spec:
           env:
             - name: TARGET_URL
               value: "http://front-end.sock-shop.svc.cluster.local"
+            - name: K6_PROMETHEUS_RW_SERVER_URL
+              value: "http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"
+            - name: K6_PROMETHEUS_RW_TREND_STATS
+              value: "p(95)"
           volumeMounts:
             - name: scripts
               mountPath: /scripts

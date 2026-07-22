@@ -7,6 +7,7 @@ be running in separate terminals before starting this.
 Usage:
     python3 run_episodes.py --class crash-loop [num_episodes]   # default 20
     python3 run_episodes.py --class oom [num_episodes]
+    python3 run_episodes.py --class network-latency [num_episodes]
 """
 
 import argparse
@@ -30,7 +31,8 @@ def run(script: str, extra_args: list[str] | None = None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--class", dest="fault_class", required=True, choices=["crash-loop", "oom", "disk-full"]
+        "--class", dest="fault_class", required=True,
+        choices=["crash-loop", "oom", "disk-full", "network-latency", "memory-leak", "connection-pool-exhaustion"]
     )
     parser.add_argument("num_episodes", nargs="?", type=int, default=20)
     args = parser.parse_args()

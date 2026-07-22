@@ -12,6 +12,7 @@ Usage:
     python3 scorer.py
 """
 
+import datetime
 import sqlite3
 from pathlib import Path
 
@@ -22,6 +23,14 @@ AGENT_URL = "http://localhost:8000/diagnose"
 # on WSL2's native filesystem instead of the Windows-mounted C:/ path.
 OUTPUT_DIR = Path.home() / "wardence_p2_data"
 DB_PATH = OUTPUT_DIR / "wardence.db"
+
+# Found the hard way in p3_scorer.py (2026-07-21), same bug applies
+# here: picking "most recent unscored" with no staleness check means a
+# day-old leftover episode can get scored against TODAY's live cluster
+# state, guaranteed to read as "no anomaly" and corrupt the accuracy
+# record with a false WRONG. 10 minutes comfortably covers normal
+# injector->settle->scorer timing with margin.
+MAX_EPISODE_AGE_MINUTES = 10
 
 
 def ensure_scores_table(conn: sqlite3.Connection):
@@ -44,7 +53,7 @@ def ensure_scores_table(conn: sqlite3.Connection):
 def get_unscored_episode(conn: sqlite3.Connection):
     row = conn.execute(
         """
-        SELECT e.episode_id, e.fault_class, e.target, e.namespace
+        SELECT e.episode_id, e.fault_class, e.target, e.namespace, e.t0
         FROM episodes e
         LEFT JOIN scores s ON e.episode_id = s.episode_id
         WHERE s.episode_id IS NULL
@@ -52,7 +61,19 @@ def get_unscored_episode(conn: sqlite3.Connection):
         LIMIT 1
         """
     ).fetchone()
-    return row
+    if row is None:
+        return None
+    episode_id, fault_class, target, namespace, t0_str = row
+    t0 = datetime.datetime.fromisoformat(t0_str)
+    age_minutes = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds() / 60
+    if age_minutes > MAX_EPISODE_AGE_MINUTES:
+        print(
+            f"WARNING: most recent unscored episode ({episode_id}, {fault_class}) is "
+            f"{age_minutes:.1f} minutes old -- refusing to score it (stale ground truth, "
+            f"would falsely read as 'no anomaly' against the current cluster)."
+        )
+        return None
+    return episode_id, fault_class, target, namespace
 
 
 def diagnosis_matches(predicted: str, actual: str) -> bool:
