@@ -35,6 +35,7 @@ check existed).
 """
 
 import base64
+import datetime
 import json
 import os
 import time
@@ -43,6 +44,38 @@ from kubernetes import client, config
 
 SA_TOKEN_PATH = os.path.join(os.path.dirname(__file__), "sa_token.txt")
 DEFAULT_NAMESPACE = "sock-shop"
+
+# Live step-progress for multi-step fixes (2026-07-22) -- so a frontend
+# can poll "scaling down -> waiting for termination -> scaling up"
+# instead of staring at a content-free spinner for the ~1-2 minutes
+# restore_from_disk_full genuinely takes. In-memory only, not persisted:
+# this is transient run state, not the final verdict (that's already
+# captured properly in episode_snapshots via p3_scorer.py). Keyed by
+# (namespace, name) since only one fix runs at a time system-wide
+# (matches the Operator API's existing one-episode-in-flight rule) --
+# no locking needed for the same reason, and a new run overwrites the
+# previous entry rather than appending forever.
+_PROGRESS: dict[tuple[str, str], list[dict]] = {}
+
+
+def _reset_progress(name: str, namespace: str):
+    _PROGRESS[(namespace, name)] = []
+
+
+def _record_step(name: str, namespace: str, step: str, status: str, detail: str | None = None):
+    _PROGRESS.setdefault((namespace, name), []).append(
+        {
+            "step": step,
+            "status": status,
+            "detail": detail,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+    )
+
+
+def get_progress(name: str, namespace: str) -> list[dict]:
+    """Read-only accessor for the frontend's live-trigger view to poll."""
+    return _PROGRESS.get((namespace, name), [])
 
 # Warn/refuse this far ahead of actual expiry, not just at the exact
 # moment it lapses -- gives enough lead time to regenerate before a
@@ -289,8 +322,12 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
     cleared, then reappeared minutes later and got misread as a fresh
     post-fix flap.
     """
+    _reset_progress(name, namespace)
+
+    _record_step(name, namespace, "scaling_down", "in_progress")
     scale_down = scale_deployment(name, 0, namespace)
     if not scale_down["applied"]:
+        _record_step(name, namespace, "scaling_down", "failed", scale_down.get("error"))
         return {
             "action": "restore_from_disk_full",
             "target": name,
@@ -300,9 +337,14 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
             "scale_down": scale_down,
             "scale_up": None,
         }
+    _record_step(name, namespace, "scaling_down", "done")
 
+    _record_step(name, namespace, "waiting_for_termination", "in_progress")
     pod_gone = _wait_for_pod_count(
         name, namespace, expected_count=0, timeout_s=POD_TERMINATE_TIMEOUT_S
+    )
+    _record_step(
+        name, namespace, "waiting_for_termination", "done" if pod_gone else "timed_out"
     )
 
     # ALWAYS scale back up, even if the terminate-wait timed out. Leaving
@@ -312,15 +354,24 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
     # eviction detected" (found 2026-07-22 -- this exact state wedged the
     # cluster twice). A timed-out wait still reports applied=False below,
     # so the fix is judged honestly; it just doesn't leave wreckage.
+    _record_step(name, namespace, "scaling_up", "in_progress")
     scale_up = scale_deployment(name, replicas, namespace)
     if scale_up["applied"]:
+        _record_step(name, namespace, "scaling_up", "done")
+        _record_step(name, namespace, "waiting_for_new_pod", "in_progress")
         pod_back = _wait_for_pod_count(
             name, namespace, expected_count=replicas, timeout_s=POD_START_TIMEOUT_S
         )
         if not pod_back:
             scale_up = {**scale_up, "applied": False, "error": "timed out waiting for new pod to start Running"}
+            _record_step(name, namespace, "waiting_for_new_pod", "timed_out")
+        else:
+            _record_step(name, namespace, "waiting_for_new_pod", "done")
+    else:
+        _record_step(name, namespace, "scaling_up", "failed", scale_up.get("error"))
 
     if not pod_gone:
+        _record_step(name, namespace, "complete", "failed", "old pod never terminated")
         return {
             "action": "restore_from_disk_full",
             "target": name,
@@ -335,6 +386,7 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
             "scale_up": scale_up,
         }
 
+    _record_step(name, namespace, "complete", "done" if scale_up["applied"] else "failed")
     return {
         "action": "restore_from_disk_full",
         "target": name,

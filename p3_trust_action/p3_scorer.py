@@ -23,6 +23,7 @@ Usage:
 """
 
 import datetime
+import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -84,6 +85,40 @@ def ensure_scores_table(conn: sqlite3.Connection):
     conn.commit()
 
 
+def ensure_episode_snapshots_table(conn: sqlite3.Connection):
+    """
+    Tier A capture (2026-07-22): persists what the agent's /handle response
+    ALREADY contains per episode but was previously discarded once
+    p3_scorer.py pulled out only the few fields needed for scores/trust.
+    This is the real data source the frontend's Replay Viewer will read
+    from -- without it there was nothing to show beyond a bare verdict.
+
+    Deliberately NOT a time series (Tier B, deferred): tool_output is
+    the single point-in-time snapshot query_prometheus already returns,
+    and durability_elapsed_s is verify_durability's own final elapsed
+    time, not a per-poll history -- neither of those exist as real data
+    anywhere in the system yet. Storing exactly what's real, nothing
+    fabricated to look richer than it is.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS episode_snapshots (
+            episode_id TEXT PRIMARY KEY,
+            tool_output TEXT,
+            reasoning TEXT,
+            confidence REAL,
+            action_taken TEXT,
+            action_result TEXT,
+            durability_verdict TEXT,
+            durability_elapsed_s INTEGER,
+            captured_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
+        )
+        """
+    )
+    conn.commit()
+
+
 def get_unscored_episode(conn: sqlite3.Connection):
     row = conn.execute(
         """
@@ -120,6 +155,7 @@ def diagnosis_matches(predicted: str, actual: str) -> bool:
 def main():
     conn = sqlite3.connect(DB_PATH)
     ensure_scores_table(conn)
+    ensure_episode_snapshots_table(conn)
     ensure_trust_tables(conn)
     ensure_circuit_breaker_table(conn)
 
@@ -149,6 +185,7 @@ def main():
     action_result = result.get("action_result")
     action_applied = action_result["applied"] if action_result else None
     durability_verdict = None
+    durability_elapsed_s = None
     trust_correct = None
 
     breaker_result = None
@@ -162,6 +199,7 @@ def main():
         else:
             verdict = verify_durability(actual_class, target, namespace)
             durability_verdict = verdict["verdict"]
+            durability_elapsed_s = verdict["elapsed_s"]
             trust_correct = durability_verdict == "confirmed"
             if not trust_correct:
                 breaker_result = record_failure(conn, reason="fix flapped", fault_class=actual_class)
@@ -192,6 +230,24 @@ def main():
             None if action_applied is None else int(action_applied),
             durability_verdict,
             None if trust_correct is None else int(trust_correct),
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO episode_snapshots
+            (episode_id, tool_output, reasoning, confidence,
+             action_taken, action_result, durability_verdict, durability_elapsed_s)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            episode_id,
+            json.dumps(result.get("tool_output")),
+            result.get("reasoning"),
+            confidence,
+            action_taken,
+            json.dumps(action_result) if action_result is not None else None,
+            durability_verdict,
+            durability_elapsed_s,
         ),
     )
     conn.commit()

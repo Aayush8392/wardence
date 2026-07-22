@@ -26,11 +26,12 @@ def _load_secret() -> str:
     return SECRET_KEY_PATH.read_text().strip()
 
 
-def create_token(role: str, expires_hours: int = 24) -> str:
+def create_token(role: str, expires_hours: int = 24, username: str | None = None) -> str:
     if role not in ROLES:
         raise ValueError(f"unknown role '{role}', must be one of {ROLES}")
     payload = {
         "role": role,
+        "username": username,
         "exp": datetime.datetime.now(datetime.timezone.utc)
         + datetime.timedelta(hours=expires_hours),
         "iat": datetime.datetime.now(datetime.timezone.utc),

@@ -28,7 +28,7 @@ from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from actions import ALLOWED_ACTIONS  # noqa: E402
+from actions import ALLOWED_ACTIONS, get_progress  # noqa: E402
 from trust_engine import DB_PATH, ensure_trust_tables, get_trust_state  # noqa: E402
 
 # Both P2 and P3 have a file named agent.py -- a plain `from agent import
@@ -118,3 +118,18 @@ def handle(req: HandleRequest):
     response["action_result"] = action_result
 
     return response
+
+
+@app.get("/progress/{namespace}/{name}")
+def progress(namespace: str, name: str):
+    """
+    Live-trigger view polls this while a multi-step fix (e.g.
+    restore_from_disk_full) is in flight from a concurrent /handle call.
+    Works because /handle is a plain `def`, not `async def` -- FastAPI
+    runs it in a threadpool, so this GET is served by a different worker
+    thread while /handle's POST is still blocked mid-fix, not queued
+    behind it. Single-step actions (restart_deployment, patch_memory_limit)
+    never populate this -- an empty list here just means either nothing
+    is running or the fix was one-shot, not multi-step.
+    """
+    return {"steps": get_progress(name, namespace)}

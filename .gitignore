@@ -1,6 +1,7 @@
 # Private working notes -- never committed
 wardence_context.md
 wardence_buildlog.md
+wardence_frontend.md
 wardence_guide.html
 reviews/
 
@@ -20,3 +21,6 @@ p3_trust_action/sa_token.txt
 
 # JWT signing secret -- never committed
 p3_trust_action/jwt_secret.txt
+
+# R2 credentials -- never committed
+p3_trust_action/.env

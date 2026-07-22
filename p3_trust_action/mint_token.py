@@ -1,7 +1,15 @@
 """
+SUPERSEDED (2026-07-22) by the real accounts system (accounts.py +
+operator_api.py's /login) -- admin and demo-trigger both now authenticate
+with username/password (+ TOTP for admin) instead of raw locally-minted
+bearer tokens. See create_admin_account.py for bootstrapping the first
+admin account. This script still works as a local fallback (e.g. minting
+a one-off viewer token, or a token for local testing without touching the
+accounts system), but is no longer the primary way to get admin/
+demo-trigger access.
+
 Generate the JWT signing secret (first run only) and mint a token for a
-given role. Admin tokens are minted here, locally, by you -- there is no
-login endpoint for admin (never distributed, see wardence_context.md).
+given role.
 
 Usage:
     python3 p3_trust_action/mint_token.py admin

@@ -1,4 +1,4 @@
-"""One-off: print full scores row for a given episode_id.
+"""One-off: print full scores + episode_snapshots rows for a given episode_id.
 Run: python3 p3_trust_action/inspect_episode.py <episode_id>
 """
 
@@ -11,11 +11,22 @@ DB_PATH = Path.home() / "wardence_p2_data" / "wardence.db"
 episode_id = sys.argv[1]
 conn = sqlite3.connect(DB_PATH)
 conn.row_factory = sqlite3.Row
-row = conn.execute("SELECT * FROM scores WHERE episode_id = ?", (episode_id,)).fetchone()
+score_row = conn.execute("SELECT * FROM scores WHERE episode_id = ?", (episode_id,)).fetchone()
+snapshot_row = conn.execute(
+    "SELECT * FROM episode_snapshots WHERE episode_id = ?", (episode_id,)
+).fetchone()
 conn.close()
 
-if row is None:
+if score_row is None:
     print("no such episode")
 else:
-    for k in row.keys():
-        print(f"{k}: {row[k]}")
+    print("--- scores ---")
+    for k in score_row.keys():
+        print(f"{k}: {score_row[k]}")
+
+    print("\n--- episode_snapshots ---")
+    if snapshot_row is None:
+        print("no snapshot captured for this episode")
+    else:
+        for k in snapshot_row.keys():
+            print(f"{k}: {snapshot_row[k]}")
