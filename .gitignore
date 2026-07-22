@@ -15,6 +15,8 @@ p2_readonly_loop/output/
 
 # One-off diagnostic/probe scripts
 traffic_gen/repro_session_race.py
+p3_trust_action/stitch_data_sample.py
+stitch_sample_output.txt
 
 # Live ServiceAccount credential -- never committed
 p3_trust_action/sa_token.txt

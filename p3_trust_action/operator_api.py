@@ -31,11 +31,13 @@ Usage:
 import datetime
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import jwt
 import requests
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -54,6 +56,16 @@ from trust_engine import (  # noqa: E402
 )
 
 app = FastAPI()
+
+# The p4_frontend dev server needs cross-origin access to this API -- same
+# CORS requirement as R2 (see wardence_frontend.md). Tighten allow_origins
+# to the real Vercel domain once deployed; localhost:5173 covers local dev.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"],
+)
 
 # Session tokens issued at login never outlive a demo-trigger account's
 # own expiry (a 24h-limited account shouldn't get a session that outlasts
@@ -81,9 +93,22 @@ GLOBAL_DAILY_CAP = 10
 
 INJECTOR_PATH = Path(__file__).parent.parent / "p2_readonly_loop" / "injector.py"
 INJECTOR_CWD = Path(__file__).parent.parent / "p2_readonly_loop"
+SCORER_PATH = Path(__file__).parent / "p3_scorer.py"
+SCORER_CWD = Path(__file__).parent
 
 PROMETHEUS_URL = "http://localhost:9090"
 STATUS_NAMESPACE = "sock-shop"
+
+# Matches p2_readonly_loop/run_episodes.py's own SETTLE_SECONDS -- same
+# documented race (kube-state-metrics scrapes every 30s; scoring before a
+# full cycle has passed can read stale state and misdiagnose a genuine
+# fault as "no anomaly"). Never skip this, even here.
+SETTLE_SECONDS = 35
+
+# p3_scorer.py's own agent request timeout is already 180s (durability
+# windows run up to 3 min for oom -- see p3_scorer.py's docstring); give
+# the subprocess itself real margin beyond that, not a tight guess.
+SCORER_TIMEOUT_S = 400
 
 
 def _conn():
@@ -246,16 +271,23 @@ def trigger(
         conn.close()
         raise HTTPException(400, f"'{fault_class}' has no injector implementation yet")
 
+    # Real concurrency-safety guard, not a fairness/budget one -- applies to
+    # EVERY role, including admin. Two genuinely concurrent injector.py runs
+    # against the same cluster target is a correctness risk (races on pod
+    # selection/baselining, the same class of bug this project already hit
+    # repeatedly with disk-full's settle-wait timing), not something an
+    # admin should be able to bypass just because the cooldown/cap fairness
+    # rules below don't apply to them.
+    if _episode_in_flight(conn):
+        _audit(conn, role, "/trigger", "rejected: episode already in flight", ip)
+        conn.close()
+        raise HTTPException(429, "an episode is already in flight, try again shortly")
+
     if role == "demo-trigger":
         if fault_class not in SAFE_DEMO_CLASSES:
             _audit(conn, role, "/trigger", f"rejected: '{fault_class}' not in safe subset", ip)
             conn.close()
             raise HTTPException(403, f"demo-trigger may only trigger {SAFE_DEMO_CLASSES}")
-
-        if _episode_in_flight(conn):
-            _audit(conn, role, "/trigger", "rejected: episode already in flight", ip)
-            conn.close()
-            raise HTTPException(429, "an episode is already in flight, try again shortly")
 
         if _global_triggers_today(conn) >= GLOBAL_DAILY_CAP:
             _audit(conn, role, "/trigger", "rejected: global daily cap reached", ip)
@@ -291,7 +323,7 @@ def trigger(
     conn.close()
 
     result = subprocess.run(
-        [sys.executable, str(INJECTOR_PATH)],
+        [sys.executable, str(INJECTOR_PATH), "--class", fault_class],
         cwd=str(INJECTOR_CWD),
         capture_output=True,
         text=True,
@@ -299,7 +331,58 @@ def trigger(
     )
     if result.returncode != 0:
         raise HTTPException(500, f"injector failed: {result.stderr}")
-    return {"status": "triggered", "output": result.stdout}
+
+    # injector.py writes ground truth straight to SQLite -- read the real
+    # episode_id back from there rather than scraping it out of stdout text.
+    conn = _conn()
+    row = conn.execute(
+        "SELECT episode_id FROM episodes WHERE fault_class = ? ORDER BY t0 DESC LIMIT 1",
+        (fault_class,),
+    ).fetchone()
+    conn.close()
+    episode_id = row[0] if row else None
+
+    # Close the loop for real: injector.py only creates the episode with
+    # ground truth -- nothing scored it until now, which is why a
+    # triggered episode used to sit "in flight" forever (up to the 10-min
+    # staleness bound) with no diagnosis, action, or verdict ever recorded.
+    # p3_agent.py (the real agent, port 8001) must already be running for
+    # this to succeed -- p3_scorer.py calls it directly.
+    time.sleep(SETTLE_SECONDS)
+
+    scorer_result = subprocess.run(
+        [sys.executable, str(SCORER_PATH)],
+        cwd=str(SCORER_CWD),
+        capture_output=True,
+        text=True,
+        timeout=SCORER_TIMEOUT_S,
+    )
+    if scorer_result.returncode != 0:
+        # The episode itself is real and already recorded -- surface the
+        # scorer failure but don't pretend the whole trigger failed.
+        return {
+            "status": "triggered_but_unscored",
+            "episode_id": episode_id,
+            "scorer_error": scorer_result.stderr,
+        }
+
+    conn = _conn()
+    score_row = conn.execute(
+        "SELECT predicted_class, correct, action_taken, action_applied, durability_verdict "
+        "FROM scores WHERE episode_id = ?",
+        (episode_id,),
+    ).fetchone()
+    conn.close()
+
+    return {
+        "status": "scored",
+        "episode_id": episode_id,
+        "predicted_class": score_row[0] if score_row else None,
+        "correct": bool(score_row[1]) if score_row else None,
+        "action_taken": score_row[2] if score_row else None,
+        "action_applied": bool(score_row[3]) if score_row and score_row[3] is not None else None,
+        "durability_verdict": score_row[4] if score_row else None,
+    }
 
 
 @app.post("/promote")
