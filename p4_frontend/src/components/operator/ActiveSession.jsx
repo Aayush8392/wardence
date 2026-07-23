@@ -10,6 +10,17 @@ import { useEffect, useState } from "react";
 const SETTLE_SECONDS = 35;
 const INJECT_PHASE_MS = 2000; // rough real-world time for the inject call itself to land
 
+// M:SS, no cap -- unlike the settle progress bar (bounded to a known
+// SETTLE_SECONDS constant), diagnosis has no known duration, so this just
+// counts up plainly (0:59 -> 1:00 -> 1:01 ...) rather than pretending to
+// know when it'll finish.
+function formatMinSec(ms) {
+  const totalSeconds = Math.floor(ms / 1000);
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 function useElapsed(startedAt) {
   const [elapsedMs, setElapsedMs] = useState(0);
 
@@ -42,6 +53,7 @@ export default function ActiveSession({ triggeringClass, triggerStartedAt, lastR
   const settleElapsed = Math.max(elapsedMs - INJECT_PHASE_MS, 0);
   const settlePct = Math.min((settleElapsed / (SETTLE_SECONDS * 1000)) * 100, 100);
   const phase = !inflight ? null : elapsedMs < INJECT_PHASE_MS ? "inject" : settlePct < 100 ? "settle" : "diagnose";
+  const diagnoseElapsedMs = phase === "diagnose" ? Math.max(elapsedMs - INJECT_PHASE_MS - SETTLE_SECONDS * 1000, 0) : 0;
 
   return (
     <div className="bg-surface-container-low border border-outline min-h-[320px] flex flex-col">
@@ -65,8 +77,26 @@ export default function ActiveSession({ triggeringClass, triggerStartedAt, lastR
             </div>
 
             <div className="flex flex-col gap-1">
-              <div className={`flex items-center gap-2 ${phase === "settle" ? "text-primary" : "text-on-surface-variant opacity-50"}`}>
-                <span className="material-symbols-outlined text-xs animate-spin">refresh</span>
+              {/* Three real states now, matching the icon's own three
+                  branches -- previously this only distinguished "settle"
+                  (bright) from everything else (dimmed), so once settle
+                  reached DONE the icon turned bright green but the
+                  surrounding text/row stayed dimmed, a mismatch against
+                  the "Injecting fault" row above (always full brightness
+                  once done). Done now gets the same bright green as that
+                  row, not a half-dim/half-bright state. */}
+              <div
+                className={`flex items-center gap-2 ${
+                  phase === "diagnose" ? "text-[#238636]" : phase === "settle" ? "text-primary" : "text-on-surface-variant opacity-50"
+                }`}
+              >
+                {phase === "settle" ? (
+                  <span className="material-symbols-outlined text-xs animate-spin">refresh</span>
+                ) : phase === "diagnose" ? (
+                  <span className="material-symbols-outlined text-xs">check_circle</span>
+                ) : (
+                  <span className="material-symbols-outlined text-xs">hourglass_empty</span>
+                )}
                 <span>[{phase === "settle" ? "PENDING" : phase === "diagnose" ? "DONE" : "WAITING"}] Settle period (~{SETTLE_SECONDS}s)</span>
               </div>
               {phase === "settle" && (
@@ -81,6 +111,13 @@ export default function ActiveSession({ triggeringClass, triggerStartedAt, lastR
                 {phase === "diagnose" ? "refresh" : "hourglass_empty"}
               </span>
               <span>[{phase === "diagnose" ? "PENDING" : "WAITING"}] AI diagnosis + scoring</span>
+              {/* Live counter, no known duration to bound it against (unlike
+                  settle's real SETTLE_SECONDS constant) -- just counts up so
+                  it's visibly alive rather than looking frozen during a
+                  genuinely variable-length real network call. */}
+              {phase === "diagnose" && (
+                <span className="ml-auto text-primary">{formatMinSec(diagnoseElapsedMs)}</span>
+              )}
             </div>
           </>
         )}
@@ -90,10 +127,23 @@ export default function ActiveSession({ triggeringClass, triggerStartedAt, lastR
             <div className={lastResult.correct ? "text-[#238636]" : "text-error"}>
               [DONE] Predicted: {lastResult.predicted_class ?? "n/a"} — {lastResult.correct ? "correct" : "incorrect"}
             </div>
+            {/* target/confidence/totalElapsedMs added 2026-07-24 -- all real,
+                already-stored values (target from episodes, confidence from
+                scores, same fields Calibration/Replay Viewer already use),
+                not new numbers invented for this view. */}
+            {lastResult.target && (
+              <div className="text-on-surface-variant">Target: {lastResult.target}</div>
+            )}
+            {lastResult.confidence != null && (
+              <div className="text-on-surface-variant">Confidence: {lastResult.confidence.toFixed(2)}</div>
+            )}
             {lastResult.action_taken && (
               <div className="text-on-surface-variant">
                 Action: {lastResult.action_taken} ({lastResult.durability_verdict ?? "pending"})
               </div>
+            )}
+            {lastResult.totalElapsedMs != null && (
+              <div className="text-on-surface-variant">Total elapsed: {formatMinSec(lastResult.totalElapsedMs)}</div>
             )}
             {lastResult.scorer_error && (
               <div className="text-error">Scoring failed: {lastResult.scorer_error}</div>

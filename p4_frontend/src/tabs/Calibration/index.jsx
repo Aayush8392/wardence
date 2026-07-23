@@ -64,7 +64,13 @@ export default function Calibration() {
         </div>
       </div>
 
-      <div className="grid grid-cols-12 gap-6">
+      {/* items-start, not the grid default of stretch -- otherwise the
+          scatter plot's real height gets squeezed to match the right
+          column's height (short when nothing's selected, tall once a
+          detail panel renders), so the beeswarm layout has less room to
+          spread dots into and more of them visually stack on top of each
+          other. Same bug class as the Replay Viewer height-sync fix. */}
+      <div className="grid grid-cols-12 gap-6 items-start">
         <ScatterPlot episodes={visible} selectedId={selected?.episode_id} onSelect={setSelected} />
 
         <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">

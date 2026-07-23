@@ -44,16 +44,35 @@ sys.path.insert(0, str(Path(__file__).parent))
 import sqlite3  # noqa: E402
 
 import accounts  # noqa: E402
+import publish_to_r2  # noqa: E402
 from auth import create_token, decode_token  # noqa: E402
 from trust_engine import (  # noqa: E402
     CAN_ACT,
     DB_PATH,
-    DEMOTED,
     PROMOTION_STREAK,
+    REPORT_ONLY,
     ensure_trust_tables,
     get_trust_state,
     manual_set_state,
 )
+
+
+def _republish_to_r2() -> None:
+    """Refresh the public R2 snapshot right after a manual trust-state
+    change (2026-07-24 fix). Without this, admin's /promote or /demote
+    changes the LIVE DB instantly but the public Trust Ladder page (which
+    reads the R2 snapshot, not the live DB -- see wardence_context.md Zone
+    2) wouldn't show it until the next manual publish_to_r2.py run,
+    making the override look like it silently failed. Best-effort: a
+    publish failure (e.g. R2 credentials/network issue) must NOT fail the
+    underlying trust-state change, which already succeeded in the DB --
+    it just means the public snapshot stays stale until the next run,
+    same as today, not a regression.
+    """
+    try:
+        publish_to_r2.main()
+    except Exception as e:  # noqa: BLE001 -- deliberately broad, see docstring
+        print(f"WARNING: R2 republish after manual override failed: {e}")
 
 app = FastAPI()
 
@@ -367,12 +386,25 @@ def trigger(
         }
 
     conn = _conn()
+    # target + confidence added 2026-07-24 (frontend asked for more detail
+    # in Operator's completed-trigger summary) -- both were already stored,
+    # just not previously selected by this query. target comes from the
+    # episodes table (the injector's own record of what it hit), confidence
+    # from scores (the diagnoser's self-reported confidence, same field the
+    # Calibration tab already uses).
     score_row = conn.execute(
-        "SELECT predicted_class, correct, action_taken, action_applied, durability_verdict "
-        "FROM scores WHERE episode_id = ?",
+        "SELECT s.predicted_class, s.correct, s.action_taken, s.action_applied, s.durability_verdict, "
+        "s.confidence, e.target "
+        "FROM scores s JOIN episodes e ON e.episode_id = s.episode_id "
+        "WHERE s.episode_id = ?",
         (episode_id,),
     ).fetchone()
     conn.close()
+
+    # Refresh the R2 snapshot so "VIEW FULL REPLAY" (which reads episodes.json
+    # from R2, not the live DB) actually finds this episode right away --
+    # same staleness gap already fixed for /promote and /demote.
+    _republish_to_r2()
 
     return {
         "status": "scored",
@@ -382,6 +414,8 @@ def trigger(
         "action_taken": score_row[2] if score_row else None,
         "action_applied": bool(score_row[3]) if score_row and score_row[3] is not None else None,
         "durability_verdict": score_row[4] if score_row else None,
+        "confidence": score_row[5] if score_row else None,
+        "target": score_row[6] if score_row else None,
     }
 
 
@@ -391,9 +425,23 @@ def promote(fault_class: str, request: Request, payload: dict = Depends(require_
     if fault_class not in PROMOTION_STREAK:
         raise HTTPException(400, f"'{fault_class}' has no promotion policy")
     conn = _conn()
+    # Guard added 2026-07-24 (found during frontend testing): without this,
+    # force-promoting an ALREADY can_act class silently overwrote its real,
+    # earned streak with the fixed PROMOTION_STREAK[fault_class] floor (5) --
+    # a real class (disk-full) has genuinely earned streaks past 5 (10, 11)
+    # via real correct fixes, and a stray click would have fabricated the
+    # published Trust Ladder number. This endpoint is meant only for
+    # recovering a class after a KNOWN-BOGUS demotion (see oom's token-expiry
+    # and disk-full's settle-wait incidents in wardence_buildlog.md), never
+    # for touching a class that's already trusted.
+    current = get_trust_state(conn, fault_class)
+    if current["state"] == CAN_ACT:
+        conn.close()
+        raise HTTPException(400, f"'{fault_class}' is already can_act -- nothing to promote")
     manual_set_state(conn, fault_class, CAN_ACT, streak=PROMOTION_STREAK[fault_class])
     _audit(conn, role, "/promote", f"fault_class={fault_class}", request.client.host)
     conn.close()
+    _republish_to_r2()
     return {"fault_class": fault_class, "state": CAN_ACT}
 
 
@@ -401,10 +449,25 @@ def promote(fault_class: str, request: Request, payload: dict = Depends(require_
 def demote(fault_class: str, request: Request, payload: dict = Depends(require_role("admin"))):
     role = payload["role"]
     conn = _conn()
-    manual_set_state(conn, fault_class, DEMOTED, streak=0)
+    # Guard + state fix added 2026-07-24 (found during frontend testing):
+    # (1) demoting an already report_only class had nothing real to revoke,
+    # and (2) manual demotion previously wrote the literal state "demoted",
+    # which the NATURAL scorer pipeline (trust_engine.record_outcome) never
+    # produces -- a real automatic demotion lands on REPORT_ONLY instead
+    # (see that function's docstring/logic). The two paths wrote different
+    # state values for the same real-world meaning, so a manually-forced
+    # demotion rendered a different Trust Ladder badge than a real one.
+    # Fixed by aligning manual demotion onto the same REPORT_ONLY state the
+    # real pipeline uses.
+    current = get_trust_state(conn, fault_class)
+    if current["state"] == REPORT_ONLY:
+        conn.close()
+        raise HTTPException(400, f"'{fault_class}' is already report_only -- nothing to demote")
+    manual_set_state(conn, fault_class, REPORT_ONLY, streak=0)
     _audit(conn, role, "/demote", f"fault_class={fault_class}", request.client.host)
     conn.close()
-    return {"fault_class": fault_class, "state": DEMOTED}
+    _republish_to_r2()
+    return {"fault_class": fault_class, "state": REPORT_ONLY}
 
 
 # --- Accounts (2026-07-22) -------------------------------------------------

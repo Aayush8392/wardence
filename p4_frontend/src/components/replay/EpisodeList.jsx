@@ -1,4 +1,24 @@
+import { useEffect, useRef } from "react";
+
 export default function EpisodeList({ episodes, selectedId, onSelect, maxHeight }) {
+  // Selection highlight alone doesn't bring the row into view -- the list
+  // is sorted t0 DESC and capped to the detail panel's height (internal
+  // scroll), so a selection arriving via cross-tab jump (Trust Ladder /
+  // Calibration) can land anywhere in that scroll range. Scroll it into
+  // view explicitly whenever the selection changes.
+  const selectedRef = useRef(null);
+
+  // Also re-run once maxHeight arrives (not just on selectedId change) --
+  // maxHeight starts null on first mount (the detail panel's ResizeObserver
+  // hasn't measured yet), so the list has no internal scroll container to
+  // scroll WITHIN when this first fires. Without maxHeight in the deps, the
+  // scroll silently no-ops (or scrolls the outer page instead, which then
+  // gets reset once the container becomes height-capped a frame later) and
+  // nothing re-triggers it once the real cap lands.
+  useEffect(() => {
+    selectedRef.current?.scrollIntoView({ block: "center" });
+  }, [selectedId, maxHeight]);
+
   return (
     <section
       className="w-80 shrink-0 border-r border-outline-variant flex flex-col overflow-hidden"
@@ -11,9 +31,12 @@ export default function EpisodeList({ episodes, selectedId, onSelect, maxHeight 
         {episodes.map((ep) => (
           <div
             key={ep.episode_id}
+            ref={ep.episode_id === selectedId ? selectedRef : null}
             onClick={() => onSelect(ep.episode_id)}
             className={`p-4 border-b border-outline-variant hover:bg-surface-variant cursor-pointer transition-colors ${
-              ep.episode_id === selectedId ? "bg-surface-container-high" : ""
+              ep.episode_id === selectedId
+                ? "bg-surface-container-high border border-primary ring-1 ring-primary/40 -m-px"
+                : ""
             }`}
           >
             <div className="flex justify-between items-start mb-2">

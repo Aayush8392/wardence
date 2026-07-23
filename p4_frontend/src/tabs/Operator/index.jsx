@@ -38,7 +38,13 @@ export default function Operator() {
   const [errorMsg, setErrorMsg] = useState(null);
 
   const [busyClass, setBusyClass] = useState(null); // promote/demote in flight
-  const [demotedClass, setDemotedClass] = useState(null); // for "Review Decision" (pair #3)
+  // Single "last override" slot, not two independent promoted/demoted
+  // variables -- two separate state values meant nothing ever cleared the
+  // OTHER one, so promoting then demoting (or vice versa) left both
+  // banners stacked visible at once. Collapsing to one slot makes only-one-
+  // at-a-time true by construction, not something to remember to enforce.
+  const [lastOverride, setLastOverride] = useState(null); // { type: "promoted" | "demoted", faultClass }
+  const [overrideBannerDismissed, setOverrideBannerDismissed] = useState(false);
   const [bannerDismissed, setBannerDismissed] = useState(false);
 
   // Consume a cross-tab jump from Replay Viewer's "Promote Class" link (pair #4)
@@ -76,11 +82,16 @@ export default function Operator() {
     setLastResult(null);
     setTriggeringClass(faultClass);
     setTriggerStartedAt(Date.now());
+    const startedAt = Date.now();
     try {
       // Real pipeline: inject -> 35s settle -> diagnose+act+score. Can take
       // a few minutes total, not seconds.
       const result = await triggerFault(faultClass, token);
-      setLastResult(result);
+      // Real, client-measured total elapsed -- captured here (before the
+      // finally block clears triggerStartedAt) since ActiveSession's own
+      // completed-view needs a number to display, not just the in-progress
+      // timeline's live ticker.
+      setLastResult({ ...result, totalElapsedMs: Date.now() - startedAt });
       loadTriggerStatus();
     } catch (e) {
       setErrorMsg(e.message);
@@ -96,6 +107,8 @@ export default function Operator() {
     try {
       await promoteClass(faultClass, token);
       loadTrustMap();
+      setLastOverride({ type: "promoted", faultClass });
+      setOverrideBannerDismissed(false); // re-arm in case a prior banner was dismissed
     } catch (e) {
       setErrorMsg(e.message);
     } finally {
@@ -109,7 +122,8 @@ export default function Operator() {
     try {
       await demoteClass(faultClass, token);
       loadTrustMap();
-      setDemotedClass(faultClass); // pair #3
+      setLastOverride({ type: "demoted", faultClass }); // pair #3
+      setOverrideBannerDismissed(false); // re-arm in case a prior banner was dismissed
     } catch (e) {
       setErrorMsg(e.message);
     } finally {
@@ -119,6 +133,16 @@ export default function Operator() {
 
   return (
     <div className="max-w-[1600px] mx-auto">
+      {/* Sticky, not static -- these banners are the visual confirmation
+          for an action the user just took (promote/demote/arrival), but
+          they render at the top of the PAGE CONTENT, not the viewport. If
+          you'd already scrolled down (e.g. to click a button further down
+          the page), a static banner is off-screen and easy to miss
+          entirely. Sticking to the viewport top once scrolled past its
+          natural position keeps it visible regardless of scroll position.
+          Solid bg (not the banners' own translucent backgrounds) so
+          content scrolling underneath doesn't show through once pinned. */}
+      <div className="sticky top-0 z-40 bg-surface-container-lowest">
       {highlightClass && !bannerDismissed && (
         <div className="bg-primary/10 border border-primary/30 px-4 py-2 mb-4 flex items-center justify-between">
           <p className="font-body-sm text-sm text-primary flex items-center gap-2">
@@ -132,19 +156,52 @@ export default function Operator() {
         </div>
       )}
 
-      {demotedClass && (
-        <div className="bg-error-container/10 border border-error-container/30 px-4 py-2 mb-4 flex items-center justify-between">
-          <p className="font-body-sm text-sm text-error">
-            <span className="font-data-mono font-bold">{demotedClass}</span> was just demoted.
-          </p>
-          <button
-            onClick={() => navigateTo("/", { type: "faultClass", faultClass: demotedClass }, "Operator")}
-            className="font-label-caps text-[11px] text-primary hover:underline"
-          >
-            REVIEW DECISION →
-          </button>
-        </div>
+      {lastOverride && !overrideBannerDismissed && (
+        lastOverride.type === "promoted" ? (
+          <div className="bg-primary/10 border border-primary/30 px-4 py-2 mb-4 flex items-center justify-between">
+            <p className="font-body-sm text-sm text-primary flex items-center gap-2">
+              <span className="material-symbols-outlined text-sm">check_circle</span>
+              <span className="font-data-mono font-bold">{lastOverride.faultClass}</span> was just promoted to
+              CAN-ACT.
+            </p>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => navigateTo("/", { type: "faultClass", faultClass: lastOverride.faultClass }, "Operator")}
+                className="font-label-caps text-[11px] text-primary hover:underline"
+              >
+                VIEW TRUST LADDER →
+              </button>
+              <button
+                onClick={() => setOverrideBannerDismissed(true)}
+                className="text-on-surface-variant hover:text-on-surface"
+              >
+                <span className="material-symbols-outlined text-sm">close</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="bg-error-container/10 border border-error-container/30 px-4 py-2 mb-4 flex items-center justify-between">
+            <p className="font-body-sm text-sm text-error">
+              <span className="font-data-mono font-bold">{lastOverride.faultClass}</span> was just demoted.
+            </p>
+            <div className="flex items-center gap-3">
+              <button
+                onClick={() => navigateTo("/", { type: "faultClass", faultClass: lastOverride.faultClass }, "Operator")}
+                className="font-label-caps text-[11px] text-primary hover:underline"
+              >
+                REVIEW DECISION →
+              </button>
+              <button
+                onClick={() => setOverrideBannerDismissed(true)}
+                className="text-on-surface-variant hover:text-on-surface"
+              >
+                <span className="material-symbols-outlined text-sm">close</span>
+              </button>
+            </div>
+          </div>
+        )
       )}
+      </div>
 
       {errorMsg && <p className="text-error text-sm mb-4">{errorMsg}</p>}
 
