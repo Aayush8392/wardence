@@ -19,9 +19,11 @@ circuit breaker.
 
 Usage:
     Agent must be running: uvicorn p3_agent:app --reload --app-dir p3_trust_action --port 8001
-    python3 p3_scorer.py
+    python3 p3_scorer.py                       # scores the most recent unscored episode
+    python3 p3_scorer.py --episode-id <id>      # scores that SPECIFIC episode (used by operator_api.py)
 """
 
+import argparse
 import datetime
 import json
 import sqlite3
@@ -148,18 +150,60 @@ def get_unscored_episode(conn: sqlite3.Connection):
     return episode_id, fault_class, target, namespace
 
 
+def get_episode_by_id(conn: sqlite3.Connection, episode_id: str):
+    """
+    Score a SPECIFIC episode, not "whatever's most recent" (2026-07-24,
+    Phase B). operator_api.py's /trigger/resolve always knows exactly
+    which episode it wants scored -- it's the one it just injected -- so
+    it should never rely on the "most recent unscored" heuristic
+    get_unscored_episode() uses for manual/CLI runs. That heuristic is
+    only a reasonable guess when the caller doesn't know a specific ID;
+    once a caller DOES know, guessing is a real correctness risk (e.g. the
+    future parked multi-inject case: inject crash-loop, then inject oom,
+    then click "fix" on crash-loop -- "most recent unscored" would
+    silently score oom's episode instead, applying the wrong real action).
+    No staleness check here -- the caller (operator_api.py) already
+    enforces its own, tighter, real-time-window-based expiry check BEFORE
+    ever invoking this, so by the time this runs the caller has already
+    decided the episode is fresh enough to score.
+    """
+    row = conn.execute(
+        """
+        SELECT e.episode_id, e.fault_class, e.target, e.namespace
+        FROM episodes e
+        LEFT JOIN scores s ON e.episode_id = s.episode_id
+        WHERE e.episode_id = ? AND s.episode_id IS NULL
+        """,
+        (episode_id,),
+    ).fetchone()
+    if row is None:
+        print(f"Episode '{episode_id}' not found, or already scored.")
+        return None
+    return row
+
+
 def diagnosis_matches(predicted: str, actual: str) -> bool:
     return predicted.strip().lower() == actual.strip().lower()
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--episode-id", dest="episode_id", default=None,
+        help="Score this specific episode instead of guessing the most recent unscored one.",
+    )
+    args = parser.parse_args()
+
     conn = sqlite3.connect(DB_PATH)
     ensure_scores_table(conn)
     ensure_episode_snapshots_table(conn)
     ensure_trust_tables(conn)
     ensure_circuit_breaker_table(conn)
 
-    episode = get_unscored_episode(conn)
+    if args.episode_id:
+        episode = get_episode_by_id(conn, args.episode_id)
+    else:
+        episode = get_unscored_episode(conn)
     if episode is None:
         print("No unscored episodes found.")
         return

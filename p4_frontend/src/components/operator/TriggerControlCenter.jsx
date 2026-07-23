@@ -1,15 +1,39 @@
-const NOT_YET_TRIGGERABLE = [
-  { label: "OOM / Memory Leak" },
-  { label: "Disk-Full Overflow" },
-  { label: "Network Latency" },
-];
+const NOT_YET_TRIGGERABLE = [{ label: "Network Latency" }];
+// oom/disk-full moved out of this list 2026-07-24 (Phase B) -- both are
+// now real, live-triggerable classes (injector.py + p3_agent.py's
+// ACTION_MAP already fully supported them; the only gap was
+// operator_api.py's IMPLEMENTED_CLASSES). network-latency stays here --
+// it's report-only by design (no fix action exists), and wiring it into
+// live /trigger was never part of this pass.
 
-function FaultCard({ faultClass, token, role, safeDemoClasses, triggerStatus, running, onTrigger }) {
+function FaultCard({
+  faultClass,
+  token,
+  role,
+  safeDemoClasses,
+  triggerStatus,
+  running,
+  resolving,
+  awaitingFix,
+  onTrigger,
+  onResolve,
+}) {
   const cooldownActive = (triggerStatus?.your_cooldown_remaining_s ?? 0) > 0;
   const blocked = triggerStatus?.episode_in_flight || cooldownActive;
 
+  // awaiting-fix and running BOTH take priority over "blocked" -- once
+  // THIS card's fault has landed, its button must become "Diagnose &
+  // Fix" regardless of cooldown/cap state; and while THIS card's own
+  // inject call is in flight, it must keep showing its own "INJECTING…"
+  // state, not "EPISODE IN FLIGHT" -- even though episode_in_flight is
+  // now optimistically true the instant the click fires (2026-07-24 fix,
+  // see Operator/index.jsx's effectiveTriggerStatus), that flag is true
+  // BECAUSE of this card's own click, not a reason to grey ITSELF out.
+  // It's still the correct reason to grey out every OTHER card.
   let state = "active";
-  if (!token) state = "locked";
+  if (awaitingFix) state = "awaiting-fix";
+  else if (running) state = "active";
+  else if (!token) state = "locked";
   else if (role === "demo-trigger" && !safeDemoClasses.includes(faultClass)) state = "admin-only";
   else if (blocked) state = "cooldown";
 
@@ -65,6 +89,29 @@ function FaultCard({ faultClass, token, role, safeDemoClasses, triggerStatus, ru
     );
   }
 
+  if (state === "awaiting-fix") {
+    // A real fault this card just injected has landed and is waiting for
+    // the user to confirm it on the frontend and deliberately click to
+    // fix it -- distinct border color so it's visually unmistakable which
+    // card is actionable right now, especially since every other card is
+    // simultaneously locked by the system-wide episode_in_flight guard.
+    return (
+      <div className="border-2 border-[#238636] bg-[#238636]/5 p-4 flex flex-col gap-4">
+        <div className="flex items-center justify-between">
+          <span className="font-bold">{label}</span>
+          <span className="material-symbols-outlined text-[#238636] text-sm">bug_report</span>
+        </div>
+        <button
+          onClick={() => onResolve(faultClass)}
+          disabled={resolving}
+          className="w-full py-2 bg-[#238636] text-white font-label-caps text-[11px] font-bold hover:brightness-110 transition-all disabled:opacity-60"
+        >
+          {resolving ? "DIAGNOSING… (can take a few minutes)" : "DIAGNOSE & FIX"}
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="border border-primary bg-primary/5 p-4 flex flex-col gap-4">
       <div className="flex items-center justify-between">
@@ -76,7 +123,7 @@ function FaultCard({ faultClass, token, role, safeDemoClasses, triggerStatus, ru
         disabled={running}
         className="w-full py-2 bg-primary text-on-primary font-label-caps text-[11px] font-bold hover:brightness-110 transition-all disabled:opacity-60"
       >
-        {running ? "RUNNING… (can take a few minutes)" : "TRIGGER INJECTION"}
+        {running ? "INJECTING…" : "TRIGGER INJECTION"}
       </button>
     </div>
   );
@@ -89,7 +136,10 @@ export default function TriggerControlCenter({
   safeDemoClasses,
   triggerStatus,
   triggeringClass,
+  awaitingFixClass,
+  resolvingClass,
   onTrigger,
+  onResolve,
 }) {
   return (
     <div className="bg-surface-container border border-outline">
@@ -110,7 +160,10 @@ export default function TriggerControlCenter({
                 safeDemoClasses={safeDemoClasses}
                 triggerStatus={triggerStatus}
                 running={triggeringClass === fc}
+                resolving={resolvingClass === fc}
+                awaitingFix={awaitingFixClass === fc}
                 onTrigger={onTrigger}
+                onResolve={onResolve}
               />
             ))}
           </div>

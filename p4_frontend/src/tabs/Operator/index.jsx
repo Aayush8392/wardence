@@ -5,7 +5,8 @@ import {
   fetchTriggerStatus,
   fetchSystemStatus,
   fetchLiveTrust,
-  triggerFault,
+  injectFault,
+  resolveFault,
   promoteClass,
   demoteClass,
 } from "../../api/operator";
@@ -15,13 +16,12 @@ import AdminOverrides from "../../components/operator/AdminOverrides";
 import TriggerBudget from "../../components/operator/TriggerBudget";
 import ActiveSession from "../../components/operator/ActiveSession";
 
-// Real, locked constants -- not fabricated. injector.py only implements
-// crash-loop's live /trigger path so far (operator_api.py's
-// IMPLEMENTED_CLASSES/SAFE_DEMO_CLASSES both = {"crash-loop"} today); the
-// 3 auto-fix classes are the locked taxonomy (wardence_context.md) that
-// have a real promotion/demotion path.
-const TRIGGERABLE_CLASSES = ["crash-loop"];
-const SAFE_DEMO_CLASSES = ["crash-loop"];
+// Real, locked constants -- not fabricated. Matches operator_api.py's
+// IMPLEMENTED_CLASSES/SAFE_DEMO_CLASSES (2026-07-24, Phase B: all 3 locked
+// auto-fix classes are now live-triggerable and demo-safe, giving demo
+// users a real feel for the project's depth rather than just crash-loop).
+const TRIGGERABLE_CLASSES = ["crash-loop", "oom", "disk-full"];
+const SAFE_DEMO_CLASSES = ["crash-loop", "oom", "disk-full"];
 const AUTO_FIX_CLASSES = ["crash-loop", "oom", "disk-full"];
 
 export default function Operator() {
@@ -32,8 +32,15 @@ export default function Operator() {
   const [systemStatus, setSystemStatus] = useState(null);
   const [trustMap, setTrustMap] = useState({});
 
-  const [triggeringClass, setTriggeringClass] = useState(null);
-  const [triggerStartedAt, setTriggerStartedAt] = useState(null);
+  // Two-phase trigger flow (2026-07-24, see wardence_frontend.md): inject
+  // and resolve are now two separate, user-paced actions instead of one
+  // blocking call. injectedEpisode holds the real episode landed by
+  // inject, awaiting the user's deliberate Diagnose & Fix click.
+  const [injectingClass, setInjectingClass] = useState(null);
+  const [injectStartedAt, setInjectStartedAt] = useState(null);
+  const [injectedEpisode, setInjectedEpisode] = useState(null); // { faultClass, episodeId, t0 }
+  const [resolvingClass, setResolvingClass] = useState(null);
+  const [resolveStartedAt, setResolveStartedAt] = useState(null);
   const [lastResult, setLastResult] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
 
@@ -77,27 +84,59 @@ export default function Operator() {
 
   useEffect(() => { loadTrustMap(); }, [loadTrustMap]);
 
-  const handleTrigger = async (faultClass) => {
+  const handleInject = async (faultClass) => {
     setErrorMsg(null);
     setLastResult(null);
-    setTriggeringClass(faultClass);
-    setTriggerStartedAt(Date.now());
-    const startedAt = Date.now();
+    setInjectedEpisode(null);
+    setInjectingClass(faultClass);
+    setInjectStartedAt(Date.now());
     try {
-      // Real pipeline: inject -> 35s settle -> diagnose+act+score. Can take
-      // a few minutes total, not seconds.
-      const result = await triggerFault(faultClass, token);
-      // Real, client-measured total elapsed -- captured here (before the
-      // finally block clears triggerStartedAt) since ActiveSession's own
-      // completed-view needs a number to display, not just the in-progress
-      // timeline's live ticker.
-      setLastResult({ ...result, totalElapsedMs: Date.now() - startedAt });
+      const result = await injectFault(faultClass, token);
+      // Real fault has landed -- hand off to the "awaiting fix" state.
+      // Nothing auto-advances from here; the user must confirm on the
+      // live frontend and click DIAGNOSE & FIX deliberately.
+      setInjectedEpisode({ faultClass, episodeId: result.episode_id, t0: result.t0 });
       loadTriggerStatus();
     } catch (e) {
       setErrorMsg(e.message);
     } finally {
-      setTriggeringClass(null);
-      setTriggerStartedAt(null);
+      setInjectingClass(null);
+      setInjectStartedAt(null);
+    }
+  };
+
+  const handleResolve = async (faultClass) => {
+    if (!injectedEpisode || injectedEpisode.faultClass !== faultClass) return;
+    setErrorMsg(null);
+    setResolvingClass(faultClass);
+    setResolveStartedAt(Date.now());
+    const startedAt = Date.now();
+    try {
+      // Real pipeline: the backend silently pads out any remaining settle
+      // time before diagnosing -- see operator_api.py's /trigger/resolve
+      // and wardence_frontend.md's "Two-Phase Trigger Flow" section. Can
+      // take a few minutes total, not seconds -- deliberately shown as one
+      // continuous busy state, never split into "waiting" vs "diagnosing".
+      const result = await resolveFault(injectedEpisode.episodeId, token);
+      setLastResult({ ...result, totalElapsedMs: Date.now() - startedAt });
+      setInjectedEpisode(null);
+      loadTriggerStatus();
+    } catch (e) {
+      setErrorMsg(e.message);
+      // 410 = operator_api.py's RESOLVE_WINDOW_MAX_S hard block -- this
+      // specific episode will NEVER be scorable now (elapsed only grows),
+      // so retrying "Diagnose & Fix" on it is pointless. Clear it so the
+      // card reverts to "Trigger Injection" instead of leaving the user
+      // stuck retrying a dead episode forever. Deliberately NOT done for
+      // other errors (e.g. a transient agent hiccup) -- those episodes
+      // may still be genuinely resolvable, so the user should be able to
+      // retry the SAME episode rather than lose it.
+      if (e.status === 410) {
+        setInjectedEpisode(null);
+      }
+    } finally {
+      setResolvingClass(null);
+      setResolveStartedAt(null);
     }
   };
 
@@ -130,6 +169,21 @@ export default function Operator() {
       setBusyClass(null);
     }
   };
+
+  // Real bug found during Phase B testing (2026-07-24): triggerStatus is
+  // only fetched from the server on mount + after this session's own
+  // actions complete -- so "an episode is in flight" only appeared on
+  // cards/widgets AFTER injector.py's subprocess finished and a fresh
+  // fetch landed, not the instant the user clicked "Trigger Injection".
+  // Fixed by overlaying what THIS session already knows client-side
+  // (injecting/awaiting-fix/resolving) onto the server's own flag --
+  // true the moment either side thinks something is happening, cleared
+  // the instant both agree nothing is. Doesn't touch the server's other
+  // fields (cooldown/cap numbers), only episode_in_flight.
+  const clientKnownBusy = Boolean(injectingClass || injectedEpisode || resolvingClass);
+  const effectiveTriggerStatus = triggerStatus
+    ? { ...triggerStatus, episode_in_flight: triggerStatus.episode_in_flight || clientKnownBusy }
+    : triggerStatus;
 
   return (
     <div className="max-w-[1600px] mx-auto">
@@ -225,9 +279,12 @@ export default function Operator() {
             token={token}
             role={role}
             safeDemoClasses={SAFE_DEMO_CLASSES}
-            triggerStatus={triggerStatus}
-            triggeringClass={triggeringClass}
-            onTrigger={handleTrigger}
+            triggerStatus={effectiveTriggerStatus}
+            triggeringClass={injectingClass}
+            awaitingFixClass={injectedEpisode?.faultClass ?? null}
+            resolvingClass={resolvingClass}
+            onTrigger={handleInject}
+            onResolve={handleResolve}
           />
 
           {role === "admin" && (
@@ -243,10 +300,13 @@ export default function Operator() {
         </div>
 
         <div className="col-span-12 lg:col-span-4 space-y-6">
-          <TriggerBudget status={triggerStatus} />
+          <TriggerBudget status={effectiveTriggerStatus} />
           <ActiveSession
-            triggeringClass={triggeringClass}
-            triggerStartedAt={triggerStartedAt}
+            injectingClass={injectingClass}
+            injectStartedAt={injectStartedAt}
+            injectedEpisode={injectedEpisode}
+            resolvingClass={resolvingClass}
+            resolveStartedAt={resolveStartedAt}
             lastResult={lastResult}
             onViewReplay={(episodeId) => navigateTo(`/replay/${episodeId}`, null, "Operator")}
           />

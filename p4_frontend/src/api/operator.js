@@ -25,7 +25,14 @@ async function request(path, { method = "GET", token, body, params } = {}) {
 
   const data = await res.json().catch(() => null);
   if (!res.ok) {
-    throw new Error(data?.detail ?? `${method} ${path} failed: ${res.status}`);
+    const err = new Error(data?.detail ?? `${method} ${path} failed: ${res.status}`);
+    // Status attached (2026-07-24) so callers can distinguish error KINDS
+    // without string-matching messages -- e.g. a 410 from /trigger/resolve
+    // means the fault's diagnosability window expired and the episode
+    // will never be scored, which needs different handling (abandon it,
+    // don't let the user retry) than a transient failure would.
+    err.status = res.status;
+    throw err;
   }
   return data;
 }
@@ -55,8 +62,20 @@ export function fetchLiveTrust(token) {
   return request("/trust", { token }).then((d) => d.states);
 }
 
-export function triggerFault(faultClass, token) {
-  return request("/trigger", { method: "POST", token, params: { fault_class: faultClass } });
+// Two-phase trigger flow (2026-07-24, see wardence_frontend.md): inject
+// returns immediately once the fault has landed; resolve is a SEPARATE,
+// user-clicked action that runs the real diagnose+act+score pipeline.
+// resolve may take longer than its own network round-trip suggests -- the
+// backend silently pads out the remaining settle window server-side if
+// resolve is called too soon after inject. The frontend must show one
+// continuous busy state for the whole resolve call, never a distinct
+// "waiting to stabilize" message -- see that file for why.
+export function injectFault(faultClass, token) {
+  return request("/trigger/inject", { method: "POST", token, params: { fault_class: faultClass } });
+}
+
+export function resolveFault(episodeId, token) {
+  return request("/trigger/resolve", { method: "POST", token, params: { episode_id: episodeId } });
 }
 
 export function promoteClass(faultClass, token) {

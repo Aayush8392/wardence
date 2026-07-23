@@ -31,6 +31,7 @@ Usage:
 import datetime
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -93,8 +94,10 @@ app.add_middleware(
 # regardless of the account itself being revocable.
 DEFAULT_SESSION_HOURS = 24
 
-IMPLEMENTED_CLASSES = {"crash-loop"}  # injector.py only knows how to inject this so far
-SAFE_DEMO_CLASSES = {"crash-loop"}  # curated subset, per wardence_context.md
+IMPLEMENTED_CLASSES = {"crash-loop", "oom", "disk-full"}
+# All 3 locked auto-fix classes -- decided 2026-07-24 (Phase B) to give demo
+# users a real feel for the project's depth, not just the cheapest class.
+SAFE_DEMO_CLASSES = {"crash-loop", "oom", "disk-full"}
 COOLDOWN_S = 60
 DAILY_CAP = 3  # per-IP cap -- a fairness layer, NOT the real budget protection
 
@@ -123,6 +126,87 @@ STATUS_NAMESPACE = "sock-shop"
 # full cycle has passed can read stale state and misdiagnose a genuine
 # fault as "no anomaly"). Never skip this, even here.
 SETTLE_SECONDS = 35
+
+# Extra margin added on top of whatever's left of SETTLE_SECONDS when
+# /trigger/resolve is called before the full settle window has naturally
+# elapsed (2026-07-24, two-phase trigger flow). Not a new race-condition
+# fix -- SETTLE_SECONDS is already the proven-sufficient number (see
+# disk-full's five-root-cause saga in wardence_buildlog.md) -- this is
+# just a small safety pad for the user-controlled variant, where "elapsed
+# since t0" is measured server-side at click time rather than via a fixed
+# sleep started right after injection.
+RESOLVE_SAFETY_BUFFER_S = 5
+
+# Real bug found during Phase B testing (2026-07-24): a user who took
+# several minutes between clicking "Trigger Injection" and "Diagnose &
+# Fix" (e.g. mid-discussion, mid-distraction) got back a hollow "scored"
+# response with every field null -- p3_scorer.py's OWN staleness guard
+# (MAX_EPISODE_AGE_MINUTES=10, meant for a totally different scenario --
+# an abandoned leftover row from an old session) silently refused to
+# score the episode, exited 0 anyway, and operator_api.py had no idea
+# nothing had actually happened.
+#
+# This constant is the REAL fix, not a bandage on that symptom: every
+# diagnosis query in agent.py has a genuine, bounded PromQL lookback
+# window (confirmed by reading the file, not assumed) -- [3m] for
+# restarts/OOM/eviction/memory-leak/connection-pool, [2m] for
+# network-latency. Wait too long past injection and the agent's own
+# queries will correctly see nothing, because the real evidence has
+# aged out of the window it checks -- producing a FALSE "wrong" that
+# reflects nothing about the system's real accuracy, only that the user
+# waited too long. That would silently corrupt the real published trust/
+# calibration stats with illegitimate data (the same contamination risk
+# flagged in the 2026-07-24 audit).
+#
+# 180s (3 minutes) sits just above the longest real query window (3m)
+# with a small buffer, comfortably covering every current live class's
+# own duration_s (max 60s) plus SETTLE_SECONDS. Past this, /trigger/
+# resolve hard-refuses rather than silently scoring a fault result that
+# isn't a fair reflection of the agent -- the episode is simply never
+# scored (matches this project's standing "refuse rather than corrupt"
+# principle, same as injector.py's own total-failure handling).
+RESOLVE_WINDOW_MAX_S = 180
+
+# Real concurrency guard, shared across BOTH /trigger/inject and
+# /trigger/resolve (2026-07-24, found during checklist review before the
+# two-phase flow was ever tested). The DB-backed checks each endpoint
+# already has (_episode_in_flight for inject, the "already scored" query
+# for resolve) both have the same blind spot: they can only see a row
+# that's already been WRITTEN. Neither can see work that's currently
+# running but hasn't produced a row yet --
+#   - inject: no episodes row exists until injector.py's subprocess
+#     finishes, so a fast double-click (or two different classes clicked
+#     back-to-back) can start TWO concurrent injector.py runs against the
+#     cluster before either check would catch it.
+#   - resolve: no scores row exists until p3_scorer.py's subprocess
+#     finishes, so a fast double-click can run the scorer twice,
+#     concurrently, against the same episode -- for an auto-fix class
+#     that means the real fix action could genuinely fire twice and
+#     trust_engine.record_outcome could double-count one real outcome
+#     into the streak.
+# One shared flag (not two separate per-phase ones) because the real
+# invariant is "only one episode in flight, in ANY phase, system-wide" --
+# the same invariant _episode_in_flight already enforces for the window
+# AFTER a row exists. Checked-and-set atomically under the lock so two
+# near-simultaneous requests can't both pass the check before either
+# marks itself busy.
+_TRIGGER_BUSY: dict | None = None  # {"phase": "injecting" | "resolving", "detail": str} or None while idle
+_TRIGGER_LOCK = threading.Lock()
+
+
+def _try_acquire_trigger_busy(phase: str, detail: str) -> bool:
+    global _TRIGGER_BUSY
+    with _TRIGGER_LOCK:
+        if _TRIGGER_BUSY is not None:
+            return False
+        _TRIGGER_BUSY = {"phase": phase, "detail": detail}
+        return True
+
+
+def _release_trigger_busy() -> None:
+    global _TRIGGER_BUSY
+    with _TRIGGER_LOCK:
+        _TRIGGER_BUSY = None
 
 # p3_scorer.py's own agent request timeout is already 180s (durability
 # windows run up to 3 min for oom -- see p3_scorer.py's docstring); give
@@ -209,7 +293,19 @@ def trust(request: Request, payload: dict = Depends(require_role("admin", "demo-
 # blocking demo-trigger with a 429 even though nothing was actually
 # running. Anything older than this is treated as abandoned, not in
 # flight -- same reasoning as p3_scorer.py's own fix.
-EPISODE_IN_FLIGHT_MAX_AGE_MINUTES = 10
+#
+# Lowered from 10 to 4 minutes (2026-07-24, real bug found during Phase B
+# testing): the ORIGINAL 10-minute number was never grounded in real
+# diagnosis behavior -- see RESOLVE_WINDOW_MAX_S below, which is the real,
+# newly-added hard limit on how long a fault stays genuinely diagnosable
+# (~3 minutes, derived from agent.py's actual PromQL lookback windows).
+# Leaving this at 10 would have created a real dead zone: an episode
+# correctly refused by /trigger/resolve as "too old to score" would still
+# report episode_in_flight=True for up to 6 more minutes, blocking a fresh
+# inject even after the system had already told the user the old one was
+# a lost cause. 4 minutes gives a small buffer above RESOLVE_WINDOW_MAX_S
+# (180s) without reintroducing that gap.
+EPISODE_IN_FLIGHT_MAX_AGE_MINUTES = 4
 
 
 def _episode_in_flight(conn) -> bool:
@@ -275,18 +371,27 @@ def trigger_status(request: Request):
     }
 
 
-@app.post("/trigger")
-def trigger(
+@app.post("/trigger/inject")
+def trigger_inject(
     fault_class: str,
     request: Request,
     payload: dict = Depends(require_role("admin", "demo-trigger")),
 ):
+    """
+    Phase 1 of the two-phase trigger flow (2026-07-24, superseding the old
+    single-call /trigger): injects only, returns immediately with the real
+    episode_id + t0. Does NOT settle-wait, diagnose, act, or score -- the
+    caller decides when to move to /trigger/resolve, after visually
+    confirming on the frontend that the fault actually landed. All the
+    same rate-limiting/safety checks the old /trigger had still apply here,
+    unchanged -- they gate INJECTION, not resolution.
+    """
     role = payload["role"]
     conn = _conn()
     ip = request.client.host
 
     if fault_class not in IMPLEMENTED_CLASSES:
-        _audit(conn, role, "/trigger", f"rejected: '{fault_class}' not implemented", ip)
+        _audit(conn, role, "/trigger/inject", f"rejected: '{fault_class}' not implemented", ip)
         conn.close()
         raise HTTPException(400, f"'{fault_class}' has no injector implementation yet")
 
@@ -298,100 +403,205 @@ def trigger(
     # admin should be able to bypass just because the cooldown/cap fairness
     # rules below don't apply to them.
     if _episode_in_flight(conn):
-        _audit(conn, role, "/trigger", "rejected: episode already in flight", ip)
+        _audit(conn, role, "/trigger/inject", "rejected: episode already in flight", ip)
         conn.close()
         raise HTTPException(429, "an episode is already in flight, try again shortly")
 
-    if role == "demo-trigger":
-        if fault_class not in SAFE_DEMO_CLASSES:
-            _audit(conn, role, "/trigger", f"rejected: '{fault_class}' not in safe subset", ip)
-            conn.close()
-            raise HTTPException(403, f"demo-trigger may only trigger {SAFE_DEMO_CLASSES}")
+    # Closes the real gap _episode_in_flight can't see -- see _TRIGGER_BUSY's
+    # module-level comment. Deliberately checked BEFORE the cooldown/cap
+    # bookkeeping below, so a busy-rejection never costs a demo-trigger
+    # caller their cooldown/daily-cap allowance for a request that never
+    # actually ran.
+    if not _try_acquire_trigger_busy("injecting", fault_class):
+        _audit(conn, role, "/trigger/inject", "rejected: another trigger call in progress", ip)
+        conn.close()
+        raise HTTPException(429, "an episode is already in flight, try again shortly")
 
-        if _global_triggers_today(conn) >= GLOBAL_DAILY_CAP:
-            _audit(conn, role, "/trigger", "rejected: global daily cap reached", ip)
-            conn.close()
-            raise HTTPException(429, f"site-wide daily cap of {GLOBAL_DAILY_CAP} reached, try again tomorrow")
-
-        last = conn.execute(
-            "SELECT triggered_at FROM demo_trigger_log WHERE ip = ? ORDER BY triggered_at DESC LIMIT 1",
-            (ip,),
-        ).fetchone()
-        if last is not None:
-            elapsed = conn.execute(
-                "SELECT (julianday('now') - julianday(?)) * 86400.0", (last[0],)
-            ).fetchone()[0]
-            if elapsed < COOLDOWN_S:
-                _audit(conn, role, "/trigger", "rejected: cooldown", ip)
+    # Everything from here on has already acquired _TRIGGER_BUSY -- every
+    # exit path (a rejection below, injector failure, or success) MUST
+    # release it, or one rejected/failed call would wedge every future
+    # trigger behind a busy flag nothing will ever clear.
+    try:
+        if role == "demo-trigger":
+            if fault_class not in SAFE_DEMO_CLASSES:
+                _audit(conn, role, "/trigger/inject", f"rejected: '{fault_class}' not in safe subset", ip)
                 conn.close()
-                raise HTTPException(429, f"cooldown active, wait {COOLDOWN_S - elapsed:.0f}s")
+                raise HTTPException(403, f"demo-trigger may only trigger {SAFE_DEMO_CLASSES}")
 
-        today_count = conn.execute(
-            "SELECT COUNT(*) FROM demo_trigger_log WHERE ip = ? AND date(triggered_at) = date('now')",
-            (ip,),
-        ).fetchone()[0]
-        if today_count >= DAILY_CAP:
-            _audit(conn, role, "/trigger", "rejected: daily cap reached", ip)
-            conn.close()
-            raise HTTPException(429, f"daily cap of {DAILY_CAP} reached for this IP")
+            if _global_triggers_today(conn) >= GLOBAL_DAILY_CAP:
+                _audit(conn, role, "/trigger/inject", "rejected: global daily cap reached", ip)
+                conn.close()
+                raise HTTPException(429, f"site-wide daily cap of {GLOBAL_DAILY_CAP} reached, try again tomorrow")
 
-        conn.execute("INSERT INTO demo_trigger_log (ip) VALUES (?)", (ip,))
-        conn.commit()
+            last = conn.execute(
+                "SELECT triggered_at FROM demo_trigger_log WHERE ip = ? ORDER BY triggered_at DESC LIMIT 1",
+                (ip,),
+            ).fetchone()
+            if last is not None:
+                elapsed = conn.execute(
+                    "SELECT (julianday('now') - julianday(?)) * 86400.0", (last[0],)
+                ).fetchone()[0]
+                if elapsed < COOLDOWN_S:
+                    _audit(conn, role, "/trigger/inject", "rejected: cooldown", ip)
+                    conn.close()
+                    raise HTTPException(429, f"cooldown active, wait {COOLDOWN_S - elapsed:.0f}s")
 
-    _audit(conn, role, "/trigger", f"fault_class={fault_class}", ip)
-    conn.close()
+            today_count = conn.execute(
+                "SELECT COUNT(*) FROM demo_trigger_log WHERE ip = ? AND date(triggered_at) = date('now')",
+                (ip,),
+            ).fetchone()[0]
+            if today_count >= DAILY_CAP:
+                _audit(conn, role, "/trigger/inject", "rejected: daily cap reached", ip)
+                conn.close()
+                raise HTTPException(429, f"daily cap of {DAILY_CAP} reached for this IP")
 
-    result = subprocess.run(
-        [sys.executable, str(INJECTOR_PATH), "--class", fault_class],
-        cwd=str(INJECTOR_CWD),
-        capture_output=True,
-        text=True,
-        timeout=90,
-    )
-    if result.returncode != 0:
-        raise HTTPException(500, f"injector failed: {result.stderr}")
+            # Cooldown/cap bookkeeping happens on INJECT, not resolve --
+            # "an episode was triggered" is the fairness-relevant event,
+            # matching the old /trigger's behavior.
+            conn.execute("INSERT INTO demo_trigger_log (ip) VALUES (?)", (ip,))
+            conn.commit()
 
-    # injector.py writes ground truth straight to SQLite -- read the real
-    # episode_id back from there rather than scraping it out of stdout text.
+        _audit(conn, role, "/trigger/inject", f"fault_class={fault_class}", ip)
+        conn.close()
+
+        result = subprocess.run(
+            [sys.executable, str(INJECTOR_PATH), "--class", fault_class],
+            cwd=str(INJECTOR_CWD),
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        if result.returncode != 0:
+            raise HTTPException(500, f"injector failed: {result.stderr}")
+
+        # injector.py writes ground truth straight to SQLite -- read the
+        # real episode_id + t0 back from there rather than scraping
+        # stdout text.
+        conn = _conn()
+        row = conn.execute(
+            "SELECT episode_id, t0 FROM episodes WHERE fault_class = ? ORDER BY t0 DESC LIMIT 1",
+            (fault_class,),
+        ).fetchone()
+        conn.close()
+        if row is None:
+            raise HTTPException(500, "injector reported success but no episode was recorded")
+
+        return {"status": "injected", "episode_id": row[0], "t0": row[1]}
+    finally:
+        # Deliberately NOT released here on the success path alone -- an
+        # unscored episode row now exists, so _episode_in_flight takes
+        # over as the guard for the "awaiting fix" window that follows.
+        # This flag only needs to cover the sub-window where NO row
+        # exists yet, which ends the instant this function returns
+        # (success) or raises (every rejection/failure path above).
+        _release_trigger_busy()
+
+
+@app.post("/trigger/resolve")
+def trigger_resolve(
+    episode_id: str,
+    request: Request,
+    payload: dict = Depends(require_role("admin", "demo-trigger")),
+):
+    """
+    Phase 2 of the two-phase trigger flow (2026-07-24): the user clicked
+    "Diagnose & Fix" for a real, already-injected episode. Enforces the
+    same SETTLE_SECONDS floor the old atomic /trigger always waited out --
+    if the user resolves fast, this silently sleeps out whatever's left
+    (+RESOLVE_SAFETY_BUFFER_S) before actually diagnosing; if they waited
+    long enough on their own, it proceeds immediately. Deliberately does
+    NOT expose which of those two cases happened -- see
+    wardence_frontend.md's "Two-Phase Trigger Flow" section for why the
+    settle-wait must stay invisible to the end user.
+    """
+    role = payload["role"]
     conn = _conn()
+    ip = request.client.host
+
     row = conn.execute(
-        "SELECT episode_id FROM episodes WHERE fault_class = ? ORDER BY t0 DESC LIMIT 1",
-        (fault_class,),
+        "SELECT t0 FROM episodes WHERE episode_id = ?", (episode_id,)
     ).fetchone()
+    if row is None:
+        _audit(conn, role, "/trigger/resolve", f"rejected: no such episode '{episode_id}'", ip)
+        conn.close()
+        raise HTTPException(404, f"no such episode '{episode_id}'")
+
+    already_scored = conn.execute(
+        "SELECT 1 FROM scores WHERE episode_id = ?", (episode_id,)
+    ).fetchone()
+    if already_scored is not None:
+        _audit(conn, role, "/trigger/resolve", f"rejected: '{episode_id}' already scored", ip)
+        conn.close()
+        raise HTTPException(409, f"episode '{episode_id}' was already resolved")
+
+    # Hard block, checked BEFORE acquiring the busy flag or sleeping --
+    # see RESOLVE_WINDOW_MAX_S's module-level comment. This episode will
+    # NEVER be scored past this point; deliberately not attempted at all,
+    # rather than run the scorer and let it silently fail/return nulls.
+    elapsed_s = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(row[0])
+    ).total_seconds()
+    if elapsed_s > RESOLVE_WINDOW_MAX_S:
+        _audit(conn, role, "/trigger/resolve", f"rejected: '{episode_id}' window expired ({elapsed_s:.0f}s)", ip)
+        conn.close()
+        raise HTTPException(
+            410,
+            f"too much time has passed since this fault was injected ({elapsed_s:.0f}s, "
+            f"limit {RESOLVE_WINDOW_MAX_S}s) -- its evidence window has likely expired and "
+            f"it will not be scored. Inject a fresh fault instead.",
+        )
+
+    # Closes the gap the DB-backed already_scored check above can't see --
+    # see _TRIGGER_BUSY's module-level comment. Shares the same flag
+    # /trigger/inject uses, since the real invariant is one episode in
+    # flight system-wide, in ANY phase, not a per-endpoint rule.
+    if not _try_acquire_trigger_busy("resolving", episode_id):
+        _audit(conn, role, "/trigger/resolve", f"rejected: '{episode_id}' resolve already in progress", ip)
+        conn.close()
+        raise HTTPException(409, f"diagnosis already in progress for episode '{episode_id}'")
+
+    _audit(conn, role, "/trigger/resolve", f"episode_id={episode_id}", ip)
     conn.close()
-    episode_id = row[0] if row else None
 
-    # Close the loop for real: injector.py only creates the episode with
-    # ground truth -- nothing scored it until now, which is why a
-    # triggered episode used to sit "in flight" forever (up to the 10-min
-    # staleness bound) with no diagnosis, action, or verdict ever recorded.
-    # p3_agent.py (the real agent, port 8001) must already be running for
-    # this to succeed -- p3_scorer.py calls it directly.
-    time.sleep(SETTLE_SECONDS)
+    try:
+        t0 = datetime.datetime.fromisoformat(row[0])
+        elapsed_s = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds()
+        remaining_s = SETTLE_SECONDS - elapsed_s
+        if remaining_s > 0:
+            time.sleep(remaining_s + RESOLVE_SAFETY_BUFFER_S)
 
-    scorer_result = subprocess.run(
-        [sys.executable, str(SCORER_PATH)],
-        cwd=str(SCORER_CWD),
-        capture_output=True,
-        text=True,
-        timeout=SCORER_TIMEOUT_S,
-    )
-    if scorer_result.returncode != 0:
-        # The episode itself is real and already recorded -- surface the
-        # scorer failure but don't pretend the whole trigger failed.
-        return {
-            "status": "triggered_but_unscored",
-            "episode_id": episode_id,
-            "scorer_error": scorer_result.stderr,
-        }
+        # p3_agent.py (the real agent, port 8001) must already be running
+        # for this to succeed -- p3_scorer.py calls it directly.
+        # --episode-id (2026-07-24): tells the scorer exactly which
+        # episode to score, instead of letting it guess "most recent
+        # unscored" -- see get_episode_by_id's docstring in p3_scorer.py
+        # for why guessing is a real correctness risk, not just untidy.
+        scorer_result = subprocess.run(
+            [sys.executable, str(SCORER_PATH), "--episode-id", episode_id],
+            cwd=str(SCORER_CWD),
+            capture_output=True,
+            text=True,
+            timeout=SCORER_TIMEOUT_S,
+        )
+        if scorer_result.returncode != 0:
+            # The episode itself is real and already recorded -- surface
+            # the scorer failure but don't pretend resolution failed
+            # outright.
+            return {
+                "status": "triggered_but_unscored",
+                "episode_id": episode_id,
+                "scorer_error": scorer_result.stderr,
+            }
+    finally:
+        # Always release, even on a scorer failure/timeout/exception --
+        # otherwise one failed resolve would permanently wedge every
+        # future trigger call behind a busy flag nothing will ever clear.
+        _release_trigger_busy()
 
     conn = _conn()
-    # target + confidence added 2026-07-24 (frontend asked for more detail
-    # in Operator's completed-trigger summary) -- both were already stored,
-    # just not previously selected by this query. target comes from the
-    # episodes table (the injector's own record of what it hit), confidence
-    # from scores (the diagnoser's self-reported confidence, same field the
-    # Calibration tab already uses).
+    # target + confidence: target comes from the episodes table (the
+    # injector's own record of what it hit), confidence from scores (the
+    # diagnoser's self-reported confidence, same field Calibration uses).
     score_row = conn.execute(
         "SELECT s.predicted_class, s.correct, s.action_taken, s.action_applied, s.durability_verdict, "
         "s.confidence, e.target "

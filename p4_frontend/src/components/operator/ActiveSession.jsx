@@ -1,19 +1,23 @@
 import { useEffect, useState } from "react";
 
-// Real known constant (matches operator_api.py's SETTLE_SECONDS, which
-// itself matches run_episodes.py's own settle wait) -- used to render an
-// honest, real-time-elapsed phase timeline. The backend call is a single
-// blocking request with no live push channel, so exact phase transitions
-// aren't pushed to the client -- this infers "roughly which real phase
-// we're in" from real elapsed time against a real known constant, and is
-// labeled as elapsed/approximate rather than claiming certainty.
-const SETTLE_SECONDS = 35;
-const INJECT_PHASE_MS = 2000; // rough real-world time for the inject call itself to land
+// Real target mapping (p2_readonly_loop/injector.py's FAULT_CONFIG), not
+// guessed -- only classes whose target maps to something a visitor
+// actually browses on the storefront get a specific hint. disk-full's
+// target (queue-master) is a backend order-processing consumer with no
+// direct customer-facing page, so it deliberately falls through to the
+// generic message rather than pointing at a page that won't show anything.
+const LANDED_HINTS = {
+  "crash-loop": "Try opening the Cart page on the storefront -- it may briefly fail to load while the pod restarts.",
+  oom: "Try browsing the product catalogue/homepage -- it may briefly fail to load while the pod restarts.",
+};
 
-// M:SS, no cap -- unlike the settle progress bar (bounded to a known
-// SETTLE_SECONDS constant), diagnosis has no known duration, so this just
-// counts up plainly (0:59 -> 1:00 -> 1:01 ...) rather than pretending to
-// know when it'll finish.
+// M:SS, no cap -- neither the injecting nor resolving phase has a known
+// duration bound worth showing a progress bar against (resolving
+// especially: it may be genuinely diagnosing, or it may still be padding
+// out the hidden settle wait -- see wardence_frontend.md's "Two-Phase
+// Trigger Flow" section for why those two cases are deliberately never
+// distinguished to the user). This just counts up plainly so it's
+// visibly alive, not frozen.
 function formatMinSec(ms) {
   const totalSeconds = Math.floor(ms / 1000);
   const m = Math.floor(totalSeconds / 60);
@@ -24,16 +28,12 @@ function formatMinSec(ms) {
 function useElapsed(startedAt) {
   const [elapsedMs, setElapsedMs] = useState(0);
 
-  // Reset during render when startedAt changes (a new trigger began),
-  // rather than synchronously in the effect body -- see TriggerBudget.jsx
-  // for the same pattern and reasoning.
+  // Reset during render when startedAt changes (a new phase began), rather
+  // than synchronously in the effect body -- see TriggerBudget.jsx for the
+  // same pattern and reasoning.
   const [syncedStartedAt, setSyncedStartedAt] = useState(startedAt);
   if (startedAt !== syncedStartedAt) {
     setSyncedStartedAt(startedAt);
-    // 0, not Date.now()-startedAt -- Date.now() is impure and can't be
-    // called during render. startedAt is set the instant the trigger
-    // fires, so elapsed is genuinely ~0 here; the effect's interval below
-    // takes over within 250ms anyway.
     setElapsedMs(0);
   }
 
@@ -46,91 +46,92 @@ function useElapsed(startedAt) {
   return elapsedMs;
 }
 
-export default function ActiveSession({ triggeringClass, triggerStartedAt, lastResult, onViewReplay }) {
-  const elapsedMs = useElapsed(triggerStartedAt);
+// Two-phase trigger flow (2026-07-24, see wardence_frontend.md): replaces
+// the old single-call model's fake, elapsed-time-inferred phase timeline
+// with real, distinct states driven directly by which real backend call
+// is in flight. "resolving" deliberately covers BOTH the hidden
+// settle-wait pad and the real diagnosis call with one indistinguishable
+// label -- that's the whole point of the design, not an oversight.
+export default function ActiveSession({
+  injectingClass,
+  injectStartedAt, // timestamp, set once by the parent when the inject call fires
+  injectedEpisode, // { faultClass, episodeId, t0 } once landed, awaiting user's Diagnose & Fix click
+  resolvingClass,
+  resolveStartedAt, // timestamp, set once by the parent when the resolve call fires
+  lastResult,
+  onViewReplay,
+}) {
+  // Both startedAt values must come from the PARENT as stable state (set
+  // once when the call fires, not recomputed here) -- computing Date.now()
+  // inline on every render would reset useElapsed's internal clock every
+  // render instead of once per phase. Same pattern the old single-phase
+  // version already used for this exact reason.
+  const injectElapsedMs = useElapsed(injectingClass ? injectStartedAt : null);
+  const resolveElapsedMs = useElapsed(resolvingClass ? resolveStartedAt : null);
 
-  const inflight = triggeringClass != null;
-  const settleElapsed = Math.max(elapsedMs - INJECT_PHASE_MS, 0);
-  const settlePct = Math.min((settleElapsed / (SETTLE_SECONDS * 1000)) * 100, 100);
-  const phase = !inflight ? null : elapsedMs < INJECT_PHASE_MS ? "inject" : settlePct < 100 ? "settle" : "diagnose";
-  const diagnoseElapsedMs = phase === "diagnose" ? Math.max(elapsedMs - INJECT_PHASE_MS - SETTLE_SECONDS * 1000, 0) : 0;
+  const phase = injectingClass
+    ? "injecting"
+    : resolvingClass
+    ? "resolving"
+    : injectedEpisode
+    ? "awaiting-fix"
+    : lastResult
+    ? "done"
+    : "idle";
 
   return (
     <div className="bg-surface-container-low border border-outline min-h-[320px] flex flex-col">
       <div className="p-4 border-b border-outline bg-surface-container-high flex items-center justify-between">
         <h2 className="font-label-caps text-[11px]">ACTIVE SESSION</h2>
-        {lastResult?.episode_id && (
-          <span className="font-data-mono text-[10px] text-primary">ID: {lastResult.episode_id.slice(0, 8)}</span>
+        {(injectedEpisode?.episodeId || lastResult?.episode_id) && (
+          <span className="font-data-mono text-[10px] text-primary">
+            ID: {(injectedEpisode?.episodeId ?? lastResult?.episode_id).slice(0, 8)}
+          </span>
         )}
       </div>
 
       <div className="p-4 flex-1 font-data-mono text-xs space-y-4">
-        {!inflight && !lastResult && (
+        {phase === "idle" && (
           <p className="text-on-surface-variant opacity-60">No active session. Trigger a fault to see it here.</p>
         )}
 
-        {inflight && (
+        {phase === "injecting" && (
+          <div className="flex items-center gap-2 text-primary">
+            <span className="material-symbols-outlined text-xs animate-spin">refresh</span>
+            <span>[RUNNING] Injecting fault: {injectingClass}</span>
+            <span className="ml-auto">{formatMinSec(injectElapsedMs)}</span>
+          </div>
+        )}
+
+        {phase === "awaiting-fix" && (
           <>
             <div className="flex items-center gap-2 text-[#238636]">
               <span className="material-symbols-outlined text-xs">check_circle</span>
-              <span>[{phase === "inject" ? "RUNNING" : "DONE"}] Injecting fault: {triggeringClass}</span>
+              <span>[LANDED] Fault injected: {injectedEpisode.faultClass}</span>
             </div>
-
-            <div className="flex flex-col gap-1">
-              {/* Three real states now, matching the icon's own three
-                  branches -- previously this only distinguished "settle"
-                  (bright) from everything else (dimmed), so once settle
-                  reached DONE the icon turned bright green but the
-                  surrounding text/row stayed dimmed, a mismatch against
-                  the "Injecting fault" row above (always full brightness
-                  once done). Done now gets the same bright green as that
-                  row, not a half-dim/half-bright state. */}
-              <div
-                className={`flex items-center gap-2 ${
-                  phase === "diagnose" ? "text-[#238636]" : phase === "settle" ? "text-primary" : "text-on-surface-variant opacity-50"
-                }`}
-              >
-                {phase === "settle" ? (
-                  <span className="material-symbols-outlined text-xs animate-spin">refresh</span>
-                ) : phase === "diagnose" ? (
-                  <span className="material-symbols-outlined text-xs">check_circle</span>
-                ) : (
-                  <span className="material-symbols-outlined text-xs">hourglass_empty</span>
-                )}
-                <span>[{phase === "settle" ? "PENDING" : phase === "diagnose" ? "DONE" : "WAITING"}] Settle period (~{SETTLE_SECONDS}s)</span>
-              </div>
-              {phase === "settle" && (
-                <div className="w-full h-1 bg-outline-variant/30">
-                  <div className="h-full bg-primary" style={{ width: `${settlePct}%` }} />
-                </div>
-              )}
-            </div>
-
-            <div className={`flex items-center gap-2 ${phase === "diagnose" ? "text-primary" : "text-on-surface-variant opacity-40"}`}>
-              <span className={`material-symbols-outlined text-xs ${phase === "diagnose" ? "animate-spin" : ""}`}>
-                {phase === "diagnose" ? "refresh" : "hourglass_empty"}
-              </span>
-              <span>[{phase === "diagnose" ? "PENDING" : "WAITING"}] AI diagnosis + scoring</span>
-              {/* Live counter, no known duration to bound it against (unlike
-                  settle's real SETTLE_SECONDS constant) -- just counts up so
-                  it's visibly alive rather than looking frozen during a
-                  genuinely variable-length real network call. */}
-              {phase === "diagnose" && (
-                <span className="ml-auto text-primary">{formatMinSec(diagnoseElapsedMs)}</span>
-              )}
-            </div>
+            {LANDED_HINTS[injectedEpisode.faultClass] && (
+              <p className="text-on-surface-variant opacity-80">{LANDED_HINTS[injectedEpisode.faultClass]}</p>
+            )}
+            <p className="text-on-surface-variant opacity-80">
+              Confirm the fault is live, then click DIAGNOSE &amp; FIX on the matching card to start the
+              real fix.
+            </p>
           </>
         )}
 
-        {!inflight && lastResult && (
+        {phase === "resolving" && (
+          <div className="flex items-center gap-2 text-primary">
+            <span className="material-symbols-outlined text-xs animate-spin">refresh</span>
+            <span>[RUNNING] Diagnosing &amp; fixing: {resolvingClass}</span>
+            <span className="ml-auto">{formatMinSec(resolveElapsedMs)}</span>
+          </div>
+        )}
+
+        {phase === "done" && (
           <div className="space-y-2">
             <div className={lastResult.correct ? "text-[#238636]" : "text-error"}>
               [DONE] Predicted: {lastResult.predicted_class ?? "n/a"} — {lastResult.correct ? "correct" : "incorrect"}
             </div>
-            {/* target/confidence/totalElapsedMs added 2026-07-24 -- all real,
-                already-stored values (target from episodes, confidence from
-                scores, same fields Calibration/Replay Viewer already use),
-                not new numbers invented for this view. */}
             {lastResult.target && (
               <div className="text-on-surface-variant">Target: {lastResult.target}</div>
             )}
