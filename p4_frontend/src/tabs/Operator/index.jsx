@@ -1,184 +1,200 @@
 import { useEffect, useState, useCallback } from "react";
 import { useAuth } from "../../context/AuthContext";
 import { useNavHistory } from "../../context/NavHistoryContext";
-import { fetchTriggerStatus, fetchSystemStatus, triggerFault, promoteClass, demoteClass } from "../../api/operator";
-import LoginModal from "../../components/auth/LoginModal";
+import {
+  fetchTriggerStatus,
+  fetchSystemStatus,
+  fetchLiveTrust,
+  triggerFault,
+  promoteClass,
+  demoteClass,
+} from "../../api/operator";
+import SystemStatusRibbon from "../../components/operator/SystemStatusRibbon";
+import TriggerControlCenter from "../../components/operator/TriggerControlCenter";
+import AdminOverrides from "../../components/operator/AdminOverrides";
+import TriggerBudget from "../../components/operator/TriggerBudget";
+import ActiveSession from "../../components/operator/ActiveSession";
 
 // Real, locked constants -- not fabricated. injector.py only implements
-// crash-loop so far (operator_api.py's IMPLEMENTED_CLASSES/SAFE_DEMO_CLASSES
-// both = {"crash-loop"} today); the 3 auto-fix classes are the locked
-// taxonomy (wardence_context.md) that have a real promotion/demotion path.
+// crash-loop's live /trigger path so far (operator_api.py's
+// IMPLEMENTED_CLASSES/SAFE_DEMO_CLASSES both = {"crash-loop"} today); the
+// 3 auto-fix classes are the locked taxonomy (wardence_context.md) that
+// have a real promotion/demotion path.
 const TRIGGERABLE_CLASSES = ["crash-loop"];
+const SAFE_DEMO_CLASSES = ["crash-loop"];
 const AUTO_FIX_CLASSES = ["crash-loop", "oom", "disk-full"];
 
 export default function Operator() {
-  const { token, role, user, logout } = useAuth();
+  const { token, role } = useAuth();
   const { currentContext, navigateTo } = useNavHistory();
-  const [showLogin, setShowLogin] = useState(false);
+
   const [triggerStatus, setTriggerStatus] = useState(null);
   const [systemStatus, setSystemStatus] = useState(null);
-  const [actionMsg, setActionMsg] = useState(null);
-  const [triggering, setTriggering] = useState(null); // fault_class currently in flight, or null
-  const [lastEpisodeId, setLastEpisodeId] = useState(null); // for "View full replay" (pair #5)
+  const [trustMap, setTrustMap] = useState({});
+
+  const [triggeringClass, setTriggeringClass] = useState(null);
+  const [triggerStartedAt, setTriggerStartedAt] = useState(null);
+  const [lastResult, setLastResult] = useState(null);
+  const [errorMsg, setErrorMsg] = useState(null);
+
+  const [busyClass, setBusyClass] = useState(null); // promote/demote in flight
   const [demotedClass, setDemotedClass] = useState(null); // for "Review Decision" (pair #3)
+  const [bannerDismissed, setBannerDismissed] = useState(false);
 
   // Consume a cross-tab jump from Replay Viewer's "Promote Class" link (pair #4)
   const highlightClass = currentContext?.type === "promoteClass" ? currentContext.faultClass : null;
 
   const loadTriggerStatus = useCallback(() => {
-    fetchTriggerStatus().then(setTriggerStatus).catch((e) => setActionMsg(e.message));
+    fetchTriggerStatus().then(setTriggerStatus).catch((e) => setErrorMsg(e.message));
   }, []);
 
-  useEffect(() => {
-    loadTriggerStatus();
-  }, [loadTriggerStatus]);
+  useEffect(() => { loadTriggerStatus(); }, [loadTriggerStatus]);
 
   useEffect(() => {
+    // Only fetch when there's a token -- if it's cleared (logout), the
+    // stale value just doesn't get re-fetched. Rendering is separately
+    // gated on `token` below, so a stale value never actually displays.
     if (!token) return;
     let cancelled = false;
     fetchSystemStatus(token)
       .then((d) => { if (!cancelled) setSystemStatus(d); })
-      .catch((e) => { if (!cancelled) setActionMsg(e.message); });
+      .catch((e) => { if (!cancelled) setErrorMsg(e.message); });
     return () => { cancelled = true; };
   }, [token]);
 
+  const loadTrustMap = useCallback(() => {
+    if (!token) return;
+    fetchLiveTrust(token)
+      .then((states) => setTrustMap(Object.fromEntries(states.map((s) => [s.fault_class, s.state]))))
+      .catch(() => {}); // non-critical -- overrides panel just shows "unknown"
+  }, [token]);
+
+  useEffect(() => { loadTrustMap(); }, [loadTrustMap]);
+
   const handleTrigger = async (faultClass) => {
-    setActionMsg(null);
-    setTriggering(faultClass);
+    setErrorMsg(null);
+    setLastResult(null);
+    setTriggeringClass(faultClass);
+    setTriggerStartedAt(Date.now());
     try {
-      // Real pipeline against the live cluster: inject -> 35s settle wait
-      // (kube-state-metrics scrape cycle) -> diagnose+act+score. Can take
-      // a few minutes total, not seconds -- the pending state is real.
+      // Real pipeline: inject -> 35s settle -> diagnose+act+score. Can take
+      // a few minutes total, not seconds.
       const result = await triggerFault(faultClass, token);
-      if (result.status === "scored") {
-        setActionMsg(
-          `Episode ${result.episode_id}: predicted "${result.predicted_class}" — ` +
-          `${result.correct ? "correct" : "incorrect"}` +
-          (result.action_taken ? `, action: ${result.action_taken} (${result.durability_verdict ?? "pending"})` : "")
-        );
-        setLastEpisodeId(result.episode_id); // pair #5
-      } else if (result.status === "triggered_but_unscored") {
-        setActionMsg(`Episode ${result.episode_id} triggered, but scoring failed: ${result.scorer_error}`);
-      } else {
-        setActionMsg(`Triggered ${faultClass}: episode ${result.episode_id ?? "(see response)"}`);
-      }
+      setLastResult(result);
       loadTriggerStatus();
     } catch (e) {
-      setActionMsg(e.message);
+      setErrorMsg(e.message);
     } finally {
-      setTriggering(null);
+      setTriggeringClass(null);
+      setTriggerStartedAt(null);
     }
   };
 
   const handlePromote = async (faultClass) => {
+    setBusyClass(faultClass);
+    setErrorMsg(null);
     try {
       await promoteClass(faultClass, token);
-      setActionMsg(`${faultClass} promoted to can_act.`);
+      loadTrustMap();
     } catch (e) {
-      setActionMsg(e.message);
+      setErrorMsg(e.message);
+    } finally {
+      setBusyClass(null);
     }
   };
 
   const handleDemote = async (faultClass) => {
+    setBusyClass(faultClass);
+    setErrorMsg(null);
     try {
       await demoteClass(faultClass, token);
-      setActionMsg(`${faultClass} demoted.`);
+      loadTrustMap();
       setDemotedClass(faultClass); // pair #3
     } catch (e) {
-      setActionMsg(e.message);
+      setErrorMsg(e.message);
+    } finally {
+      setBusyClass(null);
     }
   };
 
   return (
-    <div>
-      <h1>Operator</h1>
+    <div className="max-w-[1600px] mx-auto">
+      {highlightClass && !bannerDismissed && (
+        <div className="bg-primary/10 border border-primary/30 px-4 py-2 mb-4 flex items-center justify-between">
+          <p className="font-body-sm text-sm text-primary flex items-center gap-2">
+            <span className="material-symbols-outlined text-sm">info</span>
+            Arrived from Replay Viewer: <span className="font-data-mono font-bold">{highlightClass}</span> was
+            diagnosed correctly while report-only — review for promotion eligibility below.
+          </p>
+          <button onClick={() => setBannerDismissed(true)} className="text-on-surface-variant hover:text-on-surface">
+            <span className="material-symbols-outlined text-sm">close</span>
+          </button>
+        </div>
+      )}
 
-      {/* Public — visible to everyone regardless of login state. */}
-      {triggerStatus && (
-        <p style={{ fontSize: 13, opacity: 0.8 }}>
-          {triggerStatus.global_remaining_today} of {triggerStatus.global_cap} daily triggers left
-          {triggerStatus.your_cooldown_remaining_s > 0 &&
-            ` — your cooldown: ${Math.round(triggerStatus.your_cooldown_remaining_s)}s`}
-          {triggerStatus.episode_in_flight && " — an episode is currently in flight"}
+      {demotedClass && (
+        <div className="bg-error-container/10 border border-error-container/30 px-4 py-2 mb-4 flex items-center justify-between">
+          <p className="font-body-sm text-sm text-error">
+            <span className="font-data-mono font-bold">{demotedClass}</span> was just demoted.
+          </p>
+          <button
+            onClick={() => navigateTo("/", { type: "faultClass", faultClass: demotedClass }, "Operator")}
+            className="font-label-caps text-[11px] text-primary hover:underline"
+          >
+            REVIEW DECISION →
+          </button>
+        </div>
+      )}
+
+      {errorMsg && <p className="text-error text-sm mb-4">{errorMsg}</p>}
+
+      {!token && (
+        <p className="text-on-surface-variant text-sm mb-4">
+          Sign in (top right) to trigger faults or view live system status. Trigger budget below is visible to
+          everyone, no login needed.
         </p>
       )}
 
-      {!token ? (
-        <div>
-          <p>Log in to trigger faults or view live system status.</p>
-          {!showLogin ? (
-            <button onClick={() => setShowLogin(true)}>Log in</button>
-          ) : (
-            <LoginModal onClose={() => setShowLogin(false)} />
-          )}
-        </div>
-      ) : (
-        <div>
-          <p>Logged in as <strong>{user}</strong> ({role}) — <button onClick={logout}>Log out</button></p>
-
-          {systemStatus && (
-            <p style={{ fontSize: 13, opacity: 0.8 }}>
-              Request rate: {systemStatus.request_rate_per_s}/s · Error rate: {(systemStatus.error_rate * 100).toFixed(1)}% ·
-              {" "}Pods: {Object.entries(systemStatus.pods_by_phase).map(([p, n]) => `${p}:${n}`).join(", ")}
-            </p>
-          )}
-
-          <h3>Trigger a fault</h3>
-          {TRIGGERABLE_CLASSES.map((fc) => (
-            <button
-              key={fc}
-              onClick={() => handleTrigger(fc)}
-              disabled={triggering !== null}
-              style={{ marginRight: 8 }}
-            >
-              {triggering === fc ? "Running… (inject + settle + diagnose, can take a few minutes)" : `Trigger ${fc}`}
-            </button>
-          ))}
-
-          {role === "admin" && (
-            <>
-              <h3>Trust overrides (admin only)</h3>
-              {highlightClass && (
-                <p style={{ fontSize: 12, opacity: 0.8 }}>
-                  Arrived from Replay Viewer to review <strong>{highlightClass}</strong>.
-                </p>
-              )}
-              {AUTO_FIX_CLASSES.map((fc) => (
-                <span
-                  key={fc}
-                  style={{
-                    marginRight: 12,
-                    outline: fc === highlightClass ? "2px solid #4caf50" : "none",
-                    padding: 2,
-                  }}
-                >
-                  {fc}: <button onClick={() => handlePromote(fc)}>Promote</button>{" "}
-                  <button onClick={() => handleDemote(fc)}>Demote</button>
-                </span>
-              ))}
-            </>
-          )}
-
-          {actionMsg && <p style={{ marginTop: 12 }}>{actionMsg}</p>}
-
-          {lastEpisodeId && (
-            <p>
-              <button onClick={() => navigateTo(`/replay/${lastEpisodeId}`, null, "Operator")}>
-                View full replay →
-              </button>
-            </p>
-          )}
-
-          {demotedClass && (
-            <p>
-              <strong>{demotedClass}</strong> was just demoted —{" "}
-              <button onClick={() => navigateTo("/", { type: "faultClass", faultClass: demotedClass }, "Operator")}>
-                Review Decision →
-              </button>
-            </p>
-          )}
+      {token && systemStatus && (
+        <div className="mb-6">
+          <SystemStatusRibbon status={systemStatus} />
         </div>
       )}
+
+      <div className="grid grid-cols-12 gap-6">
+        <div className="col-span-12 lg:col-span-8 space-y-6">
+          <TriggerControlCenter
+            triggerableClasses={TRIGGERABLE_CLASSES}
+            token={token}
+            role={role}
+            safeDemoClasses={SAFE_DEMO_CLASSES}
+            triggerStatus={triggerStatus}
+            triggeringClass={triggeringClass}
+            onTrigger={handleTrigger}
+          />
+
+          {role === "admin" && (
+            <AdminOverrides
+              autoFixClasses={AUTO_FIX_CLASSES}
+              trustMap={trustMap}
+              highlightClass={highlightClass}
+              busyClass={busyClass}
+              onPromote={handlePromote}
+              onDemote={handleDemote}
+            />
+          )}
+        </div>
+
+        <div className="col-span-12 lg:col-span-4 space-y-6">
+          <TriggerBudget status={triggerStatus} />
+          <ActiveSession
+            triggeringClass={triggeringClass}
+            triggerStartedAt={triggerStartedAt}
+            lastResult={lastResult}
+            onViewReplay={(episodeId) => navigateTo(`/replay/${episodeId}`, null, "Operator")}
+          />
+        </div>
+      </div>
     </div>
   );
 }

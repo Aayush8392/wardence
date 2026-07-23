@@ -5,6 +5,11 @@ wardence_frontend.md
 wardence_guide.html
 reviews/
 
+# Raw Stitch design exports (zips/code/screenshots) -- reference material
+# for building the real frontend, not app code itself. One subfolder per
+# export, named for what it's a mockup of.
+p4_frontend/stitch_mockups/
+
 # Python
 p2_readonly_loop/venv/
 __pycache__/

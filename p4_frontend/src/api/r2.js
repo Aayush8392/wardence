@@ -39,3 +39,7 @@ export async function fetchEpisodes() {
   const episodes = await fetchJson("episodes.json");
   return episodes.filter((e) => !INTERNAL_ONLY_CLASSES.has(e.fault_class));
 }
+
+export async function fetchSystemStatus() {
+  return fetchJson("system_status.json");
+}

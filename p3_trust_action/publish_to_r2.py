@@ -4,12 +4,15 @@ episode_snapshots, trust_state, trust_history) and pushes JSON snapshots
 to Cloudflare R2, per the locked architecture (wardence_context.md Zone 2
 -- "site builds ONCE, SPA fetches from R2 at runtime", no always-on DB).
 
-Produces three objects in the bucket:
+Produces four objects in the bucket:
   - trust_ladder.json   -- current per-fault-class state (Trust Ladder board)
   - trust_history.json  -- every promotion/demotion event over time
   - episodes.json        -- full per-episode data (scores + episode_snapshots
                              joined), feeds both the case list and the
                              Replay Viewer
+  - system_status.json   -- global circuit-breaker state (read-only mirror
+                             of circuit_breaker.py's own trip check, for the
+                             landing page's "System Guard" indicator)
 
 Deliberately NOT incremental/streaming -- this project's whole dataset is
 ~150 episodes, small enough to just re-upload the full JSON each run
@@ -25,6 +28,8 @@ import sqlite3
 from pathlib import Path
 
 import boto3
+
+from circuit_breaker import FAILURE_THRESHOLD, FAILURE_WINDOW_S, ensure_circuit_breaker_table
 
 DB_PATH = Path.home() / "wardence_p2_data" / "wardence.db"
 ENV_PATH = Path(__file__).parent / ".env"
@@ -146,6 +151,27 @@ def build_episodes(conn: sqlite3.Connection) -> list[dict]:
     return episodes
 
 
+def build_system_status(conn: sqlite3.Connection) -> dict:
+    """Read-only mirror of circuit_breaker.py's own trip check -- the
+    publisher must never mutate trust state itself, so this recomputes the
+    same FAILURE_THRESHOLD-within-FAILURE_WINDOW_S logic directly instead of
+    importing/calling check_circuit_breaker (which trips the breaker as a
+    side effect)."""
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) FROM failure_log
+        WHERE recorded_at >= datetime('now', '-{FAILURE_WINDOW_S} seconds')
+        """
+    ).fetchone()
+    recent_failures = row[0]
+    return {
+        "recent_failures": recent_failures,
+        "tripped": recent_failures >= FAILURE_THRESHOLD,
+        "failure_window_s": FAILURE_WINDOW_S,
+        "failure_threshold": FAILURE_THRESHOLD,
+    }
+
+
 def upload_json(client, bucket: str, key: str, data) -> None:
     body = json.dumps(data, indent=2).encode("utf-8")
     client.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
@@ -168,16 +194,19 @@ def main():
     bucket = env["R2_BUCKET_NAME"]
 
     conn = sqlite3.connect(DB_PATH)
+    ensure_circuit_breaker_table(conn)  # in case this DB has never had a failure recorded yet
 
     trust_ladder = build_trust_ladder(conn)
     trust_history = build_trust_history(conn)
     episodes = build_episodes(conn)
+    system_status = build_system_status(conn)
 
     conn.close()
 
     upload_json(client, bucket, "trust_ladder.json", trust_ladder)
     upload_json(client, bucket, "trust_history.json", trust_history)
     upload_json(client, bucket, "episodes.json", episodes)
+    upload_json(client, bucket, "system_status.json", system_status)
 
 
 if __name__ == "__main__":

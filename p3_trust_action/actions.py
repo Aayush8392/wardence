@@ -336,6 +336,14 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
             "error": f"scale-to-0 failed: {scale_down.get('error')}",
             "scale_down": scale_down,
             "scale_up": None,
+            # Real, timestamped step log -- previously only ever readable
+            # live via GET /progress (in-memory, wiped on the next episode),
+            # never persisted. Capturing it into the return value means it
+            # flows through p3_agent.py -> p3_scorer.py -> episode_snapshots.
+            # action_result -> episodes.json with no schema change needed,
+            # so a HISTORICAL replay can show the same 4-step sequence
+            # Operator's live view already shows, not just 2 sub-results.
+            "progress_log": get_progress(name, namespace),
         }
     _record_step(name, namespace, "scaling_down", "done")
 
@@ -384,6 +392,7 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
             ),
             "scale_down": scale_down,
             "scale_up": scale_up,
+            "progress_log": get_progress(name, namespace),
         }
 
     _record_step(name, namespace, "complete", "done" if scale_up["applied"] else "failed")
@@ -395,6 +404,7 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
         "error": scale_up.get("error"),
         "scale_down": scale_down,
         "scale_up": scale_up,
+        "progress_log": get_progress(name, namespace),
     }
 
 

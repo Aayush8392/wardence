@@ -14,24 +14,55 @@ export default function LoginModal({ onClose }) {
   };
 
   return (
-    <div style={{ border: "1px solid #444", padding: 16, maxWidth: 320, marginTop: 12 }}>
-      <form onSubmit={handleSubmit}>
-        <div>
-          <label>Username <input value={username} onChange={(e) => setUsername(e.target.value)} /></label>
-        </div>
-        <div>
-          <label>Password <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} /></label>
-        </div>
-        <div>
-          <label>
-            TOTP code (admin only){" "}
-            <input value={totpCode} onChange={(e) => setTotpCode(e.target.value)} placeholder="6-digit code" />
-          </label>
-        </div>
-        {error && <p style={{ color: "#e05" }}>{error}</p>}
-        <button type="submit" disabled={loading}>{loading ? "Logging in…" : "Log in"}</button>
-        <button type="button" onClick={onClose}>Cancel</button>
-      </form>
-    </div>
+    <form
+      onSubmit={handleSubmit}
+      className="absolute right-4 top-14 w-72 bg-surface-container border border-outline-variant p-4 flex flex-col gap-3 z-50 shadow-2xl"
+    >
+      <label className="flex flex-col gap-1 text-xs text-on-surface-variant font-label-caps">
+        USERNAME
+        <input
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          className="bg-surface-container-lowest border border-outline-variant text-on-surface text-sm px-2 py-1.5"
+        />
+      </label>
+      <label className="flex flex-col gap-1 text-xs text-on-surface-variant font-label-caps">
+        PASSWORD
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          className="bg-surface-container-lowest border border-outline-variant text-on-surface text-sm px-2 py-1.5"
+        />
+      </label>
+      <label className="flex flex-col gap-1 text-xs text-on-surface-variant font-label-caps">
+        TOTP CODE (admin only)
+        <input
+          value={totpCode}
+          onChange={(e) => setTotpCode(e.target.value)}
+          placeholder="6-digit code"
+          className="bg-surface-container-lowest border border-outline-variant text-on-surface text-sm px-2 py-1.5"
+        />
+      </label>
+
+      {error && <p className="text-error text-xs">{error}</p>}
+
+      <div className="flex gap-2 mt-1">
+        <button
+          type="submit"
+          disabled={loading}
+          className="flex-1 bg-primary text-on-primary text-xs font-label-caps py-2 disabled:opacity-60"
+        >
+          {loading ? "LOGGING IN…" : "LOG IN"}
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          className="px-3 border border-outline-variant text-on-surface-variant text-xs font-label-caps"
+        >
+          CANCEL
+        </button>
+      </div>
+    </form>
   );
 }

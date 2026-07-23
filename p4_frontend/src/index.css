@@ -1,111 +1,125 @@
-:root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+@import "tailwindcss";
 
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
+/* Exact tokens from the Stitch export (stitch_export/DESIGN.md + code.html)
+   -- not approximated, these are the real values. */
+@theme {
+  --color-surface: #0D1117;
+  --color-surface-dim: #101419;
+  --color-surface-bright: #36393f;
+  --color-surface-container-lowest: #0b0e14;
+  --color-surface-container-low: #161b22;
+  --color-surface-container: #1c2025;
+  --color-surface-container-high: #272a30;
+  --color-surface-container-highest: #32353b;
+  --color-surface-variant: #21262d;
+  --color-on-surface: #e0e2ea;
+  --color-on-surface-variant: #c0c7d4;
+  --color-outline: #484f58;
+  --color-outline-variant: #30363d;
 
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
+  --color-primary: #58a6ff;
+  --color-primary-container: #58a6ff;
+  --color-primary-fixed-dim: #a2c9ff;
+  --color-on-primary: #0d1117;
+  --color-on-primary-container: #003a6b;
 
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
-}
+  --color-error: #ffb4ab;
+  --color-error-container: #93000a;
+  --color-on-error: #690005;
+  --color-on-error-container: #ffdad6;
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
+  /* Data-viz marker colors (Calibration scatter plot) -- deliberately
+     brighter/more saturated than the status-badge greens/reds used
+     elsewhere (#238636/#93000a), since a small marker dot on a dark
+     background needs more contrast to read than a filled badge does.
+     Distinct visual role, not a second "true red/green" for the same
+     semantic purpose. */
+  --color-correct-green: #4ade80;
+  --color-error-red: #f43f5e;
+  --color-warning-amber: #fbbf24;
 
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
+  --font-display-lg: "Geist", sans-serif;
+  --font-headline-md: "Geist", sans-serif;
+  --font-body-md: "Inter", sans-serif;
+  --font-body-sm: "Inter", sans-serif;
+  --font-data-mono: "JetBrains Mono", ui-monospace, monospace;
+  --font-label-caps: "JetBrains Mono", ui-monospace, monospace;
 }
 
 body {
+  background-color: var(--color-surface-container-lowest);
+  color: var(--color-on-surface);
+  font-family: var(--font-body-md);
+  font-synthesis: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   margin: 0;
-}
-
-#root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
   min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
+  /* Real grid-line texture from the export, not a flat dot pattern. */
+  background-image:
+    linear-gradient(to right, rgba(48, 54, 61, 0.5) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(48, 54, 61, 0.5) 1px, transparent 1px);
+  background-size: 40px 40px;
 }
 
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
+#root { min-height: 100svh; }
+
+.material-symbols-outlined {
+  font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 20;
+  font-family: 'Material Symbols Outlined';
 }
 
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
+/* Trust badges -- exact classes from the export. */
+.trust-badge-report { border: 1px solid #484f58; color: #8b919d; font-family: var(--font-data-mono); }
+.trust-badge-act { background: #238636; color: #ffffff; font-weight: 700; font-family: var(--font-data-mono); }
+.trust-badge-demoted { background: #93000a; color: #ffdad6; font-weight: 700; font-family: var(--font-data-mono); }
+
+.scanline {
+  width: 100%; height: 2px;
+  background: rgba(88, 166, 255, 0.2);
+  position: absolute;
+  animation: scan 3s linear infinite;
 }
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
+@keyframes scan { 0% { top: 0; } 100% { top: 100%; } }
+
+.terminal-cursor {
+  display: inline-block; width: 6px; height: 14px;
+  background: #58a6ff;
+  animation: blink 1s infinite;
+  vertical-align: middle;
 }
-p {
-  margin: 0;
+@keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+
+.streak-block { width: 10px; height: 14px; margin-right: 2px; }
+.streak-green { background-color: #238636; }
+.streak-red { background-color: #f85149; }
+.streak-gray { background-color: #21262d; }
+
+.status-ribbon {
+  background: repeating-linear-gradient(45deg, #161b22, #161b22 10px, #1c2128 10px, #1c2128 20px);
 }
 
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
+.vector-point { animation: pulse-point 2s infinite alternate; }
+@keyframes pulse-point {
+  from { opacity: 0.4; transform: scale(0.9); }
+  to { opacity: 1; transform: scale(1.1); }
 }
 
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
+.tether-line {
+  background: linear-gradient(to bottom, #58a6ff 0%, transparent 100%);
+  width: 1px; height: 40px;
 }
+
+.scatter-grid {
+  background-image:
+    linear-gradient(to right, #30363D 1px, transparent 1px),
+    linear-gradient(to bottom, #30363D 1px, transparent 1px);
+  background-size: 10% 50%;
+}
+.point-glow {
+  filter: drop-shadow(0 0 8px rgba(244, 63, 94, 0.8));
+}
+
+table { border-collapse: collapse; width: 100%; }
+a { color: inherit; text-decoration: none; }
+button, select { font-family: inherit; }
