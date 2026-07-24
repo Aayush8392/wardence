@@ -116,6 +116,22 @@ episode is recorded at all -- a loud warning prints instead, so a
 consistently failing injector shows up as "no unscored episodes found"
 rather than silently poisoning the data.
 
+cpu-throttling: StressChaos cpu stressor (1 worker, 100% load) against
+`user` -- reuses the exact same StressChaos primitive OOM already uses,
+just the cpu stressor mode instead of memory. Verified via
+container_cpu_cfs_throttled_periods_total, the only CFS-throttling
+metric this cluster actually exposes (the more obvious
+*_seconds_total variant returns zero series here -- confirmed via a
+real query before writing any dependent code, same "assumed metric
+isn't actually exposed" surprise disk-full's container_fs_usage_bytes
+already taught). This counter is non-resetting and already nonzero
+under light idle traffic (553 at measurement time), same shape as the
+restart-count metrics -- so verification compares a raw delta
+(after - baseline), never a raw/instant value. Real measurement
+(2026-07-24, before any code was written): baseline delta over 60s of
+no stress = 0.0; during a real stressor, delta over 30s ~= 300 (~600
+projected per 60s) -- an enormous, unambiguous margin, not a guess.
+
 Usage:
     python injector.py --class crash-loop
     python injector.py --class oom
@@ -126,9 +142,13 @@ Usage:
     python injector.py --class network-partition
     python injector.py --class init-failure
     python injector.py --class session-cart-failure
+    python injector.py --class cpu-throttling
+    python injector.py --class under-provisioned-replicas
+    python injector.py --class bad-rollout
 """
 
 import argparse
+import re
 import sqlite3
 import subprocess
 import time
@@ -199,6 +219,24 @@ FAULT_CONFIG = {
         "namespace": "sock-shop",
         "target": "session-db",
         "duration_s": 60,
+    },
+    "under-provisioned-replicas": {
+        "namespace": "sock-shop",
+        "target": "catalogue",
+        "duration_s": 20,
+    },
+    "bad-rollout": {
+        "namespace": "sock-shop",
+        "target": "front-end",
+        "container": "front-end",
+        "duration_s": 60,
+    },
+    "cpu-throttling": {
+        "namespace": "sock-shop",
+        "target": "user",
+        "container": "user",
+        "duration_s": 60,
+        "chaos_name_prefix": "wardence-cputhrottle",
     },
 }
 
@@ -274,6 +312,128 @@ NETWORK_PARTITION_MIN_FAILURES = 4
 SESSION_FAILURE_SCALE_TIMEOUT_S = 60  # matches disk-full's own hard-won lesson: 30s
 # (default terminationGracePeriodSeconds) is too tight a margin, needed 60s there too.
 
+# cpu-throttling: user's real CPU limit is 300m, real baseline usage
+# ~9m under light traffic (both confirmed via direct Prometheus query,
+# 2026-07-24, not assumed) -- enormous headroom, so a 1-worker 100%-load
+# stressor overshoots the limit trivially and reliably.
+CPU_THROTTLE_STRESS_WORKERS = 1
+CPU_THROTTLE_STRESS_LOAD = 100  # percent
+# container_cpu_cfs_throttled_periods_total is non-resetting and
+# already nonzero under light idle traffic (553 at measurement time) --
+# same shape as the restart-count metrics, so this compares a raw
+# delta (after - baseline), never an instant/raw value. Real measured
+# margin (2026-07-24): baseline delta over 60s = 0.0; during-stress
+# delta over 30s ~= 300 (~600 projected per 60s). 50 leaves a huge,
+# real margin on both sides -- not a guess.
+CPU_THROTTLE_MIN_PERIODS_INCREASE = 50
+
+# Same lesson OOM already taught the hard way (2026-07-21): a real
+# successful patch_cpu_limit fix permanently raises user's CPU limit
+# above this baseline, and nothing else ever reverts it -- without a
+# reset, the SAME 100%-load stressor could stop reliably overshooting
+# the (now-raised) limit after the first successful fix cycle, which
+# looked like unrelated flakiness for OOM until the real cause was
+# found. cpu-throttling gets the same _ensure_*_baseline treatment
+# proactively this time, not after rediscovering the bug.
+CPU_THROTTLE_BASELINE_CPU_LIMIT = "300m"
+
+# under-provisioned-replicas: unlike every other class, the fault is a
+# STANDING CONFIG STATE (catalogue stuck at 1 replica), not a
+# transient injected condition -- as long as it stays at 1 replica,
+# ANY sufficiently large real burst independently reveals the same
+# degradation, whether fired by this injector, the agent's own later
+# diagnosis probe, or a durability re-check. No Chaos Mesh resource,
+# no persistent process to hold open between injection and diagnosis.
+# Real numbers, confirmed across 3 independent trials + an interleaved
+# 1->3->1->3 reproducibility check (2026-07-24, measure_catalogue_load.py
+# + _confirm.py) before any of this code was written: p95 consistently
+# 295-598ms at 1 replica, consistently 100-291ms at 3 replicas, ZERO
+# errors in every trial. 200ms sits with real margin on both sides.
+K6_IMAGE = "grafana/k6:latest"
+UNDER_PROVISIONED_VUS = 20
+UNDER_PROVISIONED_DURATION_S = 20
+UNDER_PROVISIONED_MIN_P95_MS = 200
+UNDER_PROVISIONED_BASELINE_REPLICAS = 1
+
+# bad-rollout: NOT Chaos Mesh, NOT exec-based -- a direct kubectl patch
+# of front-end's image to a nonexistent tag, simulating a real bad
+# deploy. Real config confirmed before writing this (2026-07-25):
+# real image is weaveworksdemos/front-end:0.3.12, readinessProbe delay
+# is 30s -- irrelevant here, since a nonexistent image means the
+# container never starts at all (no image = no container = readiness
+# never even gets a chance to run), so ImagePullBackOff/ErrImagePull
+# should appear within seconds, not needing any probe-delay wait
+# (genuinely simpler timing than init-failure's own mechanism). Same
+# "old healthy pod keeps serving, new broken one never comes online"
+# realism as init-failure -- confirmed by the same RollingUpdate
+# mechanics already proven there.
+FRONT_END_IMAGE_BASELINE = "weaveworksdemos/front-end:0.3.12"
+FRONT_END_IMAGE_FAULT = "weaveworksdemos/front-end:0.3.12-wardence-badtag"
+
+
+def _parse_k6_p95_ms(stdout_text: str) -> float | None:
+    """Parses the real p95 value directly from k6's own end-of-run
+    text summary -- found the hard way (2026-07-24) that
+    `--no-summary`/`--summary-export=/dev/stdout` isn't a real flag on
+    this k6 image (`unknown flag: --no-summary`, confirmed via a real
+    failed run, not assumed), so JSON export isn't available here.
+    Looks for the http_req_duration line specifically (not
+    iteration_duration, which reports a near-identical but distinct
+    metric), extracts the value+unit after 'p(95)=', and converts to
+    ms. Returns None if the line/pattern isn't found."""
+    match = re.search(
+        r"http_req_duration[^\n]*p\(95\)=([\d.]+)(µs|ms|s)\b", stdout_text
+    )
+    if not match:
+        return None
+    value, unit = float(match.group(1)), match.group(2)
+    if unit == "s":
+        return value * 1000
+    if unit == "µs":
+        return value / 1000
+    return value
+
+
+def _catalogue_burst_p95_ms(namespace: str, vus: int, duration_s: int, label: str) -> float | None:
+    """Fires a real k6 burst directly against catalogue's own Service
+    (GET /catalogue?size=10, the same real endpoint validated during
+    measurement) and returns the REAL p95, parsed from k6's own text
+    summary via _parse_k6_p95_ms. Returns None if the probe pod
+    couldn't run or its summary couldn't be parsed -- treated as
+    'can't verify' by callers, matching every other probe-based
+    helper's convention in this file."""
+    pod_name = f"wardence-underprov-{label}-{uuid.uuid4().hex[:8]}"
+    script = f"""
+import http from 'k6/http';
+export const options = {{
+  scenarios: {{
+    burst: {{
+      executor: 'constant-vus',
+      vus: {vus},
+      duration: '{duration_s}s',
+    }},
+  }},
+}};
+export default function () {{
+  http.get('http://catalogue.{namespace}.svc.cluster.local/catalogue?size=10');
+}}
+"""
+    try:
+        result = subprocess.run(
+            [
+                "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
+                "-n", namespace, f"--image={K6_IMAGE}",
+                "--", "run", "--quiet", "-",
+            ],
+            input=script, capture_output=True, text=True, timeout=duration_s + 60,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_k6_p95_ms(result.stdout)
+
+
 PAYMENT_READINESS_PATH_BASELINE = "/health"
 PAYMENT_READINESS_PATH_FAULT = "/wardence-fault-nonexistent"
 # Real mechanism confirmed empirically (2026-07-24, not assumed): this
@@ -312,8 +472,11 @@ PAYMENT_READINESS_PATH_FAULT = "/wardence-fault-nonexistent"
 MEMORY_LEAK_STRESS_SIZE = "150M"
 MEMORY_LEAK_MIN_INCREASE_MIB = 100
 
-# catalogue-db's max_connections is 151, baseline Threads_connected is
-# ~2-3 (both confirmed via direct query, 2026-07-21, not assumed).
+# catalogue-db's max_connections is 151 (confirmed still unchanged,
+# 2026-07-25). baseline Threads_connected was ~2-3 on 2026-07-21;
+# re-checked 2026-07-25 (real drift after days of accumulated testing)
+# and found at 7 -- real growth, re-measured rather than assumed still
+# true.
 #
 # Found the hard way (2026-07-21): first tried flooding 140, reasoning
 # it "leaves ~11 connections of headroom" -- backwards. Confirmed via
@@ -326,7 +489,20 @@ MEMORY_LEAK_MIN_INCREASE_MIB = 100
 # connection attempts may themselves fail once the real ceiling is
 # hit, which is expected and fine (that's the ceiling working, not a
 # bug), as long as enough land to genuinely fill the pool.
-CONNECTION_POOL_FLOOD_CONNECTIONS = 150
+#
+# Found the hard way AGAIN (2026-07-25, during under-provisioned-
+# replicas' Phase 2 cross-check): 150 stopped being enough real margin.
+# Direct diagnostic (measure_connection_pool_flood_reliability.py)
+# confirmed real exhaustion WAS reached (Threads_connected hit exactly
+# 151, held for ~24s) but a fresh catalogue_user test connection still
+# slipped in -- because only 144 of the 150 targeted flood connections
+# actually landed (6 failed to establish, a real MySQL boundary-
+# condition effect, not a bug), and the real baseline growth (~3 -> 7)
+# further thinned the already-intentionally-tight margin. Bumped to
+# 170 to rebuild real headroom given the drifted baseline -- not a
+# design flaw, a real number that needed re-measuring and adjusting,
+# same as every other real threshold in this project.
+CONNECTION_POOL_FLOOD_CONNECTIONS = 170
 
 # Found the hard way (2026-07-21): the flood originally used root for
 # every connection -- the SAME user mysqld_exporter uses for its own
@@ -451,6 +627,33 @@ spec:
     memory:
       workers: 1
       size: "{size}"
+"""
+
+
+def build_cpu_throttle_manifest(chaos_name: str, cfg: dict) -> str:
+    """Same StressChaos primitive OOM's build_oom_manifest already uses,
+    just the cpu stressor mode instead of memory -- no oomScoreAdj
+    needed here, there's no OOM-kill victim-selection problem for a CPU
+    stressor."""
+    return f"""
+apiVersion: chaos-mesh.org/v1alpha1
+kind: StressChaos
+metadata:
+  name: {chaos_name}
+  namespace: chaos-mesh
+spec:
+  mode: one
+  containerNames:
+    - {cfg['container']}
+  selector:
+    namespaces:
+      - {cfg['namespace']}
+    labelSelectors:
+      name: {cfg['target']}
+  stressors:
+    cpu:
+      workers: {CPU_THROTTLE_STRESS_WORKERS}
+      load: {CPU_THROTTLE_STRESS_LOAD}
 """
 
 
@@ -741,6 +944,22 @@ def _memory_working_set_mib(target: str, namespace: str, container: str) -> floa
     return max(float(entry["value"][1]) for entry in result) / (1024 * 1024)
 
 
+def _cfs_throttled_periods(target: str, namespace: str, container: str) -> int:
+    """Raw (non-resetting) counter, summed across matched series -- same
+    convention as _restart_count. Confirmed via direct measurement
+    (2026-07-24) that this counter is already nonzero under light idle
+    traffic, so callers must always compare a delta against their own
+    baseline snapshot, never a raw/instant value alone."""
+    query = (
+        f'container_cpu_cfs_throttled_periods_total{{namespace="{namespace}", '
+        f'pod=~"{target}.*", container="{container}"}}'
+    )
+    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+    resp.raise_for_status()
+    result = resp.json()["data"]["result"]
+    return sum(int(float(entry["value"][1])) for entry in result)
+
+
 def _crash_loop_backoff_now(target: str, namespace: str) -> bool:
     """
     Found the hard way: after enough repeated crash-loop testing across
@@ -971,6 +1190,204 @@ def _ensure_oom_baseline(cfg: dict):
         ],
         capture_output=True, text=True,
     )
+
+
+def _ensure_cpu_throttle_baseline(cfg: dict):
+    """Resets user's CPU limit back to CPU_THROTTLE_BASELINE_CPU_LIMIT
+    before injecting, if it's currently anything else -- mirrors
+    _ensure_oom_baseline's pattern exactly, same reason: a real
+    successful patch_cpu_limit fix permanently raises the limit and
+    nothing else reverts it."""
+    result = subprocess.run(
+        [
+            "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "-o", "jsonpath={.spec.template.spec.containers[0].resources.limits.cpu}",
+        ],
+        capture_output=True, text=True,
+    )
+    current_limit = result.stdout.strip()
+    if current_limit == CPU_THROTTLE_BASELINE_CPU_LIMIT:
+        return
+
+    print(f"  {cfg['target']}'s CPU limit is {current_limit or '(unknown)'}, not the "
+          f"{CPU_THROTTLE_BASELINE_CPU_LIMIT} baseline -- resetting before injecting "
+          f"(a prior real fix likely raised it)...")
+    patch_body = (
+        '{"spec":{"template":{"spec":{"containers":[{"name":"' + cfg["container"] + '",'
+        '"resources":{"limits":{"cpu":"' + CPU_THROTTLE_BASELINE_CPU_LIMIT + '"}}}]}}}}'
+    )
+    subprocess.run(
+        [
+            "kubectl", "patch", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "--type=strategic", "-p", patch_body,
+        ],
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=180s",
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def _ensure_catalogue_replica_baseline(cfg: dict):
+    """Resets catalogue's replica count back to
+    UNDER_PROVISIONED_BASELINE_REPLICAS before injecting, if it's
+    currently anything else -- mirrors _ensure_oom_baseline/
+    _ensure_cpu_throttle_baseline's pattern exactly, same reason: a
+    real successful scale-for-load fix permanently raises the replica
+    count and nothing else reverts it."""
+    result = subprocess.run(
+        [
+            "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "-o", "jsonpath={.status.availableReplicas}",
+        ],
+        capture_output=True, text=True,
+    )
+    current = result.stdout.strip()
+    if current == str(UNDER_PROVISIONED_BASELINE_REPLICAS):
+        return
+
+    print(f"  {cfg['target']}'s available replicas is {current or '(unknown)'}, not the "
+          f"{UNDER_PROVISIONED_BASELINE_REPLICAS} baseline -- resetting before injecting "
+          f"(a prior real fix likely raised it)...")
+    subprocess.run(
+        [
+            "kubectl", "scale", "deployment", cfg["target"], "-n", cfg["namespace"],
+            f"--replicas={UNDER_PROVISIONED_BASELINE_REPLICAS}",
+        ],
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=90s",
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def _inject_and_verify_under_provisioned(cfg: dict) -> str | None:
+    """Fires a real k6 burst (20 VUs, 20s, matching the validated
+    Phase C2 measurement) directly against catalogue and confirms via
+    k6's own real p95 output that it lands above
+    UNDER_PROVISIONED_MIN_P95_MS -- mechanism assertion via a real
+    active probe, not Chaos Mesh, not Prometheus. No persistent chaos
+    resource to hold/delete -- see the constants' docstring above for
+    why (the fault is a standing config state, not a transient
+    condition)."""
+    _ensure_catalogue_replica_baseline(cfg)
+    namespace = cfg["namespace"]
+
+    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: firing a real "
+              f"{UNDER_PROVISIONED_VUS}-VU/{UNDER_PROVISIONED_DURATION_S}s burst against catalogue...")
+        p95_ms = _catalogue_burst_p95_ms(
+            namespace, UNDER_PROVISIONED_VUS, UNDER_PROVISIONED_DURATION_S, "inject"
+        )
+        if p95_ms is not None and p95_ms >= UNDER_PROVISIONED_MIN_P95_MS:
+            return "k6-burst"
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: p95={p95_ms}ms, below {UNDER_PROVISIONED_MIN_P95_MS}ms threshold{suffix}")
+    return None
+
+
+def _patch_front_end_image(cfg: dict, image: str):
+    patch_body = (
+        '{"spec":{"template":{"spec":{"containers":[{"name":"' + cfg["container"] + '",'
+        '"image":"' + image + '"}]}}}}'
+    )
+    subprocess.run(
+        [
+            "kubectl", "patch", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "--type=strategic", "-p", patch_body,
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def _ensure_front_end_image_baseline(cfg: dict):
+    """Resets front-end's image back to FRONT_END_IMAGE_BASELINE before
+    injecting, if it's currently anything else -- guards against a
+    prior interrupted/failed run leaving it patched. Note: unlike
+    oom/cpu-throttling/under-provisioned-replicas, this class's own
+    REAL fix (rollback_deployment) is self-correcting by definition --
+    a real successful rollback already returns the image to baseline,
+    since "rollback" means "revert to the last known-good revision."
+    This check exists only as a safety net for interrupted runs, not
+    because the fix leaves elevated state the way those other
+    classes' fixes do."""
+    result = subprocess.run(
+        [
+            "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "-o", "jsonpath={.spec.template.spec.containers[0].image}",
+        ],
+        capture_output=True, text=True,
+    )
+    current_image = result.stdout.strip()
+    if current_image == FRONT_END_IMAGE_BASELINE:
+        return
+    print(f"  {cfg['target']}'s image is {current_image or '(unknown)'}, not the "
+          f"{FRONT_END_IMAGE_BASELINE} baseline -- resetting before injecting "
+          f"(a prior interrupted run likely left it patched)...")
+    _patch_front_end_image(cfg, FRONT_END_IMAGE_BASELINE)
+    subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=90s",
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def _front_end_image_pull_failing(namespace: str) -> bool:
+    """True if any front-end-labeled pod currently reports a waiting
+    reason of ImagePullBackOff or ErrImagePull -- confirmed empirically
+    that this only ever matches the genuinely-stuck NEW pod (same
+    "old pod stays healthy and untouched" pattern as init-failure's
+    PAYMENT_READINESS_PATH_FAULT)."""
+    query = (
+        f'kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
+        f'pod=~"front-end.*", reason=~"ImagePullBackOff|ErrImagePull"}} == 1'
+    )
+    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+    resp.raise_for_status()
+    return len(resp.json()["data"]["result"]) > 0
+
+
+def _verify_bad_rollout_effect(namespace: str) -> bool:
+    elapsed = 0
+    while elapsed <= EFFECT_VERIFY_TIMEOUT_S:
+        if _front_end_image_pull_failing(namespace):
+            return True
+        time.sleep(EFFECT_VERIFY_POLL_S)
+        elapsed += EFFECT_VERIFY_POLL_S
+    return False
+
+
+def _inject_and_verify_bad_rollout(cfg: dict) -> bool:
+    """Patches front-end's image to a nonexistent tag via a strategic-
+    merge kubectl patch, same mechanism class as init-failure/oom (a
+    pod-template change that triggers a real RollingUpdate). Unlike
+    init-failure (report-only, self-reverts), this is an AUTO-FIX
+    class -- ground truth is left broken for the agent's own real fix
+    (rollback_deployment) to resolve later, no self-revert here."""
+    _ensure_front_end_image_baseline(cfg)
+    namespace = cfg["namespace"]
+
+    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: patching front-end's image to a "
+              f"nonexistent tag...")
+        _patch_front_end_image(cfg, FRONT_END_IMAGE_FAULT)
+        verified = _verify_bad_rollout_effect(namespace)
+        if verified:
+            return True
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: ImagePullBackOff/ErrImagePull never appeared{suffix}")
+        _patch_front_end_image(cfg, FRONT_END_IMAGE_BASELINE)
+    return False
 
 
 def _patch_payment_readiness_path(cfg: dict, path: str):
@@ -1513,6 +1930,53 @@ def _inject_and_verify_connection_pool_exhaustion(cfg: dict) -> str | None:
     return None
 
 
+def _verify_cpu_throttle_effect(
+    target: str, namespace: str, container: str, baseline_periods: int
+) -> bool:
+    """Polls for a real delta above CPU_THROTTLE_MIN_PERIODS_INCREASE,
+    same scrape-lag-tolerant pattern as _verify_restart_effect."""
+    elapsed = 0
+    while elapsed <= EFFECT_VERIFY_TIMEOUT_S:
+        current = _cfs_throttled_periods(target, namespace, container)
+        if current - baseline_periods >= CPU_THROTTLE_MIN_PERIODS_INCREASE:
+            return True
+        time.sleep(EFFECT_VERIFY_POLL_S)
+        elapsed += EFFECT_VERIFY_POLL_S
+    return False
+
+
+def _inject_and_verify_cpu_throttling(cfg: dict) -> str | None:
+    """StressChaos cpu stressor against `user`, held for the full
+    duration_s (same 'don't end early' discipline every other class
+    learned the hard way -- an external observer, or a future real
+    diagnosis call, needs a fair chance to see the fault too). Verified
+    via a raw before/after delta on container_cpu_cfs_throttled_periods_total,
+    not Chaos Mesh's own state."""
+    _ensure_cpu_throttle_baseline(cfg)
+    chaos_kind = "stresschaos"
+    namespace = cfg["namespace"]
+    target = cfg["target"]
+    container = cfg["container"]
+
+    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
+        baseline_periods = _cfs_throttled_periods(target, namespace, container)
+        chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
+        manifest = build_cpu_throttle_manifest(chaos_name, cfg)
+        apply_manifest(manifest)
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: baseline_periods={baseline_periods}, "
+              f"holding the fault active for the full {cfg['duration_s']}s window...")
+        time.sleep(cfg["duration_s"])
+        try:
+            verified = _verify_cpu_throttle_effect(target, namespace, container, baseline_periods)
+        finally:
+            delete_chaos_resource(chaos_kind, chaos_name)
+        if verified:
+            return chaos_name
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: no real throttled-periods increase observed{suffix}")
+    return None
+
+
 def _inject_and_verify_chaos_mesh(fault_class: str, cfg: dict, manifest_builder) -> str | None:
     """Returns the chaos_name of the attempt that got verified, or None
     if all attempts failed. Only oom uses this now -- crash-loop moved
@@ -1574,6 +2038,13 @@ def main():
     elif fault_class == "session-cart-failure":
         verified = _inject_and_verify_session_cart_failure(cfg)
         chaos_name = "manual-scale" if verified else None
+    elif fault_class == "cpu-throttling":
+        chaos_name = _inject_and_verify_cpu_throttling(cfg)
+    elif fault_class == "under-provisioned-replicas":
+        chaos_name = _inject_and_verify_under_provisioned(cfg)
+    elif fault_class == "bad-rollout":
+        verified = _inject_and_verify_bad_rollout(cfg)
+        chaos_name = "manual-patch" if verified else None
     elif fault_class == "oom":
         _ensure_oom_baseline(cfg)
         chaos_name = _inject_and_verify_chaos_mesh(fault_class, cfg, build_oom_manifest)

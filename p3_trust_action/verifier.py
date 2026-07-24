@@ -9,8 +9,10 @@ implemented. disk-full's check is structurally different from the
 other two -- see _make_disk_full_check.
 """
 
+import re
 import subprocess
 import time
+import uuid
 
 import requests
 
@@ -21,34 +23,54 @@ DURABILITY_WINDOWS = {
     "crash-loop": 120,
     "oom": 180,
     "disk-full": 120,
+    # cpu-throttling: a transient CPU-scheduling effect, not a lingering
+    # leak/growth pattern -- matches crash-loop/disk-full's shorter tier
+    # rather than oom/memory-leak's 3min.
+    "cpu-throttling": 120,
+    # Nominal target for the custom active-probe branch below -- not
+    # used by the generic poll loop, since this class bypasses it.
+    "under-provisioned-replicas": 90,
+    "bad-rollout": 120,
 }
 
+# Same real-measured margin as injector.py's CPU_THROTTLE_MIN_PERIODS_INCREASE
+# (baseline delta over 60s = 0.0, during-stress delta over 30s ~= 300) --
+# reused here for the post-fix durability check, not re-derived.
+CPU_THROTTLE_DURABILITY_MIN_INCREASE = 50
+
+# under-provisioned-replicas: durability here means "does capacity
+# genuinely stay recovered," checked via the SAME real active-probe
+# mechanism as injection/diagnosis (no passive metric exists -- see
+# injector.py's UNDER_PROVISIONED_* constants for the full real-
+# measurement history). Deliberately NOT the generic POLL_INTERVAL_S
+# sleep-then-check loop every other class uses: that loop assumes an
+# instant, near-free check -- reusing it here (a real ~20s burst each
+# time) would fire far more real load than intended (6 checks over a
+# 120s window x ~35s real time each = ~210s of real bursts, not the
+# nominal 120s) and badly undercount real elapsed_s in the result.
+# Handled as its own dedicated branch in verify_durability instead --
+# 3 real probes, spaced to land total real wall-clock close to the
+# nominal window.
+K6_IMAGE = "grafana/k6:latest"
+UNDER_PROVISIONED_PROBE_VUS = 20
+UNDER_PROVISIONED_PROBE_DURATION_S = 20
+UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 200
+UNDER_PROVISIONED_PROBE_COUNT = 3
+UNDER_PROVISIONED_INTER_PROBE_SLEEP_S = 15
+# Real bug found and fixed (2026-07-24): scale_deployment (the fix
+# action) returns as soon as the API accepts the scale request, NOT
+# once the new replicas are actually Ready -- catalogue's real
+# readinessProbe has a confirmed 180s initialDelaySeconds (see
+# injector.py/measure_catalogue_load.py's own real measurement
+# history), so the probe sequence below was starting and finishing
+# well before the new replicas could possibly be serving traffic,
+# causing a real but MISLEADING flap (only the original 1 replica was
+# ever actually live during the whole check). Same root-cause class as
+# disk-full's own "API acceptance != real completion" lesson.
+UNDER_PROVISIONED_TARGET_REPLICAS = 3  # matches FIX_PARAMS["under-provisioned-replicas"] in p3_agent.py
+UNDER_PROVISIONED_REPLICA_WAIT_TIMEOUT_S = 220  # real margin over the confirmed 180s readiness delay
+
 POLL_INTERVAL_S = 15
-
-
-def _current_pod_name(target: str, namespace: str) -> str:
-    """
-    A fix action (e.g. restart_deployment) creates a NEW pod with a new
-    name suffix. Matching by name PREFIX (pod=~"target.*") can still
-    pick up the just-terminated OLD pod's stale restart count / status
-    for a short time before Prometheus's next scrape reflects its
-    removal -- contaminating verification with pre-fix data. Resolving
-    the exact current pod name once and matching on it exactly avoids
-    that.
-    """
-    query = (
-        f'kube_pod_status_phase{{namespace="{namespace}", '
-        f'pod=~"{target}.*", phase="Running"}} == 1'
-    )
-    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
-    resp.raise_for_status()
-    result = resp.json()["data"]["result"]
-    if not result:
-        raise RuntimeError(f"no Running pod found matching '{target}' in {namespace}")
-    # If more than one is Running (rollout mid-transition), the newest
-    # pod name sorts last for the standard <name>-<hash>-<hash> scheme.
-    pod_names = sorted(entry["metric"]["pod"] for entry in result)
-    return pod_names[-1]
 
 
 def _current_pod_name_live(target: str, namespace: str) -> str | None:
@@ -103,25 +125,6 @@ def _current_pod_name_live_with_retry(target: str, namespace: str) -> str:
         elapsed += BASELINE_CAPTURE_POLL_S
 
 
-def _current_pod_name_with_retry(target: str, namespace: str) -> str:
-    """
-    scale_deployment (disk-full's fix) scales to 0 then back up -- there's
-    a real window with zero Running pods. Calling _current_pod_name
-    uncaught at baseline capture would crash the verifier (and the
-    scorer, unhandled) the first time a disk-full auto-fix runs. Retries
-    for up to BASELINE_CAPTURE_RETRY_S before giving up for real.
-    """
-    elapsed = 0
-    while True:
-        try:
-            return _current_pod_name(target, namespace)
-        except RuntimeError:
-            if elapsed >= BASELINE_CAPTURE_RETRY_S:
-                raise
-            time.sleep(BASELINE_CAPTURE_POLL_S)
-            elapsed += BASELINE_CAPTURE_POLL_S
-
-
 def _restart_count(pod_name: str, namespace: str) -> int:
     query = f'kube_pod_container_status_restarts_total{{namespace="{namespace}", pod="{pod_name}"}}'
     resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
@@ -143,7 +146,11 @@ def _crash_loop_backoff_now(pod_name: str, namespace: str) -> bool:
 def _make_crash_loop_check(pod_name: str, baseline_restarts: int):
     """
     Scoped to the exact pod resolved when the durability window started
-    -- see _current_pod_name for why exact-match beats prefix-match here.
+    -- see _current_pod_name_live for why exact-match (via kubectl's
+    `-l name={target}` label selector) beats a name-string prefix match
+    here (the latter can silently collide with an unrelated deployment
+    sharing the same string prefix, e.g. `user` vs `user-db` -- found
+    2026-07-24 while validating cpu-throttling).
     """
 
     def check(target: str, namespace: str) -> bool:
@@ -229,6 +236,62 @@ def _evicted_recently(target: str, namespace: str, baseline_pod_name: str) -> bo
     return False
 
 
+def _cfs_throttled_periods_exact(pod_name: str, namespace: str, container: str) -> int:
+    """Exact-pod-name twin of injector.py's _cfs_throttled_periods --
+    scoped to the pod resolved when the durability window started, same
+    exact-match discipline as _restart_count/_crash_loop_backoff_now
+    above, since the fix (patch_cpu_limit) triggers a real pod-template
+    rollout just like patch_memory_limit does."""
+    query = (
+        f'container_cpu_cfs_throttled_periods_total{{namespace="{namespace}", '
+        f'pod="{pod_name}", container="{container}"}}'
+    )
+    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+    resp.raise_for_status()
+    result = resp.json()["data"]["result"]
+    return sum(int(float(entry["value"][1])) for entry in result)
+
+
+def _make_cpu_throttle_check(pod_name: str, container: str, baseline_periods: int):
+    """Same raw-delta-vs-baseline discipline as injector.py's own
+    verification -- durability holds as long as throttled-periods
+    doesn't jump by another real margin above whatever it already was
+    when the window started (post-fix, on the new higher CPU limit)."""
+
+    def check(target: str, namespace: str) -> bool:
+        current = _cfs_throttled_periods_exact(pod_name, namespace, container)
+        return current - baseline_periods >= CPU_THROTTLE_DURABILITY_MIN_INCREASE
+
+    return check
+
+
+def _front_end_image_pull_failing(namespace: str) -> bool:
+    """Duplicated from injector.py's identical helper -- matches this
+    project's established self-contained-file convention. A cheap
+    passive Prometheus read (unlike under-provisioned-replicas' active
+    probes), so this fits the standard generic poll loop fine."""
+    query = (
+        f'kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
+        f'pod=~"front-end.*", reason=~"ImagePullBackOff|ErrImagePull"}} == 1'
+    )
+    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+    resp.raise_for_status()
+    return len(resp.json()["data"]["result"]) > 0
+
+
+def _make_bad_rollout_check():
+    """No baseline pod name needed -- unlike crash-loop/oom, the
+    'still faulty' signal here (ANY front-end pod stuck in
+    ImagePullBackOff/ErrImagePull) is meaningful regardless of which
+    specific pod it is: after a genuinely successful rollback, no
+    front-end pod should ever be in that state again."""
+
+    def check(target: str, namespace: str) -> bool:
+        return _front_end_image_pull_failing(namespace)
+
+    return check
+
+
 def _make_disk_full_check(baseline_pod_name: str):
     """
     disk-full doesn't restart a container in place like crash-loop/oom --
@@ -257,6 +320,137 @@ def _make_disk_full_check(baseline_pod_name: str):
     return check
 
 
+def _parse_k6_p95_ms(stdout_text: str) -> float | None:
+    """Parses the real p95 value directly from k6's own end-of-run
+    text summary -- `--no-summary`/`--summary-export=/dev/stdout`
+    isn't a real flag on this k6 image (confirmed via a real failed
+    run, 2026-07-24: `unknown flag: --no-summary`). Duplicated from
+    injector.py's identical helper, same self-contained-file
+    convention."""
+    match = re.search(
+        r"http_req_duration[^\n]*p\(95\)=([\d.]+)(µs|ms|s)\b", stdout_text
+    )
+    if not match:
+        return None
+    value, unit = float(match.group(1)), match.group(2)
+    if unit == "s":
+        return value * 1000
+    if unit == "µs":
+        return value / 1000
+    return value
+
+
+def _catalogue_probe_p95_ms(namespace: str) -> float | None:
+    """Duplicated from injector.py/agent.py's own identical helper --
+    matches this project's established convention of keeping each
+    file self-contained rather than sharing a cross-module utility
+    (see _current_pod_name_live's own precedent). Same real, validated
+    parameters throughout: 20 VUs, 20s, GET /catalogue?size=10."""
+    pod_name = f"wardence-underprov-verify-{uuid.uuid4().hex[:8]}"
+    script = f"""
+import http from 'k6/http';
+export const options = {{
+  scenarios: {{
+    burst: {{
+      executor: 'constant-vus',
+      vus: {UNDER_PROVISIONED_PROBE_VUS},
+      duration: '{UNDER_PROVISIONED_PROBE_DURATION_S}s',
+    }},
+  }},
+}};
+export default function () {{
+  http.get('http://catalogue.{namespace}.svc.cluster.local/catalogue?size=10');
+}}
+"""
+    try:
+        result = subprocess.run(
+            [
+                "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
+                "-n", namespace, f"--image={K6_IMAGE}",
+                "--", "run", "--quiet", "-",
+            ],
+            input=script, capture_output=True, text=True,
+            timeout=UNDER_PROVISIONED_PROBE_DURATION_S + 60,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_k6_p95_ms(result.stdout)
+
+
+def _catalogue_available_replicas_live(namespace: str) -> int:
+    """Live API, not Prometheus -- same 'no scrape lag' reasoning as
+    _current_pod_name_live. Returns 0 if the field is empty/unset."""
+    result = subprocess.run(
+        [
+            "kubectl", "get", "deployment", "catalogue", "-n", namespace,
+            "-o", "jsonpath={.status.availableReplicas}",
+        ],
+        capture_output=True, text=True,
+    )
+    value = result.stdout.strip()
+    return int(value) if value else 0
+
+
+def _wait_for_catalogue_replicas_ready(namespace: str, target_count: int, timeout_s: int) -> bool:
+    """Polls until catalogue's real available-replica count genuinely
+    reaches target_count -- never just trusts that scale_deployment's
+    API call being accepted means the new replicas are actually
+    serving traffic. See UNDER_PROVISIONED_REPLICA_WAIT_TIMEOUT_S's
+    docstring for why this exists."""
+    elapsed = 0
+    while elapsed <= timeout_s:
+        if _catalogue_available_replicas_live(namespace) >= target_count:
+            return True
+        time.sleep(10)
+        elapsed += 10
+    return False
+
+
+def _verify_under_provisioned_durability(namespace: str, target: str) -> dict:
+    """Custom durability path -- see the module-level constants'
+    docstring for why this bypasses the generic poll loop entirely.
+    FIRST waits for the fix's new replicas to genuinely become Ready
+    (real completion, not just API acceptance -- see
+    UNDER_PROVISIONED_REPLICA_WAIT_TIMEOUT_S), THEN runs
+    UNDER_PROVISIONED_PROBE_COUNT real probes, returning 'flapped' the
+    moment any one shows p95 still degraded (same 'return the moment
+    it's already wrong' discipline as the generic loop), else
+    'confirmed' after all probes pass. If the replicas never reach the
+    target count within the timeout, that's a real fix failure, not a
+    premature check -- reported as 'flapped' honestly."""
+    wait_start = time.time()
+    ready = _wait_for_catalogue_replicas_ready(
+        namespace, UNDER_PROVISIONED_TARGET_REPLICAS, UNDER_PROVISIONED_REPLICA_WAIT_TIMEOUT_S
+    )
+    # Real elapsed wall-clock, not the worst-case timeout value -- the
+    # wait usually finishes well before the timeout (e.g. ~180-190s in
+    # practice, not the full 220s budget).
+    elapsed = int(time.time() - wait_start)
+    if not ready:
+        return {
+            "verdict": "flapped", "elapsed_s": elapsed,
+            "fault_class": "under-provisioned-replicas", "target": target,
+        }
+
+    for i in range(UNDER_PROVISIONED_PROBE_COUNT):
+        if i > 0:
+            time.sleep(UNDER_PROVISIONED_INTER_PROBE_SLEEP_S)
+            elapsed += UNDER_PROVISIONED_INTER_PROBE_SLEEP_S
+        p95_ms = _catalogue_probe_p95_ms(namespace)
+        elapsed += UNDER_PROVISIONED_PROBE_DURATION_S
+        if p95_ms is not None and p95_ms >= UNDER_PROVISIONED_PROBE_THRESHOLD_MS:
+            return {
+                "verdict": "flapped", "elapsed_s": elapsed,
+                "fault_class": "under-provisioned-replicas", "target": target,
+            }
+    return {
+        "verdict": "confirmed", "elapsed_s": elapsed,
+        "fault_class": "under-provisioned-replicas", "target": target,
+    }
+
+
 def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop") -> dict:
     """
     Poll until the fault class's durability window closes.
@@ -269,12 +463,34 @@ def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop
     if fault_class not in DURABILITY_WINDOWS:
         raise ValueError(f"no durability window defined for fault class '{fault_class}'")
 
+    if fault_class == "under-provisioned-replicas":
+        # Bypasses the generic poll loop entirely -- see the module-
+        # level constants' docstring for why (active real probes, not
+        # a cheap passive query).
+        return _verify_under_provisioned_durability(namespace, target)
+
     if fault_class == "crash-loop":
-        pod_name = _current_pod_name_with_retry(target, namespace)
+        # Live API (exact `name={target}` label selector), not the
+        # Prometheus regex-based resolver -- see _current_pod_name_live's
+        # docstring and the 2026-07-24 cpu-throttling incident that
+        # found this: `pod=~"{target}.*"` also matches OTHER real
+        # deployments sharing the same string prefix (carts-db for
+        # crash-loop's own `carts`, catalogue-db for oom's `catalogue`),
+        # not just old-vs-new pods of the SAME rollout as the function's
+        # own comment assumed. sorted(pod_names)[-1] can silently lock
+        # onto the wrong, unrelated pod depending on which ReplicaSet
+        # hash happens to sort last -- confirmed for real via
+        # cpu-throttling (`user` vs `user-db`), and since crash-loop/oom
+        # have the identical collision (`carts`/`carts-db`,
+        # `catalogue`/`catalogue-db`), their own past durability checks
+        # may have been silently vulnerable to the same non-deterministic
+        # mis-resolution, undetected whenever the hash comparison
+        # happened to still favor the right pod.
+        pod_name = _current_pod_name_live_with_retry(target, namespace)
         baseline = _restart_count(pod_name, namespace)
         check_fn = _make_crash_loop_check(pod_name, baseline)
     elif fault_class == "oom":
-        pod_name = _current_pod_name_with_retry(target, namespace)
+        pod_name = _current_pod_name_live_with_retry(target, namespace)
         baseline = _restart_count(pod_name, namespace)
         check_fn = _make_oom_check(pod_name, baseline)
     elif fault_class == "disk-full":
@@ -283,6 +499,17 @@ def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop
         # dead pod as "baseline" and guarantee a false flap.
         baseline_pod_name = _current_pod_name_live_with_retry(target, namespace)
         check_fn = _make_disk_full_check(baseline_pod_name)
+    elif fault_class == "cpu-throttling":
+        # container == target here (user's own deployment/container name),
+        # same as FIX_PARAMS["cpu-throttling"] in p3_agent.py. Live API,
+        # not Prometheus -- see the crash-loop branch above for why
+        # (this is the exact class that surfaced the bug: `user` vs
+        # `user-db`).
+        pod_name = _current_pod_name_live_with_retry(target, namespace)
+        baseline = _cfs_throttled_periods_exact(pod_name, namespace, target)
+        check_fn = _make_cpu_throttle_check(pod_name, target, baseline)
+    elif fault_class == "bad-rollout":
+        check_fn = _make_bad_rollout_check()
 
     window_s = DURABILITY_WINDOWS[fault_class]
     elapsed = 0

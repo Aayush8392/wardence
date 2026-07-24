@@ -13,6 +13,10 @@ Usage:
     Then: POST http://localhost:8000/diagnose  {"target": "carts", "namespace": "sock-shop"}
 """
 
+import re
+import subprocess
+import uuid
+
 import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -50,6 +54,95 @@ CONNECTION_POOL_THRESHOLD = 100
 # baseline and well above the small residual noise observed during a
 # real fault.
 NETWORK_PARTITION_MAX_THROUGHPUT_BPS = 200
+
+# user's container_cpu_cfs_throttled_periods_total is a non-resetting
+# counter, already nonzero under light idle traffic (553 at measurement
+# time, 2026-07-24) -- but increase() over a window is well-defined
+# regardless of the counter's absolute starting value, so (unlike a
+# gauge) no per-episode baseline is needed here, same reasoning
+# injector.py's own verification uses. Real measured margin: baseline
+# increase over 60s = 0.0; during-stress increase over 30s ~= 300
+# (~600 projected per 60s). 100 sits with a large real margin above
+# baseline noise and well below a genuine stressed level.
+CPU_THROTTLE_INCREASE_THRESHOLD = 100
+
+# under-provisioned-replicas: catalogue exposes no native request-
+# latency metric of its own, and traffic_gen's organic load is far
+# below what's needed to trigger real degradation (confirmed via
+# measurement, 2026-07-24) -- so unlike every other signal in this
+# file, this one is an ACTIVE PROBE, not a passive Prometheus read.
+# Same real, validated parameters as injector.py's own mechanism-
+# assertion (20 VUs, 20s, 200ms threshold -- see injector.py's
+# UNDER_PROVISIONED_* constants for the full real-measurement history).
+# Called ONLY as a fallback from diagnose()/handle() -- see those
+# functions -- after cheaper signals have already been checked, so
+# this never fires during an active oom episode on the same target.
+K6_IMAGE = "grafana/k6:latest"
+UNDER_PROVISIONED_PROBE_VUS = 20
+UNDER_PROVISIONED_PROBE_DURATION_S = 20
+UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 200
+
+
+def _parse_k6_p95_ms(stdout_text: str) -> float | None:
+    """Parses the real p95 value directly from k6's own end-of-run
+    text summary -- `--no-summary`/`--summary-export=/dev/stdout`
+    isn't a real flag on this k6 image (confirmed via a real failed
+    run, 2026-07-24: `unknown flag: --no-summary`). Duplicated from
+    injector.py's identical helper, matching this project's
+    established convention of keeping each file self-contained."""
+    match = re.search(
+        r"http_req_duration[^\n]*p\(95\)=([\d.]+)(µs|ms|s)\b", stdout_text
+    )
+    if not match:
+        return None
+    value, unit = float(match.group(1)), match.group(2)
+    if unit == "s":
+        return value * 1000
+    if unit == "µs":
+        return value / 1000
+    return value
+
+
+def probe_catalogue_capacity(namespace: str) -> float | None:
+    """Fires a real k6 burst directly against catalogue and returns
+    its real p95, parsed from k6's own text summary. This is a
+    deliberate perturbation, not a read-only observation -- a first
+    for this file, worth knowing before calling it casually (see the
+    real cost/interference tradeoffs discussed before this class was
+    built: real cluster load per call, and a real contamination-
+    surface risk with connection-pool-exhaustion, which also floods
+    catalogue-db through catalogue)."""
+    pod_name = f"wardence-catprobe-{uuid.uuid4().hex[:8]}"
+    script = f"""
+import http from 'k6/http';
+export const options = {{
+  scenarios: {{
+    burst: {{
+      executor: 'constant-vus',
+      vus: {UNDER_PROVISIONED_PROBE_VUS},
+      duration: '{UNDER_PROVISIONED_PROBE_DURATION_S}s',
+    }},
+  }},
+}};
+export default function () {{
+  http.get('http://catalogue.{namespace}.svc.cluster.local/catalogue?size=10');
+}}
+"""
+    try:
+        result = subprocess.run(
+            [
+                "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
+                "-n", namespace, f"--image={K6_IMAGE}",
+                "--", "run", "--quiet", "-",
+            ],
+            input=script, capture_output=True, text=True,
+            timeout=UNDER_PROVISIONED_PROBE_DURATION_S + 60,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_k6_p95_ms(result.stdout)
 
 app = FastAPI()
 
@@ -311,6 +404,33 @@ def query_prometheus(target: str, namespace: str) -> dict:
     else:
         payment_stuck_not_ready = False
 
+    # bad-rollout: front-end's own kube_pod_container_status_waiting_reason
+    # -- confirmed empirically (2026-07-25, see injector.py's
+    # FRONT_END_IMAGE_FAULT docstring) that a bad image tag leaves the
+    # OLD, healthy pod serving traffic untouched (same "old stays up,
+    # new broken one never comes online" pattern as init-failure) while
+    # a NEW pod gets stuck ImagePullBackOff/ErrImagePull -- so a query
+    # for ANY front-end pod reporting that waiting reason only ever
+    # matches the genuinely-stuck new pod. max_over_time, not an
+    # instant query -- unlike some other classes, this fault DOESN'T
+    # self-revert before diagnosis time (it's a standing bad config,
+    # same shape as under-provisioned-replicas), so an instant query
+    # would likely also work, but the windowed version is used
+    # proactively for the same scrape-timing safety margin every other
+    # class's signal already gets.
+    if target == "front-end":
+        image_pull_failing_query = (
+            f'max_over_time(kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
+            f'pod=~"{target}.*", reason=~"ImagePullBackOff|ErrImagePull"}}[2m]) == 1'
+        )
+        image_pull_failing_resp = requests.get(
+            f"{PROMETHEUS_URL}/api/v1/query", params={"query": image_pull_failing_query}, timeout=10
+        )
+        image_pull_failing_resp.raise_for_status()
+        front_end_image_pull_failing = len(image_pull_failing_resp.json()["data"]["result"]) > 0
+    else:
+        front_end_image_pull_failing = False
+
     # session-cart-failure: session-db's own kube_deployment_status_replicas_available
     # -- a genuinely new signal type, distinct from every other class's
     # signature (target pod exists but is broken in some way): here the
@@ -398,6 +518,30 @@ def query_prometheus(target: str, namespace: str) -> dict:
     else:
         peak_threads_connected = None
 
+    # cpu-throttling: user's own container_cpu_cfs_throttled_periods_total,
+    # via increase() over a window wide enough to cover the fault's full
+    # 60s duration plus the settle gap (same 2m margin used elsewhere) --
+    # NOT max_over_time (that's for gauges; this is a monotonic counter,
+    # so increase() over the window directly gives the real delta during
+    # that period regardless of the counter's absolute starting value,
+    # avoiding the "already nonzero at idle" trap a raw/instant read of
+    # this metric would fall into).
+    if target == "user":
+        throttle_query = (
+            f'increase(container_cpu_cfs_throttled_periods_total{{namespace="{namespace}", '
+            f'pod=~"{target}-.*", container="{target}"}}[2m])'
+        )
+        throttle_resp = requests.get(
+            f"{PROMETHEUS_URL}/api/v1/query", params={"query": throttle_query}, timeout=10
+        )
+        throttle_resp.raise_for_status()
+        throttle_result = throttle_resp.json()["data"]["result"]
+        cpu_throttle_periods_increase = (
+            float(throttle_result[0]["value"][1]) if throttle_result else None
+        )
+    else:
+        cpu_throttle_periods_increase = None
+
     oom_pods = [entry["metric"].get("pod") for entry in oom_result]
     # Only trust the Evicted signal if there's ALSO a freshly-created
     # Running pod for this target -- see query docstring above for why
@@ -415,6 +559,8 @@ def query_prometheus(target: str, namespace: str) -> dict:
         "session_db_replicas_hit_zero": session_db_replicas_hit_zero,
         "peak_memory_mib": peak_memory_mib,
         "peak_threads_connected": peak_threads_connected,
+        "cpu_throttle_periods_increase": cpu_throttle_periods_increase,
+        "front_end_image_pull_failing": front_end_image_pull_failing,
     }
 
 
@@ -436,6 +582,7 @@ def stub_diagnose(tool_output: dict) -> dict:
     session_db_replicas_hit_zero = tool_output["session_db_replicas_hit_zero"]
     peak_memory_mib = tool_output["peak_memory_mib"]
     peak_threads_connected = tool_output["peak_threads_connected"]
+    cpu_throttle_periods_increase = tool_output["cpu_throttle_periods_increase"]
 
     if oom_pods:
         return {
@@ -461,6 +608,13 @@ def stub_diagnose(tool_output: dict) -> dict:
             "confidence": 0.6,
             "reasoning": "a payment pod is reporting Ready=false with no restart -- stuck, never "
                          "becoming ready, not crash-looping (stubbed rule, not LLM)",
+        }
+    if tool_output["front_end_image_pull_failing"]:
+        return {
+            "diagnosis": "bad-rollout",
+            "confidence": 0.6,
+            "reasoning": "a front-end pod is stuck in ImagePullBackOff/ErrImagePull -- a bad "
+                         "deploy, not a crash-loop or generic restart (stubbed rule, not LLM)",
         }
     if session_db_replicas_hit_zero:
         return {
@@ -502,6 +656,17 @@ def stub_diagnose(tool_output: dict) -> dict:
             "confidence": 0.6,
             "reasoning": f"peak MySQL Threads_connected {peak_threads_connected} >= {CONNECTION_POOL_THRESHOLD} threshold (stubbed rule, not LLM)",
         }
+    if (
+        cpu_throttle_periods_increase is not None
+        and cpu_throttle_periods_increase >= CPU_THROTTLE_INCREASE_THRESHOLD
+    ):
+        return {
+            "diagnosis": "cpu-throttling",
+            "confidence": 0.6,
+            "reasoning": f"user's CFS throttled-periods increased by {cpu_throttle_periods_increase} "
+                         f">= {CPU_THROTTLE_INCREASE_THRESHOLD} threshold over the last 2m "
+                         f"(stubbed rule, not LLM)",
+        }
     return {
         "diagnosis": "no anomaly detected",
         "confidence": 0.5,
@@ -513,6 +678,22 @@ def stub_diagnose(tool_output: dict) -> dict:
 def diagnose(req: DiagnoseRequest):
     tool_output = query_prometheus(req.target, req.namespace)
     result = stub_diagnose(tool_output)
+    # under-provisioned-replicas fallback: only fires the real active
+    # probe when nothing cheaper already explains this target, and
+    # only for catalogue -- see probe_catalogue_capacity's docstring
+    # for why this is deliberately NOT gathered eagerly like every
+    # other signal (avoids firing a real burst during an active oom
+    # episode on the same target).
+    if result["diagnosis"] == "no anomaly detected" and req.target == "catalogue":
+        probe_p95_ms = probe_catalogue_capacity(req.namespace)
+        tool_output["catalogue_probe_p95_ms"] = probe_p95_ms
+        if probe_p95_ms is not None and probe_p95_ms >= UNDER_PROVISIONED_PROBE_THRESHOLD_MS:
+            result = {
+                "diagnosis": "under-provisioned-replicas",
+                "confidence": 0.6,
+                "reasoning": f"active capacity probe against catalogue showed p95={probe_p95_ms}ms "
+                             f">= {UNDER_PROVISIONED_PROBE_THRESHOLD_MS}ms threshold (stubbed rule, not LLM)",
+            }
     return {
         "target": req.target,
         "namespace": req.namespace,

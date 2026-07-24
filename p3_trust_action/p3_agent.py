@@ -40,6 +40,8 @@ _p2_agent = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_p2_agent)
 query_prometheus = _p2_agent.query_prometheus
 stub_diagnose = _p2_agent.stub_diagnose
+probe_catalogue_capacity = _p2_agent.probe_catalogue_capacity
+UNDER_PROVISIONED_PROBE_THRESHOLD_MS = _p2_agent.UNDER_PROVISIONED_PROBE_THRESHOLD_MS
 
 app = FastAPI()
 
@@ -51,6 +53,9 @@ app = FastAPI()
 FIX_PARAMS = {
     "oom": {"container": "catalogue", "limit": "400Mi"},  # catalogue's original limit is 200Mi
     "disk-full": {"replicas": 1},
+    "cpu-throttling": {"container": "user", "limit": "600m"},  # user's original limit is 300m
+    "under-provisioned-replicas": {"replicas": 3},  # catalogue's original count is 1
+    "bad-rollout": {},  # rollback_deployment needs only name/namespace, no extra params
 }
 
 # predicted diagnosis string -> (fault_class key, action name, action kwargs builder).
@@ -73,6 +78,23 @@ ACTION_MAP = {
         "restore_from_disk_full",
         lambda target, namespace: {"name": target, "namespace": namespace, **FIX_PARAMS["disk-full"]},
     ),
+    "cpu-throttling": (
+        "cpu-throttling",
+        "patch_cpu_limit",
+        lambda target, namespace: {"name": target, "namespace": namespace, **FIX_PARAMS["cpu-throttling"]},
+    ),
+    "under-provisioned-replicas": (
+        "under-provisioned-replicas",
+        "scale_deployment",
+        lambda target, namespace: {
+            "name": target, "namespace": namespace, **FIX_PARAMS["under-provisioned-replicas"]
+        },
+    ),
+    "bad-rollout": (
+        "bad-rollout",
+        "rollback_deployment",
+        lambda target, namespace: {"name": target, "namespace": namespace},
+    ),
 }
 
 
@@ -85,6 +107,20 @@ class HandleRequest(BaseModel):
 def handle(req: HandleRequest):
     tool_output = query_prometheus(req.target, req.namespace)
     diagnosis_result = stub_diagnose(tool_output)
+    # under-provisioned-replicas fallback -- mirrors agent.py's own
+    # /diagnose endpoint exactly, same reason (see
+    # probe_catalogue_capacity's docstring): only fires the real
+    # active probe when nothing cheaper already explains this target.
+    if diagnosis_result["diagnosis"] == "no anomaly detected" and req.target == "catalogue":
+        probe_p95_ms = probe_catalogue_capacity(req.namespace)
+        tool_output["catalogue_probe_p95_ms"] = probe_p95_ms
+        if probe_p95_ms is not None and probe_p95_ms >= UNDER_PROVISIONED_PROBE_THRESHOLD_MS:
+            diagnosis_result = {
+                "diagnosis": "under-provisioned-replicas",
+                "confidence": 0.6,
+                "reasoning": f"active capacity probe against catalogue showed p95={probe_p95_ms}ms "
+                             f">= {UNDER_PROVISIONED_PROBE_THRESHOLD_MS}ms threshold (stubbed rule, not LLM)",
+            }
     predicted = diagnosis_result["diagnosis"]
 
     response = {

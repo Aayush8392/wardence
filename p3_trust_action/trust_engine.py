@@ -21,6 +21,9 @@ PROMOTION_STREAK = {
     "crash-loop": 5,
     "oom": 5,
     "disk-full": 5,
+    "cpu-throttling": 5,
+    "under-provisioned-replicas": 5,
+    "bad-rollout": 5,
 }
 
 REPORT_ONLY = "report_only"

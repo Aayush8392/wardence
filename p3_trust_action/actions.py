@@ -256,6 +256,92 @@ def patch_memory_limit(
     }
 
 
+def patch_cpu_limit(
+    name: str, container: str, limit: str, namespace: str = DEFAULT_NAMESPACE
+) -> dict:
+    """Fix for cpu-throttling: raise a container's CPU limit. Direct
+    sibling of patch_memory_limit -- same shape, same RBAC coverage
+    (patch on deployments), just the cpu field instead of memory."""
+    body = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {"name": container, "resources": {"limits": {"cpu": limit}}}
+                    ]
+                }
+            }
+        }
+    }
+    result = _patch_deployment(name, namespace, body)
+    return {
+        "action": "patch_cpu_limit",
+        "target": name,
+        "container": container,
+        "limit": limit,
+        "namespace": namespace,
+        **result,
+    }
+
+
+def rollback_deployment(name: str, namespace: str = DEFAULT_NAMESPACE) -> dict:
+    """Fix for bad-rollout: reverts a Deployment to its most recent
+    PREVIOUS revision's pod template -- the same real operation
+    `kubectl rollout undo` performs, reimplemented via the Python
+    client directly rather than shelling out to kubectl, which would
+    run as the developer's own admin kubeconfig identity instead of
+    the restricted wardence-agent SA, breaking the blast-radius cage.
+    RBAC confirmed sufficient empirically before this was built
+    (2026-07-24, check_rollout_undo_rbac.sh): patch on deployments,
+    get/list on replicasets -- no cage expansion needed. The removed
+    pre-1.16 deployments/rollback subresource is NOT used here."""
+    apps_api = _apps_v1()
+
+    try:
+        deployment = apps_api.read_namespaced_deployment(name, namespace)
+    except client.ApiException as e:
+        return {
+            "action": "rollback_deployment", "target": name, "namespace": namespace,
+            "dry_run_ok": False, "applied": False, "error": f"{e.status}: {e.reason}",
+        }
+
+    current_revision = int(
+        (deployment.metadata.annotations or {}).get("deployment.kubernetes.io/revision", "0")
+    )
+
+    try:
+        rs_list = apps_api.list_namespaced_replica_set(namespace, label_selector=f"name={name}")
+    except client.ApiException as e:
+        return {
+            "action": "rollback_deployment", "target": name, "namespace": namespace,
+            "dry_run_ok": False, "applied": False, "error": f"{e.status}: {e.reason}",
+        }
+
+    # Same algorithm `kubectl rollout undo` uses with no explicit
+    # --to-revision: the most recent revision STRICTLY LESS than the
+    # current one, not necessarily current-1 (revisions can be
+    # skipped/pruned).
+    previous_candidates = [
+        (int(rs.metadata.annotations["deployment.kubernetes.io/revision"]), rs)
+        for rs in rs_list.items
+        if rs.metadata.annotations and "deployment.kubernetes.io/revision" in rs.metadata.annotations
+        and int(rs.metadata.annotations["deployment.kubernetes.io/revision"]) < current_revision
+    ]
+    if not previous_candidates:
+        return {
+            "action": "rollback_deployment", "target": name, "namespace": namespace,
+            "dry_run_ok": False, "applied": False,
+            "error": "no previous revision found to roll back to",
+        }
+    previous_candidates.sort(key=lambda pair: pair[0])
+    _, target_rs = previous_candidates[-1]
+
+    template_dict = client.ApiClient().sanitize_for_serialization(target_rs.spec.template)
+    body = {"spec": {"template": template_dict}}
+    result = _patch_deployment(name, namespace, body)
+    return {"action": "rollback_deployment", "target": name, "namespace": namespace, **result}
+
+
 def scale_deployment(name: str, replicas: int, namespace: str = DEFAULT_NAMESPACE) -> dict:
     """Low-level primitive: one scale call to a given replica count. NOT
     a disk-full fix by itself -- see restore_from_disk_full below, which
@@ -415,6 +501,8 @@ def restore_from_disk_full(name: str, namespace: str = DEFAULT_NAMESPACE, replic
 ALLOWED_ACTIONS = {
     "restart_deployment": restart_deployment,
     "patch_memory_limit": patch_memory_limit,
+    "patch_cpu_limit": patch_cpu_limit,
     "scale_deployment": scale_deployment,
+    "rollback_deployment": rollback_deployment,
     "restore_from_disk_full": restore_from_disk_full,
 }

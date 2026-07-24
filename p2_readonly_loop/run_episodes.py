@@ -35,7 +35,8 @@ def main():
         choices=[
             "crash-loop", "oom", "disk-full", "network-latency", "memory-leak",
             "connection-pool-exhaustion", "network-partition", "init-failure",
-            "session-cart-failure",
+            "session-cart-failure", "cpu-throttling", "under-provisioned-replicas",
+            "bad-rollout",
         ]
     )
     parser.add_argument("num_episodes", nargs="?", type=int, default=20)
