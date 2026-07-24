@@ -40,6 +40,17 @@ MEMORY_LEAK_THRESHOLD_MIB = 380
 # a real flood (140 injected + baseline).
 CONNECTION_POOL_THRESHOLD = 100
 
+# orders' combined (transmit+receive) network throughput, measured
+# directly (2026-07-24, not assumed): baseline ~1900-2400 bytes/s
+# combined under traffic_gen's normal load, dropping to ~0-100 bytes/s
+# combined during a real, verified partition (both directions drop
+# together -- confirmed via measure_network_partition_direction_check.py,
+# `direction: to` was assumed to only block egress but empirically
+# blocks both). 200 sits with a large (~10-20x) real margin below
+# baseline and well above the small residual noise observed during a
+# real fault.
+NETWORK_PARTITION_MAX_THROUGHPUT_BPS = 200
+
 app = FastAPI()
 
 
@@ -213,6 +224,126 @@ def query_prometheus(target: str, namespace: str) -> dict:
     else:
         p95_latency_ms = None
 
+    # network-partition: orders' own combined network throughput
+    # (cAdvisor's container_network_transmit/receive_bytes_total, BOTH
+    # directions -- confirmed empirically, 2026-07-24, that a
+    # `direction: to` partition drops both together, not just egress as
+    # first assumed; see measure_network_partition_direction_check.py's
+    # real result). Deliberately NOT k6_http_req_failed -- confirmed
+    # unusable for this class: front-end's own POST /orders call
+    # (api/orders/index.js, the `request` library) has no client-side
+    # timeout at all, so it hangs indefinitely rather than ever
+    # producing an observable k6 failure while the partition holds
+    # (checked against front-end's real upstream source, not assumed).
+    #
+    # FIRST attempt used a plain rate(...[1m]) -- WRONG, found via a
+    # real diagnosis miss (2026-07-24): by the time this endpoint gets
+    # called (injector-end + 35s settle), a 1m lookback window only
+    # overlaps the actual 60s fault for ~25s, averaged together with
+    # ~35s of already-recovered normal traffic -- diluting the reading
+    # well above the 200 bytes/s threshold and letting diagnosis fall
+    # through to the p95_latency_ms check below, which then FALSE-
+    # POSITIVED as network-latency (a request that hung during the
+    # partition and only completed once it cleared reports as one very
+    # slow request to k6 -- indistinguishable from real latency using
+    # that signal alone). Same root lesson as memory-leak's un-sticky
+    # signal (reverts almost immediately once the fault ends), but
+    # inverted: memory-leak needed max_over_time to catch a since-
+    # reverted SPIKE; this needs the MINIMUM over a window to catch a
+    # since-reverted DROP. Fixed with a PromQL subquery --
+    # min_over_time(rate(...)[30s])[2m:30s] samples 30s-windowed
+    # throughput every 30s across the last 2 minutes and takes the
+    # minimum, correctly catching the nearzero reading from DURING the
+    # fault even though live throughput has since recovered. 2m
+    # comfortably covers back past t0 given diagnosis happens ~95s
+    # after fault start (60s fault + 35s settle).
+    if target == "orders":
+        throughput_query = (
+            f'min_over_time((sum(rate(container_network_transmit_bytes_total{{namespace="{namespace}", '
+            f'pod=~"{target}-.*"}}[30s])))[2m:30s]) + '
+            f'min_over_time((sum(rate(container_network_receive_bytes_total{{namespace="{namespace}", '
+            f'pod=~"{target}-.*"}}[30s])))[2m:30s])'
+        )
+        throughput_resp = requests.get(
+            f"{PROMETHEUS_URL}/api/v1/query", params={"query": throughput_query}, timeout=10
+        )
+        throughput_resp.raise_for_status()
+        throughput_result = throughput_resp.json()["data"]["result"]
+        combined_throughput_bps = (
+            float(throughput_result[0]["value"][1]) if throughput_result else None
+        )
+    else:
+        combined_throughput_bps = None
+
+    # init-failure: payment's own kube_pod_status_ready -- confirmed
+    # empirically (2026-07-24, see injector.py's PAYMENT_READINESS_PATH_FAULT
+    # docstring) that a broken readinessProbe leaves the OLD, healthy
+    # pod serving traffic untouched (Ready=true, unaffected) while a
+    # NEW pod gets stuck permanently Ready=false -- so a query for ANY
+    # payment pod reporting Ready=false only ever matches the
+    # genuinely-stuck new pod, no restart-count gate needed (a pod
+    # stuck this way never restarts, so it can't collide with
+    # crash-loop's own restart-increase signal).
+    #
+    # FIRST attempt used a plain instant query -- WRONG, found via a
+    # real diagnosis miss (2026-07-24, same root mistake as
+    # network-partition's own first attempt, re-made despite having
+    # just learned it): by the time this endpoint gets called
+    # (injector-end + settle), the fault has ALREADY been reverted
+    # (injector.py's _restore_init_failure runs immediately after the
+    # hold, before the episode is even recorded) -- the broken pod is
+    # very likely already scaled back to 0 by diagnosis time, so an
+    # instant snapshot sees nothing. Fixed with max_over_time(...[2m]),
+    # matching memory-leak/connection-pool's own "catch a since-
+    # reverted state" pattern -- confirmed via a direct query that the
+    # broken pod's Ready=false DID register within the window, just not
+    # at the exact instant of a plain snapshot query.
+    if target == "payment":
+        ready_false_query = (
+            f'max_over_time(kube_pod_status_ready{{namespace="{namespace}", pod=~"{target}.*", '
+            f'condition="false"}}[2m]) == 1'
+        )
+        ready_false_resp = requests.get(
+            f"{PROMETHEUS_URL}/api/v1/query", params={"query": ready_false_query}, timeout=10
+        )
+        ready_false_resp.raise_for_status()
+        payment_stuck_not_ready = len(ready_false_resp.json()["data"]["result"]) > 0
+    else:
+        payment_stuck_not_ready = False
+
+    # session-cart-failure: session-db's own kube_deployment_status_replicas_available
+    # -- a genuinely new signal type, distinct from every other class's
+    # signature (target pod exists but is broken in some way): here the
+    # target has ZERO available replicas at all. Confirmed empirically
+    # (2026-07-24, see injector.py's _inject_and_verify_session_cart_failure
+    # docstring) that scaling to 0 -- not a process kill/restart -- is
+    # deliberate specifically to avoid producing the same restart-
+    # increase/CrashLoopBackOff signature crash-loop already owns; the
+    # generic oom_query/evicted_query/crash_query checks above correctly
+    # return empty here regardless (no pod exists to match at all), so
+    # this check never needs its own extra exclusion logic.
+    if target == "session-db":
+        # min_over_time, not an instant/max query -- the fault is a DROP
+        # to 0, and by diagnosis time (fault-end + settle) it's already
+        # been restored to 1, so we need to catch the since-reverted LOW
+        # point within the window (same "un-sticky signal" lesson as
+        # network-partition/init-failure, inverted for a drop rather
+        # than a spike).
+        min_replicas_query = (
+            f'min_over_time(kube_deployment_status_replicas_available'
+            f'{{namespace="{namespace}", deployment="{target}"}}[2m])'
+        )
+        min_replicas_resp = requests.get(
+            f"{PROMETHEUS_URL}/api/v1/query", params={"query": min_replicas_query}, timeout=10
+        )
+        min_replicas_resp.raise_for_status()
+        min_replicas_result = min_replicas_resp.json()["data"]["result"]
+        session_db_replicas_hit_zero = (
+            len(min_replicas_result) > 0 and float(min_replicas_result[0]["value"][1]) == 0
+        )
+    else:
+        session_db_replicas_hit_zero = False
+
     # memory-leak: cAdvisor's container_memory_working_set_bytes is a
     # real-time gauge, not a percentile estimator -- but that cuts the
     # other way from the latency metric's problem: it reflects TRUE
@@ -279,6 +410,9 @@ def query_prometheus(target: str, namespace: str) -> dict:
         "evicted_pods": evicted_pods,
         "crashlooping_pods": crashlooping_pods,
         "p95_latency_ms": p95_latency_ms,
+        "combined_throughput_bps": combined_throughput_bps,
+        "payment_stuck_not_ready": payment_stuck_not_ready,
+        "session_db_replicas_hit_zero": session_db_replicas_hit_zero,
         "peak_memory_mib": peak_memory_mib,
         "peak_threads_connected": peak_threads_connected,
     }
@@ -297,6 +431,9 @@ def stub_diagnose(tool_output: dict) -> dict:
     evicted_pods = tool_output["evicted_pods"]
     crashlooping_pods = tool_output["crashlooping_pods"]
     p95_latency_ms = tool_output["p95_latency_ms"]
+    combined_throughput_bps = tool_output["combined_throughput_bps"]
+    payment_stuck_not_ready = tool_output["payment_stuck_not_ready"]
+    session_db_replicas_hit_zero = tool_output["session_db_replicas_hit_zero"]
     peak_memory_mib = tool_output["peak_memory_mib"]
     peak_threads_connected = tool_output["peak_threads_connected"]
 
@@ -317,6 +454,34 @@ def stub_diagnose(tool_output: dict) -> dict:
             "diagnosis": "crash-loop",
             "confidence": 0.6,
             "reasoning": f"pods in CrashLoopBackOff: {crashlooping_pods} (stubbed rule, not LLM)",
+        }
+    if payment_stuck_not_ready:
+        return {
+            "diagnosis": "init-failure",
+            "confidence": 0.6,
+            "reasoning": "a payment pod is reporting Ready=false with no restart -- stuck, never "
+                         "becoming ready, not crash-looping (stubbed rule, not LLM)",
+        }
+    if session_db_replicas_hit_zero:
+        return {
+            "diagnosis": "session-cart-failure",
+            "confidence": 0.6,
+            "reasoning": "session-db had zero available replicas within the recent window -- "
+                         "the session/cart store itself is down, not a crash-loop or generic "
+                         "restart (stubbed rule, not LLM)",
+        }
+    # Checked BEFORE p95 latency, same "more specific evidence first"
+    # principle as OOM/Evicted before crash-loop above: a real partition
+    # likely leaves p95_latency_ms stale or unelevated anyway (k6's
+    # requests are hanging, not completing, during a genuine partition
+    # -- see combined_throughput_bps's own docstring), but checking
+    # throughput first removes any ambiguity rather than relying on that.
+    if combined_throughput_bps is not None and combined_throughput_bps < NETWORK_PARTITION_MAX_THROUGHPUT_BPS:
+        return {
+            "diagnosis": "network-partition",
+            "confidence": 0.6,
+            "reasoning": f"orders' combined network throughput {combined_throughput_bps:.1f} bytes/s "
+                         f"< {NETWORK_PARTITION_MAX_THROUGHPUT_BPS} bytes/s threshold (stubbed rule, not LLM)",
         }
     if p95_latency_ms is not None and p95_latency_ms >= HIGH_LATENCY_THRESHOLD_MS:
         return {

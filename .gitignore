@@ -22,6 +22,14 @@ p2_readonly_loop/output/
 traffic_gen/repro_session_race.py
 p3_trust_action/stitch_data_sample.py
 stitch_sample_output.txt
+p2_readonly_loop/measure_network_partition_options.py
+p2_readonly_loop/measure_network_partition_prom_signal.py
+p2_readonly_loop/measure_network_partition_cadvisor_signal.py
+p2_readonly_loop/measure_network_partition_direction_check.py
+p2_readonly_loop/cleanup_orphaned_partition_chains.sh
+p2_readonly_loop/phase1b_network_partition_degradation.py
+p2_readonly_loop/phase1b_init_failure_degradation.py
+p2_readonly_loop/phase1b_session_cart_failure_degradation.py
 
 # Live ServiceAccount credential -- never committed
 p3_trust_action/sa_token.txt

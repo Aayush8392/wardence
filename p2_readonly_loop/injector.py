@@ -123,6 +123,9 @@ Usage:
     python injector.py --class network-latency
     python injector.py --class memory-leak
     python injector.py --class connection-pool-exhaustion
+    python injector.py --class network-partition
+    python injector.py --class init-failure
+    python injector.py --class session-cart-failure
 """
 
 import argparse
@@ -180,6 +183,23 @@ FAULT_CONFIG = {
         "container": "catalogue-db",
         "duration_s": 60,
     },
+    "network-partition": {
+        "namespace": "sock-shop",
+        "target": "orders",
+        "duration_s": 60,
+        "chaos_name_prefix": "wardence-partition",
+    },
+    "init-failure": {
+        "namespace": "sock-shop",
+        "target": "payment",
+        "container": "payment",
+        "duration_s": 60,
+    },
+    "session-cart-failure": {
+        "namespace": "sock-shop",
+        "target": "session-db",
+        "duration_s": 60,
+    },
 }
 
 CRASH_LOOP_KILL_INTERVAL_S = 10  # matches the original chaos-mesh cron cadence
@@ -208,6 +228,70 @@ NETWORK_LATENCY_JITTER = "50ms"
 # while still requiring a real, unambiguous slowdown before ground
 # truth is recorded.
 NETWORK_LATENCY_MIN_INCREASE_MS = 200
+
+# network-partition: NetworkChaos `partition` (direction=to) against
+# orders. Empirically confirmed (2026-07-24, measurement scripts, not
+# assumed) via a real 60s test with real CR-status checks: `loss`
+# (100%) and `partition` are behaviorally identical -- both fully block
+# orders' egress for the ENTIRE declared duration, no leakage. An
+# earlier, shorter (20s) test looked "partial" (only ~1-2 of 5 probe
+# samples failing) purely from probe-pod scheduling overhead eating
+# into the fault window, not a real leaky block -- confirmed by
+# widening to 60s and checking mid-window CR status directly
+# (AllInjected=True held throughout). Verified via a direct probe (same
+# pattern as _probe_orders_latency_ms, one throwaway pod running all
+# samples in a loop -- NOT one pod per sample, for the same
+# window-budget reason), not k6/Prometheus: front-end's own POST
+# /orders call (api/orders/index.js, the `request` library) has NO
+# client-side timeout at all, so it hangs indefinitely rather than ever
+# producing a k6-observable failure while orders is unreachable --
+# confirmed via front-end's real upstream source, not assumed. This
+# rules out k6_http_req_failed as a usable signal for this class
+# entirely (same category of lesson network-latency already taught
+# once, for a different reason -- see NETWORK_LATENCY_MIN_INCREASE_MS's
+# history).
+NETWORK_PARTITION_PROBE_SAMPLES = 5
+NETWORK_PARTITION_PROBE_TIMEOUT_S = 30
+# Real measured behavior: a genuinely active partition produced 5/5
+# hard failures every time it was checked mid-window. Requiring 4/5
+# (not a strict 5/5) tolerates one stray sample landing right at CR
+# application/teardown boundaries without weakening the real signal --
+# mirrors NETWORK_LATENCY_MIN_INCREASE_MS's own "real margin, not exact
+# equality" reasoning.
+NETWORK_PARTITION_MIN_FAILURES = 4
+
+# init-failure: not Chaos Mesh at all -- a direct kubectl patch of
+# payment's readinessProbe.httpGet.path, leaving livenessProbe
+# untouched (confirmed via real config, 2026-07-24: payment has
+# separate readiness/liveness blocks, both pointed at the real
+# /health). Patching ONLY readiness makes kubelet mark the pod
+# permanently Ready=false without ever restarting it -- a genuine
+# "stuck but running, never ready" signature, distinct from
+# crash-loop's repeated-restart signature. Real numbers confirmed via
+# the deployment's own live config before picking this mechanism:
+# failureThreshold=3, periodSeconds=3, so the flip to Ready=false
+# should land within ~9-12s of the patch landing.
+SESSION_FAILURE_SCALE_TIMEOUT_S = 60  # matches disk-full's own hard-won lesson: 30s
+# (default terminationGracePeriodSeconds) is too tight a margin, needed 60s there too.
+
+PAYMENT_READINESS_PATH_BASELINE = "/health"
+PAYMENT_READINESS_PATH_FAULT = "/wardence-fault-nonexistent"
+# Real mechanism confirmed empirically (2026-07-24, not assumed): this
+# patch triggers a REAL RollingUpdate -- a new ReplicaSet's pod is
+# created, but since it can never pass the broken readiness probe, the
+# OLD pod's ReplicaSet never scales down. The OLD pod keeps serving
+# traffic the ENTIRE time (confirmed: same pod name/age, untouched) --
+# matches how a real bad-readiness-probe deploy behaves in production
+# (old healthy replicas keep serving, new broken ones never come
+# online, no full outage). Verification uses EFFECT_VERIFY_TIMEOUT_S/
+# EFFECT_VERIFY_POLL_S (the same kube-state-metrics-scrape-cycle-aware
+# constants every other class's Prometheus-based verification already
+# uses), not a separate constant -- an initial guess here (9-12s based
+# on the probe's failureThreshold/periodSeconds) was WRONG: that timing
+# only applies to an ALREADY-Ready pod transitioning to NotReady, not a
+# brand-new pod, which starts NotReady immediately by k8s's own default
+# (Ready is false until the first successful probe) -- caught before
+# writing dependent code, not after a failed run.
 
 # shipping's container memory LIMIT is 500Mi (its JAVA_OPTS -Xmx128m is
 # an internal JVM heap cap, irrelevant here -- StressChaos's stress-ng
@@ -392,6 +476,73 @@ spec:
   direction: to
   duration: "{cfg['duration_s']}s"
 """
+
+
+def build_network_partition_manifest(chaos_name: str, cfg: dict) -> str:
+    return f"""
+apiVersion: chaos-mesh.org/v1alpha1
+kind: NetworkChaos
+metadata:
+  name: {chaos_name}
+  namespace: chaos-mesh
+spec:
+  action: partition
+  mode: one
+  selector:
+    namespaces:
+      - {cfg['namespace']}
+    labelSelectors:
+      name: {cfg['target']}
+  direction: to
+  duration: "{cfg['duration_s']}s"
+"""
+
+
+def _probe_orders_reachable(namespace: str) -> int:
+    """Runs NETWORK_PARTITION_PROBE_SAMPLES direct GET /health requests
+    against orders' own Service, ALL from inside ONE throwaway pod via a
+    shell loop (same pattern as _probe_orders_latency_ms, and for the
+    same reason -- a fresh pod per sample burns real scheduling/
+    image-pull overhead that can spill a short probe sequence past a
+    short fault window, confirmed the hard way while measuring this
+    class's own real behavior, 2026-07-24).
+
+    Returns the number of samples that came back as a genuine failure
+    (curl timeout/connection error, --max-time 5s), out of
+    NETWORK_PARTITION_PROBE_SAMPLES attempted. Returns 0 if the probe
+    pod itself couldn't run at all (image pull failure, scheduling
+    issue) -- treated as "can't verify" by callers, matching
+    _probe_orders_latency_ms's own None-on-failure convention adapted
+    to a count."""
+    pod_name = f"wardence-partition-probe-{uuid.uuid4().hex[:8]}"
+    script = (
+        f"for i in $(seq 1 {NETWORK_PARTITION_PROBE_SAMPLES}); do "
+        f'curl -s -o /dev/null -w "HTTP_%{{http_code}}\\n" --max-time 5 '
+        f"http://orders.{namespace}.svc.cluster.local/health; done"
+    )
+    try:
+        result = subprocess.run(
+            [
+                "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
+                "-n", namespace, f"--image={LATENCY_PROBE_IMAGE}",
+                "--", "sh", "-c", script,
+            ],
+            capture_output=True, text=True, timeout=NETWORK_PARTITION_PROBE_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        result = None
+    finally:
+        subprocess.run(
+            ["kubectl", "delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"],
+            capture_output=True, text=True,
+        )
+
+    if result is None:
+        return 0
+    lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip().startswith("HTTP_")]
+    if not lines:
+        return 0
+    return sum(1 for ln in lines if ln != "HTTP_200")
 
 
 def _probe_orders_latency_ms(namespace: str) -> float | None:
@@ -822,6 +973,215 @@ def _ensure_oom_baseline(cfg: dict):
     )
 
 
+def _patch_payment_readiness_path(cfg: dict, path: str):
+    patch_body = (
+        '{"spec":{"template":{"spec":{"containers":[{"name":"' + cfg["container"] + '",'
+        '"readinessProbe":{"httpGet":{"path":"' + path + '"}}}]}}}}'
+    )
+    subprocess.run(
+        [
+            "kubectl", "patch", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "--type=strategic", "-p", patch_body,
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def _restore_init_failure(cfg: dict):
+    """Reverts payment's readinessProbe back to the real baseline path
+    and waits for `kubectl rollout status` to confirm real recovery --
+    never just assumes the patch API call succeeding means the fix
+    landed (same 'verify real completion, not just API acceptance'
+    discipline as restore_from_disk_full). Confirmed empirically this
+    DOES succeed quickly on revert (unlike the fault-injecting patch,
+    which structurally can never succeed) -- the reverted template
+    matches the still-present, still-healthy OLD ReplicaSet exactly, so
+    Kubernetes just scales the broken one back to 0 rather than
+    creating a new pod. The broken ReplicaSet itself is left scaled to
+    0 afterward -- normal Kubernetes revision history, auto-pruned at
+    revisionHistoryLimit (default 10), confirmed NOT to accumulate the
+    same way the NetworkChaos iptables chains did -- no active purge
+    needed, checked per the fault-injection cleanup discipline rather
+    than assumed clean."""
+    _patch_payment_readiness_path(cfg, PAYMENT_READINESS_PATH_BASELINE)
+    result = subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=90s",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"  WARNING: rollout status did not confirm recovery cleanly: {result.stderr.strip()[:300]}")
+
+
+def _ensure_init_failure_baseline(cfg: dict):
+    """Resets payment's readinessProbe path back to baseline before
+    injecting, if it's currently anything else -- mirrors
+    _ensure_oom_baseline's pattern, guards against a prior failed/
+    interrupted run leaving it patched."""
+    result = subprocess.run(
+        [
+            "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "-o", "jsonpath={.spec.template.spec.containers[0].readinessProbe.httpGet.path}",
+        ],
+        capture_output=True, text=True,
+    )
+    current_path = result.stdout.strip()
+    if current_path == PAYMENT_READINESS_PATH_BASELINE:
+        return
+    print(f"  {cfg['target']}'s readinessProbe path is '{current_path or '(unknown)'}', not the "
+          f"baseline '{PAYMENT_READINESS_PATH_BASELINE}' -- resetting before injecting "
+          f"(a prior run likely left it patched)...")
+    _restore_init_failure(cfg)
+
+
+def _payment_stuck_not_ready(namespace: str) -> bool:
+    """True if any payment-labeled pod currently reports Ready=false --
+    confirmed empirically (2026-07-24) that this only ever matches the
+    genuinely-stuck NEW pod, never the OLD healthy one (which stays
+    Ready=true and untouched the entire time, see
+    PAYMENT_READINESS_PATH_FAULT's docstring). No separate restart-
+    count gate needed: a pod in this state never restarts (it's stuck
+    pending, not crash-looping), so a plain Ready=false check doesn't
+    risk colliding with crash-loop's own signal."""
+    query = (
+        f'kube_pod_status_ready{{namespace="{namespace}", pod=~"payment.*", '
+        f'condition="false"}} == 1'
+    )
+    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+    resp.raise_for_status()
+    return len(resp.json()["data"]["result"]) > 0
+
+
+def _verify_init_failure_effect(namespace: str) -> bool:
+    elapsed = 0
+    while elapsed <= EFFECT_VERIFY_TIMEOUT_S:
+        if _payment_stuck_not_ready(namespace):
+            return True
+        time.sleep(EFFECT_VERIFY_POLL_S)
+        elapsed += EFFECT_VERIFY_POLL_S
+    return False
+
+
+def _inject_and_verify_init_failure(cfg: dict) -> bool:
+    """Patches payment's readinessProbe.httpGet.path to a nonexistent
+    endpoint via a strategic-merge kubectl patch, leaving livenessProbe
+    untouched. NOT Chaos Mesh -- a direct Deployment patch, same
+    mechanism class as oom's patch_memory_limit (both are pod-template
+    changes that trigger a real RollingUpdate)."""
+    _ensure_init_failure_baseline(cfg)
+    namespace = cfg["namespace"]
+
+    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
+        window_start = time.time()
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: patching readinessProbe to a broken path...")
+        _patch_payment_readiness_path(cfg, PAYMENT_READINESS_PATH_FAULT)
+        verified = _verify_init_failure_effect(namespace)
+        if verified:
+            remaining = cfg["duration_s"] - (time.time() - window_start)
+            if remaining > 0:
+                time.sleep(remaining)
+            _restore_init_failure(cfg)
+            return True
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: readiness never flipped to false{suffix}")
+        _restore_init_failure(cfg)
+    return False
+
+
+def _scale_deployment(cfg: dict, replicas: int):
+    subprocess.run(
+        ["kubectl", "scale", "deployment", cfg["target"], "-n", cfg["namespace"], f"--replicas={replicas}"],
+        capture_output=True, text=True,
+    )
+
+
+def _replicas_available(namespace: str, deployment: str) -> int | None:
+    """kube_deployment_status_replicas_available -- confirmed to exist
+    on this cluster before writing this function, not assumed (real
+    query, 2026-07-24, baseline value 1). Returns None if no data point
+    exists yet, matching every other verify helper's convention."""
+    query = f'kube_deployment_status_replicas_available{{namespace="{namespace}", deployment="{deployment}"}}'
+    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+    resp.raise_for_status()
+    result = resp.json()["data"]["result"]
+    if not result:
+        return None
+    return int(float(result[0]["value"][1]))
+
+
+def _wait_for_replicas_available(namespace: str, deployment: str, target: int, timeout_s: int) -> bool:
+    """Polls until replicas_available genuinely reaches the target
+    count -- never just trusts that `kubectl scale` being accepted
+    means the real state changed (the same 'verify real completion,
+    not just API acceptance' lesson restore_from_disk_full's saga
+    already taught the hard way)."""
+    elapsed = 0
+    while elapsed <= timeout_s:
+        current = _replicas_available(namespace, deployment)
+        if current == target:
+            return True
+        time.sleep(EFFECT_VERIFY_POLL_S)
+        elapsed += EFFECT_VERIFY_POLL_S
+    return False
+
+
+def _ensure_session_failure_baseline(cfg: dict):
+    """Resets session-db back to 1 replica before injecting, if it's
+    currently anything else -- mirrors _ensure_oom_baseline/
+    _ensure_init_failure_baseline's pattern, guards against a prior
+    failed/interrupted run leaving it scaled down."""
+    current = _replicas_available(cfg["namespace"], cfg["target"])
+    if current == 1:
+        return
+    print(f"  {cfg['target']}'s available replicas is {current}, not the baseline of 1 -- "
+          f"resetting before injecting (a prior run likely left it scaled down)...")
+    _scale_deployment(cfg, 1)
+    _wait_for_replicas_available(cfg["namespace"], cfg["target"], 1, SESSION_FAILURE_SCALE_TIMEOUT_S)
+
+
+def _inject_and_verify_session_cart_failure(cfg: dict) -> bool:
+    """Scales session-db to 0 for the fault window, then back to 1 --
+    NOT a process kill/restart (which would produce the exact same
+    restart-increase/CrashLoopBackOff signature crash-loop already
+    owns, defeating this class's whole point). Scaling to 0 terminates
+    the pod gracefully rather than restarting it, so it never touches
+    the restart-count signal at all -- a genuinely new signal type
+    (target has ZERO available replicas) distinct from every other
+    class's signature (target pod exists but is broken in some way).
+    While at 0, the Service has no endpoints, so any real login/cart/
+    checkout call genuinely fails (connection refused, not a hang) --
+    matches this class's real "login/cart failure" story, grounded in
+    the actual session-db RDB-persistence bug already found+fixed
+    2026-07-21."""
+    _ensure_session_failure_baseline(cfg)
+    namespace = cfg["namespace"]
+    target = cfg["target"]
+
+    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
+        window_start = time.time()
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: scaling {target} to 0...")
+        _scale_deployment(cfg, 0)
+        verified = _wait_for_replicas_available(namespace, target, 0, SESSION_FAILURE_SCALE_TIMEOUT_S)
+        if verified:
+            remaining = cfg["duration_s"] - (time.time() - window_start)
+            if remaining > 0:
+                time.sleep(remaining)
+            print(f"  restoring {target} to 1 replica, waiting for real recovery...")
+            _scale_deployment(cfg, 1)
+            recovered = _wait_for_replicas_available(namespace, target, 1, SESSION_FAILURE_SCALE_TIMEOUT_S)
+            if not recovered:
+                print(f"  WARNING: {target} did not confirm recovery to 1 replica within "
+                      f"{SESSION_FAILURE_SCALE_TIMEOUT_S}s -- may need a manual check.")
+            return True
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: replicas never reached 0{suffix}")
+        _scale_deployment(cfg, 1)
+        _wait_for_replicas_available(namespace, target, 1, SESSION_FAILURE_SCALE_TIMEOUT_S)
+    return False
+
+
 def record_episode(
     conn: sqlite3.Connection, episode_id: str, fault_class: str, cfg: dict, chaos_name: str, t0: str
 ):
@@ -933,6 +1293,62 @@ def _inject_and_verify_network_latency(cfg: dict) -> str | None:
             return chaos_name
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
         print(f"  attempt {attempt}: no latency increase observed (baseline={baseline_ms}ms){suffix}")
+    return None
+
+
+def _inject_and_verify_network_partition(cfg: dict) -> str | None:
+    """Verified via _probe_orders_reachable (direct probe, NOT k6/
+    Prometheus -- see NETWORK_PARTITION_PROBE_SAMPLES's docstring for
+    why k6_http_req_failed is unusable here: front-end's own call to
+    orders has no timeout and hangs indefinitely rather than ever
+    failing observably while the partition holds).
+
+    Probes once early (after a short propagation wait) to confirm the
+    block landed for real, then holds the fault for its FULL
+    duration_s -- same "don't end early" discipline as network-latency,
+    disk-full, memory-leak, and connection-pool-exhaustion all
+    independently learned the hard way: ending a fault the instant our
+    own probe is satisfied starves any other real observer (traffic_gen,
+    a future real diagnosis query) of a fair chance to see it too.
+    Deliberately does NOT probe again near the end of the window --
+    confirmed during measurement (2026-07-24) that a probe landing right
+    at the CR's natural expiry boundary can show a false partial
+    recovery purely from probe-pod scheduling overhead, not a real
+    leaky block."""
+    chaos_kind = "networkchaos"
+    namespace = cfg["namespace"]
+
+    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
+        chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
+        manifest = build_network_partition_manifest(chaos_name, cfg)
+        apply_manifest(manifest)
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: applied, waiting 5s for propagation "
+              f"before probing...")
+
+        verified = False
+        window_start = time.time()
+        try:
+            time.sleep(5)
+            failures = _probe_orders_reachable(namespace)
+            verified = failures >= NETWORK_PARTITION_MIN_FAILURES
+            print(f"  early probe: {failures}/{NETWORK_PARTITION_PROBE_SAMPLES} samples failed "
+                  f"(need >= {NETWORK_PARTITION_MIN_FAILURES})")
+
+            # Sleep out whatever's genuinely left of duration_s, based on
+            # REAL elapsed wall-clock time (the 5s wait + the probe's own
+            # real scheduling/curl overhead), not an assumed constant --
+            # the exact lesson this class's own measurement scripts
+            # taught about probe overhead eating into fault windows.
+            remaining = cfg["duration_s"] - (time.time() - window_start)
+            if remaining > 0:
+                time.sleep(remaining)
+        finally:
+            delete_chaos_resource(chaos_kind, chaos_name)
+
+        if verified:
+            return chaos_name
+        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+        print(f"  attempt {attempt}: partition did not verify{suffix}")
     return None
 
 
@@ -1150,6 +1566,14 @@ def main():
         chaos_name = _inject_and_verify_memory_leak(cfg)
     elif fault_class == "connection-pool-exhaustion":
         chaos_name = _inject_and_verify_connection_pool_exhaustion(cfg)
+    elif fault_class == "network-partition":
+        chaos_name = _inject_and_verify_network_partition(cfg)
+    elif fault_class == "init-failure":
+        verified = _inject_and_verify_init_failure(cfg)
+        chaos_name = "manual-patch" if verified else None
+    elif fault_class == "session-cart-failure":
+        verified = _inject_and_verify_session_cart_failure(cfg)
+        chaos_name = "manual-scale" if verified else None
     elif fault_class == "oom":
         _ensure_oom_baseline(cfg)
         chaos_name = _inject_and_verify_chaos_mesh(fault_class, cfg, build_oom_manifest)

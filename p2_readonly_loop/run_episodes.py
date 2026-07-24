@@ -32,7 +32,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--class", dest="fault_class", required=True,
-        choices=["crash-loop", "oom", "disk-full", "network-latency", "memory-leak", "connection-pool-exhaustion"]
+        choices=[
+            "crash-loop", "oom", "disk-full", "network-latency", "memory-leak",
+            "connection-pool-exhaustion", "network-partition", "init-failure",
+            "session-cart-failure",
+        ]
     )
     parser.add_argument("num_episodes", nargs="?", type=int, default=20)
     args = parser.parse_args()
