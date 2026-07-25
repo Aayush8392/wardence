@@ -183,7 +183,16 @@ def get_episode_by_id(conn: sqlite3.Connection, episode_id: str):
 
 
 def diagnosis_matches(predicted: str, actual: str) -> bool:
-    return predicted.strip().lower() == actual.strip().lower()
+    # "none" control episodes never went through p3_scorer.py before Phase
+    # D (only p2_readonly_loop/scorer.py's systematic validation used
+    # them) -- this special case already exists there and is mirrored here
+    # for the same reason: the agent reports "no anomaly detected", never
+    # the literal string "none".
+    actual = actual.strip().lower()
+    predicted = predicted.strip().lower()
+    if actual == "none":
+        return predicted == "no anomaly detected"
+    return predicted == actual
 
 
 def main():

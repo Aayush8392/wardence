@@ -51,6 +51,11 @@ p3_trust_action/test_force_demotion_bad_rollout.py
 p3_trust_action/test_force_demotion_cpu_throttling.py
 p3_trust_action/test_force_demotion_under_provisioned.py
 
+# Phase D run output -- regenerated per run, not source
+p2_readonly_loop/phase_d_batch1.json
+p2_readonly_loop/phase_d_batch2.json
+p2_readonly_loop/phase_d_results.jsonl
+
 # Live ServiceAccount credential -- never committed
 p3_trust_action/sa_token.txt
 
