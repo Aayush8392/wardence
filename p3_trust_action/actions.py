@@ -259,9 +259,78 @@ def patch_memory_limit(
 def patch_cpu_limit(
     name: str, container: str, limit: str, namespace: str = DEFAULT_NAMESPACE
 ) -> dict:
-    """Fix for cpu-throttling: raise a container's CPU limit. Direct
-    sibling of patch_memory_limit -- same shape, same RBAC coverage
-    (patch on deployments), just the cpu field instead of memory."""
+    """Fix for cpu-throttling: raise a container's CPU limit.
+
+    Reworked 2026-07-28 to resize the LIVE pod in place via the
+    pods/resize subresource (KEP-1287) instead of patching the
+    Deployment template -- a Deployment-template patch forces a full
+    pod replace-and-wait every time, real cost confirmed via this
+    project's own timing data (~280s of a single cpu-throttling
+    episode's ~380s total was this rollout wait alone). Manually
+    verified first (not assumed) that this cluster (k3s v1.36) actually
+    supports in-place resize without a restart: cpu limit changed on a
+    live pod, restart count stayed at 0 throughout. Requires the
+    complete current resources block in the patch, not just the
+    changed field -- the resize API rejects a partial patch as "removing"
+    whatever fields it omits, confirmed via a real 422 on the first
+    attempt.
+
+    Needs a real RBAC cage expansion to work: `patch` on the `pods/resize`
+    subresource specifically (added to manifests/rbac.yaml 2026-07-28) --
+    deliberately scoped to resize only, NOT a general pods-patch grant,
+    consistent with the cage's existing minimal-privilege principle.
+
+    Falls back to the original Deployment-patch-and-wait path (still
+    correct, just slower) if the live pod can't be found or the resize
+    attempt fails for any reason -- this fix must never silently do
+    nothing."""
+    api = _core_v1()
+    pods = api.list_namespaced_pod(namespace, label_selector=f"name={name}")
+    running = [p for p in pods.items if p.status.phase == "Running"]
+
+    if running:
+        pod = running[0]
+        pod_name = pod.metadata.name
+        try:
+            current_container = next(
+                c for c in pod.spec.containers if c.name == container
+            )
+            resources = current_container.to_dict().get("resources") or {}
+            resources.setdefault("limits", {})["cpu"] = limit
+            resize_body = {
+                "spec": {"containers": [{"name": container, "resources": resources}]}
+            }
+            try:
+                api.patch_namespaced_pod_resize(
+                    name=pod_name, namespace=namespace, body=resize_body, dry_run="All"
+                )
+                api.patch_namespaced_pod_resize(
+                    name=pod_name, namespace=namespace, body=resize_body
+                )
+                return {
+                    "action": "patch_cpu_limit",
+                    "target": name,
+                    "container": container,
+                    "limit": limit,
+                    "namespace": namespace,
+                    "dry_run_ok": True,
+                    "applied": True,
+                    "error": None,
+                    "method": "in_place_resize",
+                    "pod": pod_name,
+                }
+            except client.ApiException as e:
+                # Real resize attempt failed -- fall through to the
+                # Deployment-patch path below rather than reporting
+                # applied=False (this fix must still be attempted, just
+                # via the slower mechanism), but keep the real error
+                # visible for whoever's reading logs.
+                print(f"  in-place resize failed for {pod_name} ({e.status}: {e.reason}), "
+                      f"falling back to a Deployment patch...")
+        except StopIteration:
+            print(f"  container {container} not found on {pod_name}, "
+                  f"falling back to a Deployment patch...")
+
     body = {
         "spec": {
             "template": {
@@ -280,6 +349,7 @@ def patch_cpu_limit(
         "container": container,
         "limit": limit,
         "namespace": namespace,
+        "method": "deployment_patch_fallback",
         **result,
     }
 

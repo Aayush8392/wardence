@@ -66,6 +66,10 @@ p2_readonly_loop/phase_d_round2.json
 p2_readonly_loop/phase_d_round3.json
 p2_readonly_loop/phase_d_round4.json
 p2_readonly_loop/phase_d_rounds_manifest.json
+p2_readonly_loop/phase_d_run_summary.json
+
+# Phase E run output -- regenerated per run, not source
+p2_readonly_loop/phase_e_sanity_check.json
 
 # Live ServiceAccount credential -- never committed
 p3_trust_action/sa_token.txt

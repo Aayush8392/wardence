@@ -25,6 +25,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  # Scoped narrowly to the resize subresource only (2026-07-28, for
+  # patch_cpu_limit's in-place resize) -- deliberately NOT a general
+  # "pods" patch grant, which would let the agent patch arbitrary pod
+  # fields far beyond resource limits. Consistent with the cage's
+  # existing minimal-privilege principle: every verb here maps to
+  # exactly one real fix action, nothing broader.
+  - apiGroups: [""]
+    resources: ["pods/resize"]
+    verbs: ["patch"]
   - apiGroups: [""]
     resources: ["configmaps", "services"]
     verbs: ["get", "list", "patch"]

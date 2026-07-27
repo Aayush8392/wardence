@@ -148,6 +148,7 @@ Usage:
 """
 
 import argparse
+import json
 import re
 import sqlite3
 import subprocess
@@ -422,7 +423,7 @@ export default function () {{
         result = subprocess.run(
             [
                 "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
-                "-n", namespace, f"--image={K6_IMAGE}",
+                "-n", namespace, f"--image={K6_IMAGE}", "--image-pull-policy=IfNotPresent",
                 "--", "run", "--quiet", "-",
             ],
             input=script, capture_output=True, text=True, timeout=duration_s + 60,
@@ -551,7 +552,29 @@ CONNECTION_POOL_TEST_PASSWORD = "default_password"
 # dashboard (P4) -- just not trusted for THIS ground-truth decision.
 LATENCY_PROBE_SAMPLES = 5
 LATENCY_PROBE_IMAGE = "curlimages/curl"
-LATENCY_PROBE_TIMEOUT_S = 30
+# Found the hard way (2026-07-27, while debugging network-partition):
+# every kubectl-run call using this image (here and K6_IMAGE below) was
+# missing an explicit --image-pull-policy, so Kubernetes' own default
+# rule for an untagged/":latest" image (imagePullPolicy: Always) forced
+# a real Docker Hub registry round-trip on EVERY single probe
+# invocation, even though the image was already cached locally --
+# violating this project's own self-containment principle (the only
+# real external dependency should ever be the LLM call) and adding
+# real, unpredictable latency to every probe. Confirmed as a real,
+# separate failure mode, not just theoretical: a probe pod outright
+# failed with ErrImagePull ("TLS handshake timeout" reaching
+# auth.docker.io) mid-investigation, even though `crictl images`
+# already showed curlimages/curl cached. Fixed by adding
+# --image-pull-policy=IfNotPresent to every kubectl-run call using
+# these images, forcing local-cache reuse and removing the live
+# registry dependency entirely.
+# Bumped from 30 (2026-07-27): a clean, idle `kubectl run --rm` round trip
+# measured 28.03s real -- almost entirely pod scheduling/API overhead, not
+# the curl requests. Left only ~2s of headroom even when nothing else was
+# happening; a cluster under real load (a long batch of back-to-back
+# episodes) reliably tipped this over into an uncaught timeout crash. See
+# _probe_orders_latency_ms's except clause for the other half of this fix.
+LATENCY_PROBE_TIMEOUT_S = 50
 
 # DB lives on WSL2's native filesystem, not the Windows-mounted C:/ path --
 # DrvFs (WSL2's NTFS translation layer) has known SQLite file-locking bugs
@@ -727,7 +750,7 @@ def _probe_orders_reachable(namespace: str) -> int:
         result = subprocess.run(
             [
                 "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
-                "-n", namespace, f"--image={LATENCY_PROBE_IMAGE}",
+                "-n", namespace, f"--image={LATENCY_PROBE_IMAGE}", "--image-pull-policy=IfNotPresent",
                 "--", "sh", "-c", script,
             ],
             capture_output=True, text=True, timeout=NETWORK_PARTITION_PROBE_TIMEOUT_S,
@@ -782,11 +805,26 @@ def _probe_orders_latency_ms(namespace: str) -> float | None:
         result = subprocess.run(
             [
                 "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
-                "-n", namespace, f"--image={LATENCY_PROBE_IMAGE}",
+                "-n", namespace, f"--image={LATENCY_PROBE_IMAGE}", "--image-pull-policy=IfNotPresent",
                 "--", "sh", "-c", script,
             ],
             capture_output=True, text=True, timeout=LATENCY_PROBE_TIMEOUT_S,
         )
+    except subprocess.TimeoutExpired:
+        # Found the hard way (2026-07-27): a clean, idle `kubectl run --rm`
+        # round trip already measured 28.03s -- almost entirely pod
+        # scheduling/API overhead, not the curl requests themselves (those
+        # took ~1.5s combined). Only ~2s of headroom under
+        # LATENCY_PROBE_TIMEOUT_S even when nothing else is going on, so a
+        # cluster under real load (e.g. mid-way through a long batch of
+        # back-to-back episodes) tips over it reliably. This used to crash
+        # the whole injector with an uncaught traceback -- both callers of
+        # this function already correctly treat a None return as "can't
+        # verify" (never as "zero latency"), exactly matching this
+        # function's own docstring, which promised this behavior without
+        # actually catching the timeout that triggers it. Return None here
+        # so a slow-but-not-broken cluster degrades into a retry, not a crash.
+        return None
     finally:
         # --rm should already have deleted it, but a subprocess timeout
         # kills our end of the connection, not necessarily the pod --
@@ -1197,7 +1235,26 @@ def _ensure_cpu_throttle_baseline(cfg: dict):
     before injecting, if it's currently anything else -- mirrors
     _ensure_oom_baseline's pattern exactly, same reason: a real
     successful patch_cpu_limit fix permanently raises the limit and
-    nothing else reverts it."""
+    nothing else reverts it.
+
+    Reworked 2026-07-28 to use the pods/resize subresource (KEP-1287,
+    in-place pod vertical scaling) instead of patching the Deployment
+    template -- confirmed manually first (not assumed): this cluster is
+    k3s v1.36 and genuinely supports it (verified via a real test on the
+    live `user` pod -- cpu limit changed 300m->400m->300m with restart
+    count staying at 0 throughout, no rollout at all). A Deployment
+    patch forces a full pod replace-and-wait every single time this
+    class has actually earned trust and been fixed for real, which was
+    the single biggest cost in a full-class timing batch (~280s of
+    cpu-throttling's ~380s total). The resize API requires the COMPLETE
+    current resources block in the merge patch (confirmed the hard way:
+    a partial patch specifying only the changed field gets rejected --
+    "resource limits/requests cannot be removed" -- resize treats an
+    omitted field as a removal, not a no-op), so this reads the pod's
+    real current resources first rather than hardcoding them. Falls
+    back to the original Deployment-patch-and-wait path if the resize
+    attempt fails for any reason -- never silently leaves the baseline
+    unreset."""
     result = subprocess.run(
         [
             "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
@@ -1212,6 +1269,38 @@ def _ensure_cpu_throttle_baseline(cfg: dict):
     print(f"  {cfg['target']}'s CPU limit is {current_limit or '(unknown)'}, not the "
           f"{CPU_THROTTLE_BASELINE_CPU_LIMIT} baseline -- resetting before injecting "
           f"(a prior real fix likely raised it)...")
+
+    pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
+    if pod_name is not None:
+        resources_result = subprocess.run(
+            [
+                "kubectl", "get", "pod", pod_name, "-n", cfg["namespace"],
+                "-o", f'jsonpath={{.spec.containers[?(@.name=="{cfg["container"]}")].resources}}',
+            ],
+            capture_output=True, text=True,
+        )
+        try:
+            resources = json.loads(resources_result.stdout.strip())
+            resources.setdefault("limits", {})["cpu"] = CPU_THROTTLE_BASELINE_CPU_LIMIT
+            resize_body = json.dumps({
+                "spec": {"containers": [{"name": cfg["container"], "resources": resources}]}
+            })
+            resize_result = subprocess.run(
+                [
+                    "kubectl", "patch", "pod", pod_name, "-n", cfg["namespace"],
+                    "--subresource", "resize", "--type=merge", "-p", resize_body,
+                ],
+                capture_output=True, text=True,
+            )
+            if resize_result.returncode == 0:
+                print(f"  reset via in-place resize (no restart needed), pod={pod_name}")
+                return
+            print(f"  in-place resize failed ({resize_result.stderr.strip()}), "
+                  f"falling back to a full Deployment patch + rollout wait...")
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  couldn't parse pod resources for in-place resize ({e}), "
+                  f"falling back to a full Deployment patch + rollout wait...")
+
     patch_body = (
         '{"spec":{"template":{"spec":{"containers":[{"name":"' + cfg["container"] + '",'
         '"resources":{"limits":{"cpu":"' + CPU_THROTTLE_BASELINE_CPU_LIMIT + '"}}}]}}}}'
@@ -1720,18 +1809,35 @@ def _inject_and_verify_network_partition(cfg: dict) -> str | None:
     orders has no timeout and hangs indefinitely rather than ever
     failing observably while the partition holds).
 
-    Probes once early (after a short propagation wait) to confirm the
-    block landed for real, then holds the fault for its FULL
-    duration_s -- same "don't end early" discipline as network-latency,
-    disk-full, memory-leak, and connection-pool-exhaustion all
-    independently learned the hard way: ending a fault the instant our
-    own probe is satisfied starves any other real observer (traffic_gen,
-    a future real diagnosis query) of a fair chance to see it too.
+    Probes once early (after a propagation wait) to confirm the block
+    landed for real, then holds the fault for its FULL duration_s --
+    same "don't end early" discipline as network-latency, disk-full,
+    memory-leak, and connection-pool-exhaustion all independently
+    learned the hard way: ending a fault the instant our own probe is
+    satisfied starves any other real observer (traffic_gen, a future
+    real diagnosis query) of a fair chance to see it too.
     Deliberately does NOT probe again near the end of the window --
     confirmed during measurement (2026-07-24) that a probe landing right
     at the CR's natural expiry boundary can show a false partial
     recovery purely from probe-pod scheduling overhead, not a real
-    leaky block."""
+    leaky block.
+
+    Propagation wait bumped 5s -> 25s (2026-07-28): the class started
+    failing verification 3/3 attempts despite the block mechanism itself
+    being genuinely healthy (confirmed via direct manual repro -- a real
+    egress connection to an external IP timed out during an active
+    partition, and chaos-daemon's logs showed the iptables rule applying
+    cleanly). Re-running measure_network_partition_direction_check.py
+    (the original 2026-07-24 measurement script) showed the real
+    timeline: baseline ~2100-2600 bytes/s tx/rx, still a leaky
+    30-1250 bytes/s at t+10s/t+20s (NOT a clean block yet), only
+    reliably near-zero from t+30-40s onward. A 5s wait landed the probe
+    squarely in that leaky transitional window, not because the class'
+    real signal is unreliable -- agent.py's own diagnosis-side
+    min_over_time(...[2m]) window comfortably outlasts this settle time
+    regardless, which is why a real episode's diagnosis was never
+    actually broken by this, only the injector's own tighter,
+    single-early-probe self-verification was."""
     chaos_kind = "networkchaos"
     namespace = cfg["namespace"]
 
@@ -1739,13 +1845,13 @@ def _inject_and_verify_network_partition(cfg: dict) -> str | None:
         chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
         manifest = build_network_partition_manifest(chaos_name, cfg)
         apply_manifest(manifest)
-        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: applied, waiting 5s for propagation "
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: applied, waiting 25s for propagation "
               f"before probing...")
 
         verified = False
         window_start = time.time()
         try:
-            time.sleep(5)
+            time.sleep(25)
             failures = _probe_orders_reachable(namespace)
             verified = failures >= NETWORK_PARTITION_MIN_FAILURES
             print(f"  early probe: {failures}/{NETWORK_PARTITION_PROBE_SAMPLES} samples failed "
@@ -1828,6 +1934,39 @@ def _inject_and_verify_memory_leak(cfg: dict) -> str | None:
     return None
 
 
+def _ensure_flood_user(cfg: dict) -> None:
+    """Re-creates the floodtest MySQL user idempotently before every
+    flood attempt. Found the hard way (2026-07-27): catalogue-db has no
+    persistent volume, so any container restart (which happens routinely
+    -- e.g. a cluster-wide WSL2/k3s restart) silently wipes MySQL back to
+    a fresh state, deleting this manually-created user along with it.
+    create_connection_pool_flood_user.sh was originally treated as a
+    one-time setup step, which is wrong given that restart behavior --
+    every future flood attempt would otherwise fail silently (the
+    backgrounded mysql client processes just error out with auth
+    failures, stderr redirected to /dev/null) with no real connections
+    ever established. CREATE USER IF NOT EXISTS makes this safe to call
+    unconditionally on every attempt, same self-healing pattern already
+    used elsewhere in this file (_ensure_cpu_throttle_baseline,
+    _ensure_front_end_image_baseline)."""
+    namespace = cfg["namespace"]
+    container = cfg["container"]
+    pod_name = _current_pod_name(cfg["target"], namespace)
+    if pod_name is None:
+        return
+    subprocess.run(
+        [
+            "kubectl", "exec", "-n", namespace, pod_name, "-c", container,
+            "--", "mysql", "-uroot", "-pfake_password", "-e",
+            f"CREATE USER IF NOT EXISTS '{CONNECTION_POOL_FLOOD_USER}'@'%' "
+            f"IDENTIFIED BY '{CONNECTION_POOL_FLOOD_PASSWORD}'; "
+            f"GRANT USAGE ON *.* TO '{CONNECTION_POOL_FLOOD_USER}'@'%'; "
+            f"FLUSH PRIVILEGES;",
+        ],
+        capture_output=True, text=True, timeout=15,
+    )
+
+
 def _flood_connections(cfg: dict) -> bool:
     """Single kubectl exec into catalogue-db backgrounds
     CONNECTION_POOL_FLOOD_CONNECTIONS real mysql client processes (each
@@ -1844,6 +1983,7 @@ def _flood_connections(cfg: dict) -> bool:
     pod_name = _current_pod_name(target, namespace)
     if pod_name is None:
         return False
+    _ensure_flood_user(cfg)
     sleep_s = cfg["duration_s"] + 15  # outlives our own polling window with margin
     script = (
         f"for i in $(seq 1 {CONNECTION_POOL_FLOOD_CONNECTIONS}); do "

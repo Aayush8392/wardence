@@ -1,0 +1,17 @@
+# Promtail -- the log-shipping DaemonSet that actually collects container logs
+# and pushes them to Loki. Loki has nowhere to get log lines from without this.
+# Using the chart's own default scrape config (all pods, cluster-wide) rather than a
+# custom override -- at this cluster's small pod count (~20 pods) the default cost is
+# negligible, and a hand-written scrape config risks silently breaking ingestion if it
+# doesn't match this chart version's exact template structure. Narrow later if needed.
+config:
+  clients:
+    - url: http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 64Mi
+  limits:
+    cpu: 100m
+    memory: 150Mi

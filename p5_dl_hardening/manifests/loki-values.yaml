@@ -1,0 +1,56 @@
+# Loki, single-binary mode, filesystem storage — sized for this project's disposable local lab.
+# Deployed via the official grafana/loki Helm chart, same pattern as kube-prometheus-stack.
+deploymentMode: SingleBinary
+
+loki:
+  auth_enabled: false
+  commonConfig:
+    replication_factor: 1
+  storage:
+    type: filesystem
+  schemaConfig:
+    configs:
+      - from: "2026-01-01"
+        store: tsdb
+        object_store: filesystem
+        schema: v13
+        index:
+          prefix: loki_index_
+          period: 24h
+  limits_config:
+    retention_period: 48h
+    reject_old_samples: true
+    reject_old_samples_max_age: 168h
+
+singleBinary:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 200Mi
+    limits:
+      cpu: 300m
+      memory: 400Mi
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: local-path
+
+# Disable the extra components the chart enables by default that this lab doesn't need.
+gateway:
+  enabled: false
+chunksCache:
+  enabled: false
+resultsCache:
+  enabled: false
+backend:
+  replicas: 0
+read:
+  replicas: 0
+write:
+  replicas: 0
+
+test:
+  enabled: false
+lokiCanary:
+  enabled: false
