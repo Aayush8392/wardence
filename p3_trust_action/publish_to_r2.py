@@ -70,8 +70,17 @@ def build_trust_ladder(conn: sqlite3.Connection) -> list[dict]:
     ]
 
     for fault_class in sorted(all_classes):
+        # Phase E (2026-07-27): episodes marked phase_e_status='excluded'
+        # had bad ground truth (mislabeled 'none' controls) and are
+        # dropped from aggregate accuracy entirely -- not counted as
+        # either correct or wrong. 'reclassified' episodes ARE counted,
+        # using their corrected `correct` value (already updated in place
+        # by phase_e_apply_corrections.py, with the original preserved in
+        # original_correct for anyone auditing the change).
         total_correct_row = conn.execute(
-            "SELECT COUNT(*), SUM(correct) FROM scores WHERE actual_class = ?", (fault_class,)
+            "SELECT COUNT(*), SUM(correct) FROM scores "
+            "WHERE actual_class = ? AND (phase_e_status IS NULL OR phase_e_status != 'excluded')",
+            (fault_class,),
         ).fetchone()
         total, correct = total_correct_row[0], total_correct_row[1] or 0
         diagnosis_accuracy = correct / total if total else None
@@ -125,7 +134,7 @@ def build_episodes(conn: sqlite3.Connection) -> list[dict]:
             s.predicted_class, s.correct, s.confidence AS score_confidence,
             s.scored_at, s.action_taken AS scores_action_taken,
             s.action_applied, s.durability_verdict AS scores_durability_verdict,
-            s.trust_correct,
+            s.trust_correct, s.phase_e_status, s.phase_e_note,
             snap.tool_output, snap.reasoning, snap.confidence AS snapshot_confidence,
             snap.action_result, snap.durability_verdict AS snapshot_durability_verdict,
             snap.durability_elapsed_s

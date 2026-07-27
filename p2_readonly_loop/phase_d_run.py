@@ -484,6 +484,32 @@ def wait_for_target_recency(target: str, last_fault_time: dict):
         time.sleep(remaining)
 
 
+# Found 2026-07-27, investigating a "none" -> under-provisioned-replicas
+# false positive on catalogue (episode ccad4a97-d230-4815-8336-2b166c063b9c).
+# wait_for_target_recency() above only checks the CONTROL's own picked
+# target -- catalogue's own last real fault was 36 minutes earlier, well
+# past TARGET_RECENCY_WINDOW_S, so it correctly didn't wait. But 3 OTHER
+# real fixes (disk-full/queue-master, cpu-throttling/user,
+# bad-rollout/front-end) all completed within the ~90s immediately before
+# this control, and catalogue's active capacity probe (k6-driven, hits the
+# whole app through front-end) read 203.83ms -- just over the 200ms
+# threshold -- almost certainly real ambient load from that concurrent
+# activity, not noise on an idle system. Different mechanism from the
+# front-end/bad-rollout no-self-revert bug (Investigation 2) -- this is
+# system-wide load bleeding into one target's probe, not one target's own
+# leftover state. A per-target recency check can never catch this; only a
+# system-wide one can.
+def wait_for_system_quiet(last_fault_time: dict):
+    if not last_fault_time:
+        return
+    elapsed = time.time() - max(last_fault_time.values())
+    remaining = TARGET_RECENCY_WINDOW_S - elapsed
+    if remaining > 0:
+        print(f"  waiting {remaining:.0f}s for system-wide quiet before recording a 'none' control "
+              f"(most recent real fault completion anywhere was {elapsed:.0f}s ago)")
+        time.sleep(remaining)
+
+
 def run_episode(fault_class: str, last_fault_time: dict) -> dict:
     """
     Timestamp + round_id wrapper around _run_episode_inner -- keeps the
@@ -524,7 +550,11 @@ def _run_episode_inner(fault_class: str, last_fault_time: dict) -> dict:
                          "elapsed_s": round(time.time() - start, 1),
                          "detail": "front-end kept being genuinely broken across all reroll "
                                     "attempts -- skipped rather than record a mislabeled control"}
-            wait_for_target_recency(target, last_fault_time)
+            # System-wide quiet check, not just this target's own recency --
+            # see wait_for_system_quiet's comment above for why (a control
+            # can be contaminated by ANY recent real fault's ambient load,
+            # not only a prior fault on the same target).
+            wait_for_system_quiet(last_fault_time)
             conn = ensure_db()
             episode_id = record_none_episode(conn, target)
             conn.close()
