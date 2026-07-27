@@ -50,11 +50,22 @@ p3_trust_action/check_rollout_undo_rbac.sh
 p3_trust_action/test_force_demotion_bad_rollout.py
 p3_trust_action/test_force_demotion_cpu_throttling.py
 p3_trust_action/test_force_demotion_under_provisioned.py
+p2_readonly_loop/bad_rollout_idle_reliability.py
+p2_readonly_loop/bad_rollout_idle_reliability_results.jsonl
+p2_readonly_loop/check_rollback_lingering_pod.py
+p2_readonly_loop/check_trust_state.py
+p2_readonly_loop/measure_image_pull_staleness.py
+p2_readonly_loop/bad_rollout_fix_verifier_py.txt
 
 # Phase D run output -- regenerated per run, not source
 p2_readonly_loop/phase_d_batch1.json
 p2_readonly_loop/phase_d_batch2.json
 p2_readonly_loop/phase_d_results.jsonl
+p2_readonly_loop/phase_d_round1.json
+p2_readonly_loop/phase_d_round2.json
+p2_readonly_loop/phase_d_round3.json
+p2_readonly_loop/phase_d_round4.json
+p2_readonly_loop/phase_d_rounds_manifest.json
 
 # Live ServiceAccount credential -- never committed
 p3_trust_action/sa_token.txt

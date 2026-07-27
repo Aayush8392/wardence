@@ -9,6 +9,7 @@ implemented. disk-full's check is structurally different from the
 other two -- see _make_disk_full_check.
 """
 
+import json
 import re
 import subprocess
 import time
@@ -91,20 +92,51 @@ def _current_pod_name_live(target: str, namespace: str) -> str | None:
 
     The live API has no such lag: it is the authoritative source
     kube-state-metrics is itself derived from. Returns None when there
-    is genuinely no Running pod (mid eviction/recreation).
+    is genuinely no Running, non-terminating pod (mid eviction/recreation
+    or right after a fresh rollout restart).
+
+    REAL BUG FIXED (2026-07-27, confirmed via direct repro): Kubernetes'
+    real `.status.phase` has no "Terminating" value at all -- that's
+    purely a kubectl DISPLAY computation from `metadata.deletionTimestamp`
+    being set. A pod that's actively being torn down still reports
+    `phase=Running` internally right up until it's actually gone, so the
+    old `--field-selector=status.phase=Running` + `.items[0]` version
+    could (and, confirmed live, did) resolve to the OLD pod mid-
+    termination during the brief window right after restart_deployment
+    triggers a rollout -- `.items[0]` has no ordering guarantee and no
+    awareness of which pod is genuinely fresh. Concretely reproduced:
+    right after a real restart_deployment call, this returned the
+    already-Terminating old pod (6 stale restarts) instead of the
+    1-second-old new pod (0 restarts) -- explaining crash-loop's
+    "flapped at the very first poll" pattern (a residual, Prometheus-
+    scraped CrashLoopBackOff/restart reading from the dying old pod, not
+    a real problem with the actual fix). Fixed by reading the full pod
+    list, explicitly excluding anything with `metadata.deletionTimestamp`
+    set, and -- among the genuinely-alive candidates -- picking the one
+    with the LATEST `metadata.creationTimestamp` (the real newest pod),
+    not array position 0.
     """
     result = subprocess.run(
         [
             "kubectl", "get", "pods", "-n", namespace,
             "-l", f"name={target}",
             "--field-selector=status.phase=Running",
-            "-o", "jsonpath={.items[0].metadata.name}",
+            "-o", "json",
         ],
         capture_output=True,
         text=True,
     )
-    name = result.stdout.strip()
-    return name or None
+    try:
+        items = json.loads(result.stdout)["items"]
+    except (json.JSONDecodeError, KeyError):
+        return None
+
+    alive = [pod for pod in items if not pod.get("metadata", {}).get("deletionTimestamp")]
+    if not alive:
+        return None
+
+    newest = max(alive, key=lambda pod: pod["metadata"]["creationTimestamp"])
+    return newest["metadata"]["name"]
 
 
 BASELINE_CAPTURE_RETRY_S = 30
@@ -131,6 +163,48 @@ def _restart_count(pod_name: str, namespace: str) -> int:
     resp.raise_for_status()
     result = resp.json()["data"]["result"]
     return sum(int(float(entry["value"][1])) for entry in result)
+
+
+CRASH_LOOP_ROLLOUT_WAIT_TIMEOUT_S = 90
+
+
+def _wait_for_deployment_rollout(name: str, namespace: str, timeout_s: int = CRASH_LOOP_ROLLOUT_WAIT_TIMEOUT_S) -> bool:
+    """
+    Waits for a real, complete rollout via kubectl's own `rollout status`
+    -- reuses kubectl's built-in wait rather than reimplementing pod-count/
+    readiness polling, since this already IS the canonical way to wait for
+    a Deployment's rollout to genuinely finish (new ReplicaSet's pod(s)
+    Ready, old one gone).
+
+    REAL BUG FIXED (2026-07-27, confirmed via direct repro, not assumed):
+    restart_deployment (actions.py, crash-loop's fix) returns the instant
+    the API accepts the patch -- confirmed empirically: it returned in
+    0.06s, and the pod list was completely UNCHANGED immediately
+    afterward (same pod name/age); the real rollout (new pod created, old
+    one terminated) only finished several seconds later, confirmed
+    separately via `kubectl rollout status`. Without this wait,
+    _current_pod_name_live_with_retry (called right after the fix
+    returns, in verify_durability's crash-loop branch) can resolve to the
+    OLD, about-to-be-replaced pod: a single-replica rolling update can
+    still report a pod as Running right up until the instant it's
+    terminated, so this is NOT the zero-Running-pods gap that function's
+    own retry loop was built to survive. The durability check then binds
+    its baseline restart-count to the wrong pod's identity for its entire
+    window -- a real, timing-sensitive race (usually wins, occasionally
+    loses), matching the "0 demotions in one full run, 3 in the next"
+    pattern actually observed. Same root-cause class as disk-full/
+    under-provisioned-replicas/bad-rollout's own "API acceptance != real
+    completion" fixes -- crash-loop's restart_deployment was the one
+    action in the roster that had never gotten this wait added, until now.
+    Returns False on timeout rather than raising; caller decides how to
+    treat a rollout that couldn't be confirmed within a real margin.
+    """
+    result = subprocess.run(
+        ["kubectl", "rollout", "status", f"deployment/{name}", "-n", namespace, f"--timeout={timeout_s}s"],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def _crash_loop_backoff_now(pod_name: str, namespace: str) -> bool:
@@ -265,18 +339,97 @@ def _make_cpu_throttle_check(pod_name: str, container: str, baseline_periods: in
     return check
 
 
-def _front_end_image_pull_failing(namespace: str) -> bool:
-    """Duplicated from injector.py's identical helper -- matches this
-    project's established self-contained-file convention. A cheap
-    passive Prometheus read (unlike under-provisioned-replicas' active
-    probes), so this fits the standard generic poll loop fine."""
-    query = (
-        f'kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
-        f'pod=~"front-end.*", reason=~"ImagePullBackOff|ErrImagePull"}} == 1'
+def _front_end_image_pull_failing_live(namespace: str) -> bool:
+    """Checks the LIVE Kubernetes API via kubectl -- NOT Prometheus.
+
+    CORRECTED 2026-07-25 (idle-baseline reliability test, rep 1 and rep 1
+    again after a first attempted fix): a real, correctly-diagnosed
+    bad-rollout fix (rollback_deployment, actions.py) reported
+    applied=True, but verify_durability flapped it at the very first poll
+    (t+15s), twice in a row, including once AFTER adding a pre-wait gate
+    (_wait_for_no_image_pull_failure, now folded into this function) that
+    itself used live kubectl. The pre-wait alone wasn't enough: the
+    ONGOING poll loop in verify_durability was still calling the old
+    Prometheus-based _front_end_image_pull_failing on every tick, and
+    Prometheus's kube-state-metrics scrape can lag behind kubectl's own
+    live state -- so the pre-wait could correctly see a clean cluster via
+    kubectl, return, and the very next poll could still read a STALE
+    Prometheus value showing the old, already-gone broken pod's
+    ImagePullBackOff state. Guarding only the entry point wasn't
+    sufficient; the metric actually driving the verdict had to change too.
+
+    Fixed by making this the ONE live-kubectl-based check used both to
+    gate entry (see _wait_for_no_image_pull_failure below, now a thin
+    wrapper around this) and as the ongoing per-poll signal itself --
+    same fix shape already applied to crash-loop/oom/disk-full/
+    cpu-throttling's durability checks (see their own docstrings and the
+    2026-07-24 cpu-throttling `user`/`user-db` collision writeup): live
+    API, never Prometheus, for anything a fix's own completion could
+    still be lagging behind in kube-state-metrics.
+
+    REAL BUG FIXED (2026-07-27, confirmed via direct manual repro -- a
+    genuinely broken front-end pod, kubectl-confirmed Pending/ErrImagePull,
+    still made this function return False): the original version filtered
+    with --field-selector=status.phase=Running. A pod stuck in
+    ImagePullBackOff/ErrImagePull is, by Kubernetes' own phase semantics,
+    Pending -- it hasn't started any container yet, so it never reaches
+    Running. The filter silently excluded exactly the pods this function
+    exists to detect, meaning it could ALWAYS return False regardless of
+    real state -- every "confirmed"/"clean" durability result since
+    Investigation 1's original fix landed proved nothing, since the check
+    could never have said otherwise. phase_d_run.py's own parallel
+    implementation (_front_end_genuinely_broken) never had this filter and
+    was directly repro-tested to correctly detect a broken pod -- that
+    inconsistency between two supposedly-equivalent checks is what
+    surfaced this. Fixed by dropping the phase filter entirely: check
+    ALL pods matching the label, regardless of phase, exactly like
+    phase_d_run.py's already-correct version."""
+    result = subprocess.run(
+        [
+            "kubectl", "get", "pods", "-n", namespace,
+            "-l", "name=front-end",
+            "-o", "json",
+        ],
+        capture_output=True,
+        text=True,
     )
-    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
-    resp.raise_for_status()
-    return len(resp.json()["data"]["result"]) > 0
+    bad_reasons = {"ImagePullBackOff", "ErrImagePull"}
+    try:
+        pods = json.loads(result.stdout)["items"]
+    except (json.JSONDecodeError, KeyError):
+        pods = []
+    for pod in pods:
+        for cs in pod.get("status", {}).get("containerStatuses", []):
+            reason = cs.get("state", {}).get("waiting", {}).get("reason")
+            if reason in bad_reasons:
+                return True
+    return False
+
+
+def _wait_for_no_image_pull_failure(namespace: str, timeout_s: int = 60) -> bool:
+    """Polls _front_end_image_pull_failing_live (live kubectl, see its
+    own docstring for the full bug history) until no front-end pod is
+    stuck in ImagePullBackOff/ErrImagePull, or timeout_s elapses.
+
+    Needed because rollback_deployment (actions.py) returns the instant
+    the API accepts the patch, not once the rollback has actually
+    reconciled -- without this wait, the durability probe sequence could
+    start polling almost immediately and still see the OLD,
+    still-terminating broken pod. Same placement precedent as
+    _wait_for_catalogue_replicas_ready (under-provisioned-replicas' own
+    fix for the identical root-cause class): the durability layer, not
+    the action layer, confirms the fix has had a fair chance to take
+    effect before judging it -- rollback_deployment itself is left
+    untouched.
+
+    Returns False on timeout rather than raising -- caller decides how to
+    treat a fix that couldn't be confirmed."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if not _front_end_image_pull_failing_live(namespace):
+            return True
+        time.sleep(2)
+    return False
 
 
 def _make_bad_rollout_check():
@@ -284,10 +437,32 @@ def _make_bad_rollout_check():
     'still faulty' signal here (ANY front-end pod stuck in
     ImagePullBackOff/ErrImagePull) is meaningful regardless of which
     specific pod it is: after a genuinely successful rollback, no
-    front-end pod should ever be in that state again."""
+    front-end pod should ever be in that state again.
+
+    Waits for real rollback completion (_wait_for_no_image_pull_failure)
+    before returning the actual polling check function -- found
+    2026-07-25: rollback_deployment (actions.py) returns the instant the
+    API accepts the patch, not once it's reconciled. The ONGOING poll
+    returned by this function also uses the live-kubectl check
+    (_front_end_image_pull_failing_live), not the old Prometheus-based
+    one -- a pre-wait alone wasn't sufficient (see
+    _front_end_image_pull_failing_live's docstring for the full story of
+    why this needed a second round of fixing), since the ongoing poll
+    could still read a stale Prometheus scrape even after the live
+    cluster state was already clean."""
+    reconciled = _wait_for_no_image_pull_failure("sock-shop", timeout_s=60)
+    if not reconciled:
+        # Rollback never genuinely completed within a real margin -- this
+        # IS a real fix failure, not a premature check. Return a check
+        # function that always reports "still faulty" so verify_durability
+        # correctly reports flapped, honestly, for this real reason.
+        def check(target: str, namespace: str) -> bool:
+            return True
+
+        return check
 
     def check(target: str, namespace: str) -> bool:
-        return _front_end_image_pull_failing(namespace)
+        return _front_end_image_pull_failing_live(namespace)
 
     return check
 
@@ -486,6 +661,13 @@ def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop
         # may have been silently vulnerable to the same non-deterministic
         # mis-resolution, undetected whenever the hash comparison
         # happened to still favor the right pod.
+        #
+        # Real completion wait added 2026-07-27 -- see
+        # _wait_for_deployment_rollout's docstring for the confirmed bug
+        # this closes (restart_deployment returns before the rollout has
+        # even started, let alone finished, so pod_name below could
+        # otherwise resolve to the OLD pod being replaced).
+        _wait_for_deployment_rollout(target, namespace)
         pod_name = _current_pod_name_live_with_retry(target, namespace)
         baseline = _restart_count(pod_name, namespace)
         check_fn = _make_crash_loop_check(pod_name, baseline)

@@ -95,7 +95,16 @@ def main():
 
     episode_id, actual_class, target, namespace = episode
 
-    resp = requests.post(AGENT_URL, json={"target": target, "namespace": namespace}, timeout=15)
+    # 150s, not 15s -- REAL BUG FIXED (2026-07-27): under-provisioned-
+    # replicas' diagnosis fallback (probe_catalogue_capacity, agent.py)
+    # fires a real k6 burst (~20-30s incl. kubectl pod overhead) and, as
+    # of today's retry fix (PROBE_MAX_ATTEMPTS=3, added after 2 real
+    # Phase D misdiagnoses caused by a single flaky probe attempt), can
+    # now take up to ~90-100s worst case on retries. 15s was already
+    # borderline-too-tight for a single attempt; with retries it's
+    # guaranteed to time out. Confirmed via a real ReadTimeout during
+    # this exact class's verification run.
+    resp = requests.post(AGENT_URL, json={"target": target, "namespace": namespace}, timeout=150)
     resp.raise_for_status()
     result = resp.json()
 

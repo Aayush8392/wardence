@@ -81,6 +81,10 @@ K6_IMAGE = "grafana/k6:latest"
 UNDER_PROVISIONED_PROBE_VUS = 20
 UNDER_PROVISIONED_PROBE_DURATION_S = 20
 UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 200
+# Matches injector.py's own MAX_INJECT_ATTEMPTS pattern for this exact
+# same probe mechanism -- see probe_catalogue_capacity's docstring for
+# the real bug this fixes.
+PROBE_MAX_ATTEMPTS = 3
 
 
 def _parse_k6_p95_ms(stdout_text: str) -> float | None:
@@ -111,9 +115,24 @@ def probe_catalogue_capacity(namespace: str) -> float | None:
     real cost/interference tradeoffs discussed before this class was
     built: real cluster load per call, and a real contamination-
     surface risk with connection-pool-exhaustion, which also floods
-    catalogue-db through catalogue)."""
-    pod_name = f"wardence-catprobe-{uuid.uuid4().hex[:8]}"
-    script = f"""
+    catalogue-db through catalogue).
+
+    REAL BUG FIXED (2026-07-27, confirmed via 2 real Phase D
+    under-provisioned-replicas misdiagnoses): a single k6 burst
+    occasionally fails to produce a valid p95 (returns None) -- an
+    already-known, already-observed flakiness in this exact mechanism
+    (injector.py's own retry loop routinely logs "p95=Nonems, below
+    200ms threshold, retrying" for this same probe). This function had
+    NO retry at all -- confirmed directly via both misdiagnosed
+    episodes' real tool_output snapshots (catalogue_probe_p95_ms: null
+    both times) -- one flaky call at diagnosis time became a missed
+    diagnosis, with no recovery. Fixed by retrying up to
+    PROBE_MAX_ATTEMPTS times, matching injector.py's own already-proven
+    pattern for this same mechanism -- only returns None if every
+    attempt genuinely fails."""
+    for attempt in range(1, PROBE_MAX_ATTEMPTS + 1):
+        pod_name = f"wardence-catprobe-{uuid.uuid4().hex[:8]}"
+        script = f"""
 import http from 'k6/http';
 export const options = {{
   scenarios: {{
@@ -128,21 +147,24 @@ export default function () {{
   http.get('http://catalogue.{namespace}.svc.cluster.local/catalogue?size=10');
 }}
 """
-    try:
-        result = subprocess.run(
-            [
-                "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
-                "-n", namespace, f"--image={K6_IMAGE}",
-                "--", "run", "--quiet", "-",
-            ],
-            input=script, capture_output=True, text=True,
-            timeout=UNDER_PROVISIONED_PROBE_DURATION_S + 60,
-        )
-    except subprocess.TimeoutExpired:
-        return None
-    if result.returncode != 0:
-        return None
-    return _parse_k6_p95_ms(result.stdout)
+        try:
+            result = subprocess.run(
+                [
+                    "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
+                    "-n", namespace, f"--image={K6_IMAGE}",
+                    "--", "run", "--quiet", "-",
+                ],
+                input=script, capture_output=True, text=True,
+                timeout=UNDER_PROVISIONED_PROBE_DURATION_S + 60,
+            )
+        except subprocess.TimeoutExpired:
+            continue
+        if result.returncode != 0:
+            continue
+        p95 = _parse_k6_p95_ms(result.stdout)
+        if p95 is not None:
+            return p95
+    return None
 
 app = FastAPI()
 
@@ -226,11 +248,25 @@ def query_prometheus(target: str, namespace: str) -> dict:
          same-pod-two-metrics joins work elsewhere in this file),
          combined at the code level below.
     """
+    # [6m], not [3m] -- REAL BUG FIXED (2026-07-27, confirmed via a
+    # historical Prometheus query at a real Phase D oom misdiagnosis's
+    # exact scored_at timestamp): last_terminated_reason=="OOMKilled"
+    # correctly showed 1 for the real OOM-killed pod, but that SAME
+    # pod's own increase(restarts_total[3m]) showed 0 at that exact
+    # instant -- the and-join between the two metrics failed even
+    # though the OOM genuinely happened, because the real restart event
+    # landed more than 3 minutes before diagnosis time. This episode's
+    # own log showed "catalogue's memory limit is 400Mi... resetting
+    # before injecting" -- the same "reset-rollout + retry attempts push
+    # the real event later than a narrow window assumes" shape already
+    # confirmed and fixed for cpu-throttling's [2m]->[6m] widen, just
+    # manifesting here as a cross-metric join failure instead of
+    # [0]-indexing. Widened to match the same real margin.
     oom_query = (
         f'(kube_pod_container_status_last_terminated_reason{{namespace="{namespace}", '
         f'pod=~"{target}.*", reason="OOMKilled"}} == 1) '
         f'and on(namespace, pod) (increase(kube_pod_container_status_restarts_total'
-        f'{{namespace="{namespace}", pod=~"{target}.*"}}[3m]) > 0)'
+        f'{{namespace="{namespace}", pod=~"{target}.*"}}[6m]) > 0)'
     )
     evicted_query = (
         f'kube_pod_status_reason{{namespace="{namespace}", '
@@ -520,24 +556,71 @@ def query_prometheus(target: str, namespace: str) -> dict:
 
     # cpu-throttling: user's own container_cpu_cfs_throttled_periods_total,
     # via increase() over a window wide enough to cover the fault's full
-    # 60s duration plus the settle gap (same 2m margin used elsewhere) --
-    # NOT max_over_time (that's for gauges; this is a monotonic counter,
-    # so increase() over the window directly gives the real delta during
-    # that period regardless of the counter's absolute starting value,
-    # avoiding the "already nonzero at idle" trap a raw/instant read of
-    # this metric would fall into).
+    # 60s duration plus the settle gap -- NOT max_over_time (that's for
+    # gauges; this is a monotonic counter, so increase() over the window
+    # directly gives the real delta during that period regardless of the
+    # counter's absolute starting value, avoiding the "already nonzero at
+    # idle" trap a raw/instant read of this metric would fall into).
+    #
+    # WIDENED 2m -> 6m (2026-07-25, real Phase D false negative, episode
+    # bc54bd30, pair 8): this is a live RATE, not a sticky historical
+    # fact like oom's last_terminated_reason -- once the stressor stops
+    # accruing new throttled periods, increase() over a short window
+    # genuinely decays back toward 0 within minutes, even though the
+    # counter's absolute value never resets. A 2m window is fine for the
+    # common single-attempt case (~97s observed elapsed_s end-to-end),
+    # but this class is also one of the few (along with oom) whose real,
+    # successful fix (patch_cpu_limit) permanently raises user's CPU
+    # limit -- nothing else reverts it -- so _ensure_cpu_throttle_baseline
+    # must patch it back and wait out a real rollout (kubectl rollout
+    # status) before the NEXT injection can even start. That reset,
+    # stacked with a retry attempt, pushed one real episode's actual
+    # last-throttling-activity well outside a 2m lookback by diagnosis
+    # time (elapsed_s=421.6 vs. the normal ~97s, tool_output showed a
+    # clean cpu_throttle_periods_increase=0.0 -- the fault genuinely
+    # landed, per the injector's own mechanism assertion, but had fully
+    # aged out of view by the time diagnosis ran). Checked every other
+    # baseline-reset class before picking this fix: under-provisioned-
+    # replicas re-probes live (no window to age out of); bad-rollout's
+    # signal doesn't self-revert at all; init-failure/session-cart-
+    # failure revert on every attempt (successful or not), so their own
+    # reset-rollout never becomes a real per-episode cost the way
+    # oom's/cpu-throttling's do. oom is unaffected by this specific bug
+    # despite sharing the same reset-rollout cost, because its own
+    # signal (last_terminated_reason) is sticky, not a decaying rate.
+    # 6m gives real margin over a 180s rollout wait + a failed 95s retry
+    # + settle, without needing to guess an even larger number.
     if target == "user":
         throttle_query = (
             f'increase(container_cpu_cfs_throttled_periods_total{{namespace="{namespace}", '
-            f'pod=~"{target}-.*", container="{target}"}}[2m])'
+            f'pod=~"{target}-.*", container="{target}"}}[6m])'
         )
         throttle_resp = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query", params={"query": throttle_query}, timeout=10
         )
         throttle_resp.raise_for_status()
         throttle_result = throttle_resp.json()["data"]["result"]
-        cpu_throttle_periods_increase = (
-            float(throttle_result[0]["value"][1]) if throttle_result else None
+        # SECOND real bug found the same session as the 2m->6m window fix
+        # (2026-07-26, direct repro): during a CPU-limit reset rollout
+        # (_ensure_cpu_throttle_baseline), the OLD and NEW `user` pods
+        # both still match pod=~"user-.*" and both still report to
+        # Prometheus for several minutes -- confirmed via a direct
+        # historical query at the exact diagnosis timestamp, which
+        # returned TWO series: the old, already-dead pod at increase=0,
+        # and the new pod (the real fault target) at increase=626.28.
+        # The previous code took throttle_result[0] -- the FIRST entry
+        # Prometheus happened to return, which silently was the dead
+        # pod's 0, discarding the real signal sitting in result[1].
+        # Same root shape as verifier.py's earlier user/user-db prefix-
+        # regex collision, but here it's the SAME target's own old and
+        # new pod overlapping during a rollout, not a different service.
+        # Fixed by taking max() across every matched series, same
+        # pattern already used for peak_memory_mib/peak_threads_connected
+        # above -- correct because a genuinely stale/dead pod can only
+        # ever report 0 or a low leftover value, never a higher one than
+        # the real active pod during a real fault.
+        cpu_throttle_periods_increase = max(
+            (float(e["value"][1]) for e in throttle_result), default=None
         )
     else:
         cpu_throttle_periods_increase = None
