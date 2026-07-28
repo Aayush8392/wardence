@@ -30,7 +30,20 @@ singleBinary:
       memory: 200Mi
     limits:
       cpu: 300m
-      memory: 400Mi
+      # Bumped 400Mi -> 1Gi (2026-07-28) -- the original 400Mi was too
+      # tight for scanning real accumulated chunk data across the full
+      # 48h retention window: repeated OOMKills confirmed (pod restart
+      # count climbing, readiness-probe failures across its whole
+      # uptime) even for a lightweight count_over_time aggregate query,
+      # not just raw-line pagination -- the cost is scanning/decompressing
+      # chunks server-side, independent of query shape. Real headroom
+      # checked before choosing this number (not guessed): node has
+      # 4.5Gi real `available` memory, cluster-wide pod memory LIMITS
+      # only total 5320Mi (53% of the 9.7Gi node) before this change --
+      # comfortable room for the +624Mi. Paired with chunking the query
+      # window client-side (check_loki_log_volume.py) so the real peak
+      # memory NEED per request also drops, not just the ceiling.
+      memory: 1Gi
   persistence:
     enabled: true
     size: 2Gi

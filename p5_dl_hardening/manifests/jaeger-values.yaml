@@ -1,0 +1,81 @@
+# Jaeger, all-in-one mode, in-memory storage — sized for this project's
+# disposable local lab, same "disposable, not precious" philosophy as
+# loki-values.yaml. Deployed via the official jaegertracing/jaeger Helm
+# chart.
+#
+# In-memory storage (not Cassandra/Elasticsearch/Badger-on-disk) is a
+# deliberate choice: traces don't need to survive a pod restart any more
+# than Chaos Mesh's own state does -- if this pod restarts, we lose
+# whatever traces were in the buffer, which is an acceptable, disposable
+# loss for this lab, not a real data-durability requirement. Matches the
+# same reasoning that made filesystem-not-object-storage the right call
+# for Loki, one level more disposable since even filesystem persistence
+# isn't needed here.
+#
+# REAL OPEN QUESTION, not yet answered (flagged 2026-07-28, check
+# immediately after this deploys): deploying Jaeger only stands up the
+# tracing BACKEND -- it does nothing on its own to make Sock Shop's
+# services actually SEND traces to it. Loki needed Promtail as a
+# separate shipping agent; Jaeger needs the app services themselves (or
+# a sidecar) to emit spans, either via a dormant Zipkin/Sleuth client
+# already built into Sock Shop's original Java services (plausible --
+# Sock Shop's original demo shipped with optional Zipkin support) or via
+# some other bridge. NOT assumed to already work -- verify empirically
+# once this is up, same "measure, don't assume" discipline as everything
+# else in this project.
+
+provisionDataStore:
+  cassandra: false
+  elasticsearch: false
+  kafka: false
+
+storage:
+  type: memory
+
+allInOne:
+  enabled: true
+  resources:
+    requests:
+      cpu: 50m
+      memory: 200Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
+  # Real cap on the in-memory trace buffer, not left at the chart
+  # default -- bounds worst-case memory use regardless of trace volume,
+  # same "bound the worst case explicitly" discipline as Loki's chunked
+  # queries. 50k traces is generous for this lab's real scale (a handful
+  # of services, modest traffic_gen load) with real headroom.
+  extraEnv:
+    - name: MEMORY_MAX_TRACES
+      value: "50000"
+  # Zipkin-compatible ingest port (9411) enabled by default in all-in-one
+  # -- left on deliberately, since Sock Shop's original Java services are
+  # the most likely candidate for already having Zipkin-client code, not
+  # native Jaeger/OTLP.
+  # Real query UI + query API, needed to actually look at traces once
+  # real data is flowing -- not exposed outside the cluster (port-forward
+  # only, same pattern as Prometheus/Grafana/Loki access throughout this
+  # project).
+  service:
+    type: ClusterIP
+
+# All-in-one already includes collector/query/agent in a single pod --
+# disable the chart's separate standalone deployments for these,
+# matching the same "disable the extra components this lab doesn't need"
+# pattern as loki-values.yaml.
+collector:
+  enabled: false
+query:
+  enabled: false
+agent:
+  enabled: false
+
+esIndexCleaner:
+  enabled: false
+esRollover:
+  enabled: false
+esLookback:
+  enabled: false
+cassandraSchemaJob:
+  enabled: false
