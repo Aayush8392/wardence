@@ -127,7 +127,17 @@ def wait_for_target_recency(last_injection_time: float | None) -> None:
 
 def run(script: str, extra_args: list[str] | None = None):
     cmd = [sys.executable, script] + (extra_args or [])
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # start_new_session=True (2026-07-28): launches the child in its OWN
+    # process group, not the terminal's foreground one -- without this, a
+    # Ctrl+C at the terminal delivers SIGINT to injector.py/scorer.py
+    # directly and simultaneously with this parent process, regardless of
+    # any signal handling done here. That risks killing a real, live
+    # cluster mutation (a kubectl scale/patch mid-flight) at a genuinely
+    # unsafe moment. With this, only the parent receives Ctrl+C, and the
+    # child always runs to its own natural completion undisturbed --
+    # required for run_batch_plan.py's "Ctrl+C is safe, stops at the next
+    # safe point" guarantee to actually be true, not just aspirational.
+    result = subprocess.run(cmd, capture_output=True, text=True, start_new_session=True)
     print(result.stdout.strip())
     if result.returncode != 0:
         print(result.stderr.strip())
