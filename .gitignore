@@ -56,6 +56,19 @@ p2_readonly_loop/check_rollback_lingering_pod.py
 p2_readonly_loop/check_trust_state.py
 p2_readonly_loop/measure_image_pull_staleness.py
 p2_readonly_loop/bad_rollout_fix_verifier_py.txt
+check_loki_status.sh
+p5_dl_hardening/check_carts_current.py
+p5_dl_hardening/check_catalogue_db_file_logs.sh
+p5_dl_hardening/check_deeplog_window_size.py
+p5_dl_hardening/check_depth6_others.py
+p5_dl_hardening/check_maskable_fields.py
+p5_dl_hardening/check_queuemaster_depth_tuning.py
+p5_dl_hardening/check_queuemaster_spc_filtered.py
+p5_dl_hardening/check_sidecar_and_container_logs.sh
+p5_dl_hardening/check_user_catalogue_wide.py
+p5_dl_hardening/check_user_depth_tuning.py
+p5_dl_hardening/check_user_token_lengths.py
+p5_dl_hardening/verify_deeplog_config.py
 
 # Phase D run output -- regenerated per run, not source
 p2_readonly_loop/phase_d_batch1.json
@@ -70,6 +83,12 @@ p2_readonly_loop/phase_d_run_summary.json
 
 # Phase E run output -- regenerated per run, not source
 p2_readonly_loop/phase_e_sanity_check.json
+
+# log_sequence_pipeline.py's real, generated state -- watermarks, drain3
+# binary snapshots, and per-service JSONL event streams. Real accumulated
+# data, not source; regenerable by re-running the pipeline (with a fresh
+# backfill if the state is ever lost).
+p5_dl_hardening/pipeline_state/
 
 # Live ServiceAccount credential -- never committed
 p3_trust_action/sa_token.txt
