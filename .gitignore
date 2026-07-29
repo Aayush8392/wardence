@@ -69,6 +69,14 @@ p5_dl_hardening/check_user_catalogue_wide.py
 p5_dl_hardening/check_user_depth_tuning.py
 p5_dl_hardening/check_user_token_lengths.py
 p5_dl_hardening/verify_deeplog_config.py
+p3_trust_action/test_force_demotion_crash_loop.py
+p3_trust_action/test_force_demotion_disk_full.py
+p3_trust_action/test_force_demotion_oom.py
+p5_dl_hardening/check_hmm_score_distribution.py
+p5_dl_hardening/check_isolation_forest_sparsity.py
+p5_dl_hardening/check_pipeline_fault_contamination.py
+p5_dl_hardening/check_track_b_hmm_fit_quality.py
+p5_dl_hardening/check_track_b_regime_shift.py
 
 # Phase D run output -- regenerated per run, not source
 p2_readonly_loop/phase_d_batch1.json
@@ -80,6 +88,10 @@ p2_readonly_loop/phase_d_round3.json
 p2_readonly_loop/phase_d_round4.json
 p2_readonly_loop/phase_d_rounds_manifest.json
 p2_readonly_loop/phase_d_run_summary.json
+
+# run_batch_plan.py's archived completed-plan snapshots -- run output,
+# regenerated per run, same category as the Phase D files above.
+p2_readonly_loop/batch_plan_progress_*.json
 
 # Phase E run output -- regenerated per run, not source
 p2_readonly_loop/phase_e_sanity_check.json

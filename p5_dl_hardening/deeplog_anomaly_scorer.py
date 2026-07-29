@@ -44,6 +44,7 @@ import torch.nn as nn
 from scipy.stats import binom
 
 from deeplog_service_config import DEEPLOG_TIER_1
+from train_track_a_lstm import BATCH_SIZE
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 TRACK_A_DIR = os.path.join(SCRIPT_DIR, "pipeline_state", "track_a")
@@ -91,14 +92,25 @@ def predict_hits(model, X: np.ndarray, y: np.ndarray, k: int):
     prediction for context X_i? Returns a boolean array, one entry per
     real (context, actual_next) sample -- consecutive entries correspond
     to consecutive real timeline positions, since X/y were built with a
-    chronological, never-shuffled split."""
+    chronological, never-shuffled split.
+
+    Real bug found and fixed after the pipeline corpus grew (2026-07-29
+    follow-up): this used to run the WHOLE test set through the model
+    in one forward call, which worked fine on the original thin corpus
+    but genuinely OOM'd a 4GB GPU once X_test grew large enough --
+    train_track_a_lstm.py already batches training at BATCH_SIZE=256,
+    this just never got the same treatment for inference. Fixed by
+    batching here too, reusing the exact same constant (not a fresh
+    guess) so training and scoring stay consistent."""
+    hits_chunks = []
     with torch.no_grad():
-        X_t = torch.from_numpy(X).to(DEVICE)
-        logits = model(X_t)
-        top_k_idx = logits.topk(min(k, logits.shape[1]), dim=1).indices.cpu().numpy()
-    y_col = y.reshape(-1, 1)
-    hits = (top_k_idx == y_col).any(axis=1)
-    return hits
+        for start in range(0, len(X), BATCH_SIZE):
+            X_batch = torch.from_numpy(X[start:start + BATCH_SIZE]).to(DEVICE)
+            logits = model(X_batch)
+            top_k_idx = logits.topk(min(k, logits.shape[1]), dim=1).indices.cpu().numpy()
+            y_batch = y[start:start + BATCH_SIZE].reshape(-1, 1)
+            hits_chunks.append((top_k_idx == y_batch).any(axis=1))
+    return np.concatenate(hits_chunks)
 
 
 def windowed_miss_rates(hits: np.ndarray, window: int, stride: int):

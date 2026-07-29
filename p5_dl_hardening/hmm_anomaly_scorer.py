@@ -86,43 +86,79 @@ def to_symbols(sequence: list, id_to_index: dict):
     return symbols, saw_unseen
 
 
-def per_step_log_probs(model, symbols: list):
-    """Real per-step conditional log-probabilities within a window, via
-    the chain rule: log P(x_1..x_n) = sum_i log P(x_i | x_1..x_{i-1}),
-    so score(prefix of length i) - score(prefix of length i-1) equals
-    the exact log P(x_i | x_1..x_{i-1}) the forward algorithm computed
-    -- not an approximation, the real per-step decomposition of the
-    same joint likelihood model.score() already returns for the whole
-    sequence."""
-    prefix_score = model.score(np.array(symbols[:1]).reshape(-1, 1))
-    steps = [prefix_score]
-    for i in range(1, len(symbols)):
-        full_score = model.score(np.array(symbols[:i + 1]).reshape(-1, 1))
-        steps.append(full_score - prefix_score)
-        prefix_score = full_score
-    return steps
+def continuous_per_step_log_probs(model, symbols: list):
+    """Real per-step conditional log-probabilities across a FULL,
+    CONTINUOUS sequence, via the standard scaled forward algorithm
+    (Rabiner 1989) -- computed once, propagating REAL prior context
+    from one step to the next throughout the whole sequence, never
+    restarting at an artificial boundary.
 
+    Real bug found and fixed, 2026-07-29 follow-up (Kimi review 08's
+    corpus-growth investigation): the previous version scored each
+    WINDOW in isolation (model.score() on just that window's own
+    symbols), which forced step 0 of every single window to fall back
+    on model.startprob_ alone -- and startprob_ is fit from Baum-Welch
+    on ONE continuous training sequence, so it only ever observed ONE
+    real "start," converging to a near-one-hot, largely meaningless
+    distribution. For queue-master's perfectly-alternating 2-symbol
+    sequence with a fixed EVEN window size (20), every non-overlapping
+    window's first symbol landed on the exact same alternation phase --
+    so if that phase happened to be startprob_'s low-probability side,
+    literally every window inherited the identical catastrophic,
+    meaningless step-0 penalty as its real minimum (confirmed directly:
+    200/201 held-out windows shared the exact same -28.91 step-0 score).
+    Whether that phase alignment is lucky or unlucky is essentially a
+    coin flip that shifts every time the corpus grows (the held-out
+    split is count-based, so its exact start index moves).
 
-def windowed_scores(model, symbols: list, window_size: int, stride: int):
-    """Yields the MINIMUM per-step log-probability within each window --
-    not the mean. Real fix, 2026-07-29: mean-over-window averages out
-    any single rare transition against the rest of a mostly-normal
-    window, which made this insensitive for low-state-count services
-    like `catalogue` (3 states -- even the model's own worst-case
-    sequence only pulled the mean down ~1.5 std, short of the 3-std
-    threshold). Taking the minimum surfaces the single worst step
-    directly, which is the more natural fit for "did something rare
-    just happen" rather than "has the overall pattern drifted." A
-    window containing an unseen symbol (None) can't be scored at all --
-    yielded as -inf, an unambiguous, maximally-anomalous score rather
-    than silently skipped."""
-    for start in range(0, len(symbols) - window_size + 1, stride):
-        window = symbols[start:start + window_size]
-        if None in window:
-            yield -np.inf, True  # (score, contains_unseen_template)
+    Real fix: compute the per-step conditional log-probability ONCE,
+    continuously, across the whole real sequence -- only the VERY
+    FIRST symbol of the entire sequence pays the meaningless startprob_
+    cold-start cost now (unavoidable, every sequence needs some prior
+    for its first real observation), not every window's first symbol.
+    An unseen template_id (None) can't be scored -- recorded as -inf
+    (an unambiguous, maximally-anomalous per-step value) and the real
+    forward state is reset to startprob_ before continuing from the
+    next real symbol, since there's no defined emission probability to
+    propagate through for a symbol never seen in training."""
+    A = model.transmat_
+    B = model.emissionprob_
+    pi = model.startprob_
+
+    log_probs = []
+    is_unseen = []
+    alpha = pi.copy()
+    need_restart = True
+    for sym in symbols:
+        if sym is None:
+            log_probs.append(-np.inf)
+            is_unseen.append(True)
+            need_restart = True
             continue
-        steps = per_step_log_probs(model, window)
-        yield min(steps), False
+        if need_restart:
+            alpha = pi * B[:, sym]
+            need_restart = False
+        else:
+            alpha = (alpha @ A) * B[:, sym]
+        c = alpha.sum()
+        alpha /= c
+        log_probs.append(float(np.log(c)))
+        is_unseen.append(False)
+    return log_probs, is_unseen
+
+
+def windowed_scores(log_probs: list, is_unseen: list, window_size: int, stride: int):
+    """Yields the MINIMUM per-step log-probability within each window --
+    not the mean, per the 2026-07-29 fix (mean-over-window averages out
+    a single rare transition, insensitive for low-state-count services
+    like `catalogue`). Operates on an ALREADY-COMPUTED continuous
+    per-step array (see continuous_per_step_log_probs) -- this function
+    only slices/aggregates, it never re-triggers a scoring restart, so
+    windowing here can't reintroduce the cold-start bug above."""
+    for start in range(0, len(log_probs) - window_size + 1, stride):
+        window_scores = log_probs[start:start + window_size]
+        window_unseen = is_unseen[start:start + window_size]
+        yield min(window_scores), any(window_unseen)
 
 
 def calibrate_threshold(model, id_to_index, service: str):
@@ -147,7 +183,8 @@ def calibrate_threshold(model, id_to_index, service: str):
     held_out = sequence[split_idx:]
     symbols, _ = to_symbols(held_out, id_to_index)
 
-    scores = [ll for ll, unseen in windowed_scores(model, symbols, WINDOW_SIZE, WINDOW_SIZE)
+    log_probs, is_unseen = continuous_per_step_log_probs(model, symbols)
+    scores = [ll for ll, unseen in windowed_scores(log_probs, is_unseen, WINDOW_SIZE, WINDOW_SIZE)
               if not unseen]
     if len(scores) < 5:
         raise RuntimeError(f"{service}: only {len(scores)} real held-out windows -- "
@@ -206,7 +243,8 @@ def self_test(service: str):
             if s < worst_score:
                 worst_score, best_next = s, candidate
         corrupted.append(best_next)
-    corrupted_scores = list(windowed_scores(model, corrupted, WINDOW_SIZE, WINDOW_SIZE))
+    corrupted_log_probs, corrupted_is_unseen = continuous_per_step_log_probs(model, corrupted)
+    corrupted_scores = list(windowed_scores(corrupted_log_probs, corrupted_is_unseen, WINDOW_SIZE, WINDOW_SIZE))
     corrupted_ll, corrupted_unseen = corrupted_scores[0]
     corrupted_flagged = corrupted_unseen or corrupted_ll <= threshold
     print(f"  synthetic corrupted-sequence check (greedy search against the "

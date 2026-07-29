@@ -1,21 +1,32 @@
 """
-P2 episode runner: repeats injector -> wait -> scorer N times.
+Shared library for episode-running scripts (injector -> wait -> scorer),
+NOT a standalone runner -- real trim, 2026-07-29. This used to also have
+its own single-class CLI loop (`main()`, `python3 run_episodes.py --class
+crash-loop 20`), but that became fully redundant once run_batch_plan.py
+existed: it does the exact same real sequence (wait-for-infra ->
+wait-for-recency -> run injector -> settle -> run scorer -> update
+timings), using these SAME helpers, plus strictly more (resumable/
+pausable, runs check_all_baselines.py first, verifies a real episode
+actually got recorded rather than trusting subprocess exit code, and has
+a richer end-of-run summary). Any single-class use case is just
+`python3 run_batch_plan.py --plan crash-loop:20` now. Removed alongside
+`main()`: `wait_for_target_recency()` (only ever called by `main()` --
+run_batch_plan.py has its own `_wait_for_target_recency`, shaped for
+multiple concurrent targets, which `main()`'s single-target version
+never needed to be).
 
-Prometheus port-forward and the agent (uvicorn agent:app) must already
-be running in separate terminals before starting this.
-
-Usage:
-    python3 run_episodes.py --class crash-loop [num_episodes]   # default 20
-    python3 run_episodes.py --class oom [num_episodes]
-    python3 run_episodes.py --class network-latency [num_episodes]
+What actually still lives here, and is the real reason this file isn't
+deleted outright: SETTLE_SECONDS, TARGET_RECENCY_WINDOW_S/
+DEFAULT_TARGET_RECENCY_WINDOW_S (the real per-class recency margins),
+_Tee, _update_timings, run(), wait_for_infra_ready()/_infra_ready() --
+all imported directly by run_batch_plan.py, the actual single source of
+truth for these values/helpers.
 """
 
-import argparse
 import json
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -24,7 +35,6 @@ SETTLE_SECONDS = 35  # kube-state-metrics scrapes every 30s; wait a full cycle +
                       # so the last fault action in the injection window is reflected
 
 TIMINGS_PATH = Path(__file__).parent / "episode_timings.json"
-OUTPUT_DIR = Path(__file__).parent / "output"
 
 
 class _Tee:
@@ -69,7 +79,48 @@ INFRA_WAIT_POLL_S = 20
 # contaminate the next episode's baseline/injection, the same
 # contamination shape behind several of this project's already-found
 # bugs. 300s matches the value already proven correct elsewhere.
-TARGET_RECENCY_WINDOW_S = 300
+# Real per-class recency margin (recalibrated 2026-07-29, replacing the
+# old flat 300s guess). Sized from each class's own REAL diagnosis
+# lookback window (agent.py's actual PromQL queries, confirmed directly
+# -- not assumed) plus a 30s buffer, matching the precedent already set
+# by run_systematic_validation.py's own "215 = 3min lookback + 30s
+# eviction/scrape-jitter buffer" derivation. The old flat 300s was
+# correctly derived for the AUTO-FIX classes (a real margin over their
+# ~280s fix+durability cycle) but was never actually valid for the
+# report-only classes (no fix/durability cycle at all -- their real
+# risk is a stale PRIOR fault still sitting inside the NEXT episode's
+# own diagnosis lookback window) -- this is what stalled the original
+# overnight thin-class batch (see wardence_buildlog.md, 2026-07-28
+# session): session-cart-failure/init-failure's real per-episode cost
+# was ~5x every other class specifically because of this over-wait.
+TARGET_RECENCY_WINDOW_S = {
+    # Report-only classes: real diagnosis lookback window + 30s buffer.
+    "network-latency": 150,             # agent.py p95_latency query: max_over_time(...[2m])
+    "network-partition": 150,           # agent.py combined_throughput_bps: [2m] subquery
+    "init-failure": 150,                # agent.py payment_stuck_not_ready: max_over_time(...[2m])
+    "session-cart-failure": 150,        # agent.py session_db_replicas_hit_zero: min_over_time(...[2m])
+    "memory-leak": 210,                 # agent.py peak_memory_mib: max_over_time(...[3m])
+    "connection-pool-exhaustion": 210,  # agent.py peak_threads_connected: max_over_time(...[3m])
+    # Auto-fix classes: real fix+durability cycle -- unchanged from the
+    # original flat 300s where it was already correctly derived.
+    "crash-loop": 300,
+    "oom": 300,
+    "disk-full": 300,
+    "bad-rollout": 300,
+    # under-provisioned-replicas' own real observed worst-case
+    # (durability_elapsed_s=278s, per wardence_buildlog.md) left only
+    # ~22s real margin against the old flat 300s -- widened for genuine
+    # safety, not because 300 was ever shown to actually fail.
+    "under-provisioned-replicas": 350,
+    # REAL CORRECTION, found during this recalibration: cpu-throttling's
+    # own diagnosis query uses a [6m]=360s lookback (agent.py, widened
+    # from [2m] on 2026-07-26 to fix a real reset-rollout timing bug) --
+    # genuinely LONGER than the old flat 300s guard, meaning repeated
+    # cpu-throttling runs were never actually safe against this exact
+    # contamination risk. Fixed to 360 + 30s buffer = 390.
+    "cpu-throttling": 390,
+}
+DEFAULT_TARGET_RECENCY_WINDOW_S = 300  # any class not yet in the dict above
 
 
 def _infra_ready() -> tuple[bool, str]:
@@ -115,16 +166,6 @@ def wait_for_infra_ready() -> bool:
         waited += INFRA_WAIT_POLL_S
 
 
-def wait_for_target_recency(last_injection_time: float | None) -> None:
-    if last_injection_time is None:
-        return
-    elapsed = time.time() - last_injection_time
-    if elapsed < TARGET_RECENCY_WINDOW_S:
-        remaining = TARGET_RECENCY_WINDOW_S - elapsed
-        print(f"  waiting {remaining:.0f}s so the target's last fault clears the recency window")
-        time.sleep(remaining)
-
-
 def run(script: str, extra_args: list[str] | None = None):
     cmd = [sys.executable, script] + (extra_args or [])
     # start_new_session=True (2026-07-28): launches the child in its OWN
@@ -162,67 +203,3 @@ def _update_timings(fault_class: str, elapsed_s: float) -> None:
     timings[fault_class] = stats
 
     TIMINGS_PATH.write_text(json.dumps(timings, indent=2) + "\n")
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--class", dest="fault_class", required=True,
-        choices=[
-            "crash-loop", "oom", "disk-full", "network-latency", "memory-leak",
-            "connection-pool-exhaustion", "network-partition", "init-failure",
-            "session-cart-failure", "cpu-throttling", "under-provisioned-replicas",
-            "bad-rollout",
-        ]
-    )
-    parser.add_argument("num_episodes", nargs="?", type=int, default=20)
-    args = parser.parse_args()
-
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    log_path = OUTPUT_DIR / f"run_episodes_{args.fault_class}_{timestamp}.log"
-    log_f = open(log_path, "w", encoding="utf-8")
-    real_stdout = sys.stdout
-    sys.stdout = _Tee(real_stdout, log_f)
-    print(f"(full log also being written to {log_path})")
-
-    episode_durations_s: list[float] = []
-    last_injection_time: float | None = None
-
-    for i in range(1, args.num_episodes + 1):
-        episode_start = time.monotonic()
-        print(f"\n--- Episode {i}/{args.num_episodes} ({args.fault_class}) ---")
-
-        if not wait_for_infra_ready():
-            print("Infra unreachable for too long, stopping.")
-            break
-
-        wait_for_target_recency(last_injection_time)
-        last_injection_time = time.time()
-
-        if not run("injector.py", ["--class", args.fault_class]):
-            print("Injector failed, stopping.")
-            break
-
-        time.sleep(SETTLE_SECONDS)
-
-        if not run("scorer.py"):
-            print("Scorer failed, stopping.")
-            break
-
-        episode_elapsed_s = time.monotonic() - episode_start
-        episode_durations_s.append(episode_elapsed_s)
-        _update_timings(args.fault_class, episode_elapsed_s)
-        print(f"--- Episode {i} took {episode_elapsed_s:.1f}s ---")
-
-    if episode_durations_s:
-        avg_s = sum(episode_durations_s) / len(episode_durations_s)
-        print(
-            f"\n=== {len(episode_durations_s)} episode(s) of '{args.fault_class}' "
-            f"completed. avg={avg_s:.1f}s min={min(episode_durations_s):.1f}s "
-            f"max={max(episode_durations_s):.1f}s total={sum(episode_durations_s):.1f}s ==="
-        )
-
-
-if __name__ == "__main__":
-    main()
