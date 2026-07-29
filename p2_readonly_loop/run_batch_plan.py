@@ -350,7 +350,18 @@ def run_one_episode(fault_class: str, last_fault_time: dict) -> bool:
 
     time.sleep(SETTLE_SECONDS)
 
-    if not run_script("scorer.py"):
+    # Real fix, 2026-07-29: p2_readonly_loop/scorer.py (port 8000, /diagnose)
+    # never writes episode_snapshots -- only p3_trust_action/p3_scorer.py
+    # (port 8001, /handle) does. Every report-only class generated via this
+    # batch runner (network-latency, network-partition, session-cart-failure,
+    # init-failure, memory-leak) had ZERO recorded tool_output snapshots as a
+    # result, confirmed via a direct DB check -- not a fault-class issue,
+    # purely this script calling the wrong scorer. p3_scorer.py already
+    # handles report-only classes correctly (diagnoses + scores them without
+    # attempting any action unless the class is actually trusted to act), so
+    # this is a straight swap, not a new capability. Requires p3_agent.py
+    # (port 8001) running, not just p2's agent.py (port 8000).
+    if not run_script("../p3_trust_action/p3_scorer.py"):
         print("Scorer failed, stopping.")
         return False
 

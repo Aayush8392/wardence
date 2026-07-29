@@ -77,6 +77,7 @@ p5_dl_hardening/check_isolation_forest_sparsity.py
 p5_dl_hardening/check_pipeline_fault_contamination.py
 p5_dl_hardening/check_track_b_hmm_fit_quality.py
 p5_dl_hardening/check_track_b_regime_shift.py
+p2_readonly_loop/llm_smoke_test.py
 
 # Phase D run output -- regenerated per run, not source
 p2_readonly_loop/phase_d_batch1.json
@@ -110,3 +111,6 @@ p3_trust_action/jwt_secret.txt
 
 # R2 credentials -- never committed
 p3_trust_action/.env
+
+# LLM provider API keys (Gemini/Groq/OpenRouter) -- never committed
+.env
