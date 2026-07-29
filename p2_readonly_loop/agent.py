@@ -23,6 +23,19 @@ from pydantic import BaseModel
 
 PROMETHEUS_URL = "http://localhost:9090"
 
+# p5_dl_hardening/detector_service.py -- plain hardcoded local constant,
+# matching PROMETHEUS_URL's own pattern (this project's standing local-
+# dev convention: manual port-forward/uvicorn per service, no env var or
+# config file for a same-machine local service).
+DETECTOR_URL = "http://localhost:8010"
+
+# Must be kept in sync with detector_service.py's SUPPORTED_SERVICES
+# (front-end/orders/user via DeepLog, catalogue via SPC, queue-master via
+# HMM) -- duplicated here rather than importing across p2/p5, matching
+# this file's own established convention of keeping each file self-
+# contained (see _parse_k6_p95_ms's docstring for the same reasoning).
+DL_DETECTOR_SERVICES = {"front-end", "orders", "user", "catalogue", "queue-master"}
+
 # Absolute threshold, not baseline-relative -- the agent only sees one
 # snapshot per /diagnose call, unlike injector.py's own verification
 # which has a genuine before/after baseline to compare to. Sock Shop's
@@ -165,6 +178,31 @@ export default function () {{
         if p95 is not None:
             return p95
     return None
+
+
+def call_dl_detector(service: str) -> dict | None:
+    """Calls detector_service.py's real POST /detect for one of the 5
+    services with real log-based coverage (DeepLog/HMM/SPC, see
+    DL_DETECTOR_SERVICES above) -- a generic anomaly flag, NOT a
+    per-class classifier (it can say "something's off on this service,"
+    never which specific fault class). Same error-handling shape as
+    probe_catalogue_capacity: any failure (service unreachable, timeout,
+    a real "insufficient_data" response because too few live events were
+    pulled) returns None rather than raising, so a flaky/cold detector
+    service degrades diagnosis back to Prometheus-only, never crashes
+    it."""
+    try:
+        resp = requests.post(
+            f"{DETECTOR_URL}/detect", json={"service": service}, timeout=15
+        )
+    except requests.exceptions.RequestException:
+        return None
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    if data.get("status") == "insufficient_data":
+        return None
+    return data
 
 app = FastAPI()
 
@@ -776,6 +814,26 @@ def diagnose(req: DiagnoseRequest):
                 "confidence": 0.6,
                 "reasoning": f"active capacity probe against catalogue showed p95={probe_p95_ms}ms "
                              f">= {UNDER_PROVISIONED_PROBE_THRESHOLD_MS}ms threshold (stubbed rule, not LLM)",
+            }
+    # DL/HMM/SPC fallback (call_dl_detector) -- only consulted if Prometheus's
+    # own rules (and, for catalogue, the capacity probe above) still found
+    # nothing. Deliberately reports a single generic, unclassified diagnosis
+    # rather than guessing a specific fault class from an anomaly flag alone
+    # (option A, decided 2026-07-29 -- see call_dl_detector's docstring: this
+    # detector cannot tell WHICH class it is, only that something is off, and
+    # building per-service class-guessing logic into the stub isn't worth it
+    # given the whole stub gets replaced once the real LLM is wired in).
+    if result["diagnosis"] == "no anomaly detected" and req.target in DL_DETECTOR_SERVICES:
+        detector_result = call_dl_detector(req.target)
+        tool_output["dl_detector_result"] = detector_result
+        if detector_result is not None and detector_result.get("is_anomalous"):
+            result = {
+                "diagnosis": "log-anomaly detected (unclassified)",
+                "confidence": 0.5,
+                "reasoning": f"DL/HMM/SPC detector flagged {req.target} as anomalous "
+                             f"(track={detector_result.get('track')}) with no Prometheus-based "
+                             f"signal to explain it -- real anomaly, but this generic detector "
+                             f"cannot identify which specific fault class it is (stubbed rule, not LLM)",
             }
     return {
         "target": req.target,

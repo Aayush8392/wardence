@@ -42,6 +42,8 @@ query_prometheus = _p2_agent.query_prometheus
 stub_diagnose = _p2_agent.stub_diagnose
 probe_catalogue_capacity = _p2_agent.probe_catalogue_capacity
 UNDER_PROVISIONED_PROBE_THRESHOLD_MS = _p2_agent.UNDER_PROVISIONED_PROBE_THRESHOLD_MS
+call_dl_detector = _p2_agent.call_dl_detector
+DL_DETECTOR_SERVICES = _p2_agent.DL_DETECTOR_SERVICES
 
 app = FastAPI()
 
@@ -120,6 +122,23 @@ def handle(req: HandleRequest):
                 "confidence": 0.6,
                 "reasoning": f"active capacity probe against catalogue showed p95={probe_p95_ms}ms "
                              f">= {UNDER_PROVISIONED_PROBE_THRESHOLD_MS}ms threshold (stubbed rule, not LLM)",
+            }
+    # DL/HMM/SPC fallback -- mirrors agent.py's own /diagnose endpoint
+    # exactly (see call_dl_detector's docstring for the full reasoning):
+    # a generic, unclassified anomaly flag, never mapped into ACTION_MAP
+    # below, so it always stays report-only by construction, same as any
+    # other class with no entry there.
+    if diagnosis_result["diagnosis"] == "no anomaly detected" and req.target in DL_DETECTOR_SERVICES:
+        detector_result = call_dl_detector(req.target)
+        tool_output["dl_detector_result"] = detector_result
+        if detector_result is not None and detector_result.get("is_anomalous"):
+            diagnosis_result = {
+                "diagnosis": "log-anomaly detected (unclassified)",
+                "confidence": 0.5,
+                "reasoning": f"DL/HMM/SPC detector flagged {req.target} as anomalous "
+                             f"(track={detector_result.get('track')}) with no Prometheus-based "
+                             f"signal to explain it -- real anomaly, but this generic detector "
+                             f"cannot identify which specific fault class it is (stubbed rule, not LLM)",
             }
     predicted = diagnosis_result["diagnosis"]
 
