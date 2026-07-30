@@ -47,18 +47,44 @@ from typing import Optional
 
 from actions import ALLOWED_ACTIONS, DEFAULT_NAMESPACE
 
-# Kubernetes resource quantity format: an integer or decimal, optionally
-# followed by a real k8s suffix. Deliberately conservative -- covers
-# every real limit value this project has ever used (see actions.py's
-# own patch_memory_limit/patch_cpu_limit callers), not the full k8s
-# quantity grammar (no exponent form, no binary-vs-decimal edge cases).
-_QUANTITY_RE = re.compile(r"^\d+(\.\d+)?(Ki|Mi|Gi|Ti|m)?$")
-
+# Real gap found via Kimi review 12 (2026-07-30), confirmed against this
+# file directly before fixing: the original _is_valid_quantity checked
+# SHAPE only (does it look like "500Mi"), never MAGNITUDE -- so
+# "999999Gi" passed cleanly. The validator's whole job is to catch a
+# syntactically-valid-but-operationally-absurd value before it ever
+# reaches the real cage; a shape-only check doesn't do that. Split into
+# two tool-specific quantity validators (memory vs. cpu use different
+# suffix grammars and real sane ranges for THIS lab's node) with a real
+# magnitude cap, generous enough for any real legitimate fix on this
+# project's cluster (node allocatable ~9.7Gi memory) but rejecting an
+# obviously-hallucinated value.
 MAX_REPLICAS = 20
+MAX_MEMORY_LIMIT_MI = 2048  # 2Gi -- generous vs. every real limit this project has ever used (200-400Mi)
+MAX_CPU_LIMIT_M = 2000  # 2 cores -- generous vs. every real limit this project has ever used (300-600m)
+
+_MEMORY_QUANTITY_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti)?$")
+_CPU_QUANTITY_RE = re.compile(r"^(\d+(?:\.\d+)?)(m)?$")
+_MI_FACTORS = {"": 1 / (1024 * 1024), "Ki": 1 / 1024, "Mi": 1, "Gi": 1024, "Ti": 1024 * 1024}
 
 
-def _is_valid_quantity(value) -> bool:
-    return isinstance(value, str) and bool(_QUANTITY_RE.match(value))
+def _is_valid_memory_quantity(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    match = _MEMORY_QUANTITY_RE.match(value)
+    if not match:
+        return False
+    mi_value = float(match.group(1)) * _MI_FACTORS[match.group(2) or ""]
+    return 0 < mi_value <= MAX_MEMORY_LIMIT_MI
+
+
+def _is_valid_cpu_quantity(value) -> bool:
+    if not isinstance(value, str):
+        return False
+    match = _CPU_QUANTITY_RE.match(value)
+    if not match:
+        return False
+    millicores = float(match.group(1)) * (1 if match.group(2) == "m" else 1000)
+    return 0 < millicores <= MAX_CPU_LIMIT_M
 
 
 def _is_valid_replicas(value) -> bool:
@@ -80,12 +106,12 @@ TOOL_SCHEMAS = {
     "patch_memory_limit": {
         "name": _is_nonempty_str,
         "container": _is_nonempty_str,
-        "limit": _is_valid_quantity,
+        "limit": _is_valid_memory_quantity,
     },
     "patch_cpu_limit": {
         "name": _is_nonempty_str,
         "container": _is_nonempty_str,
-        "limit": _is_valid_quantity,
+        "limit": _is_valid_cpu_quantity,
     },
     "scale_deployment": {
         "name": _is_nonempty_str,

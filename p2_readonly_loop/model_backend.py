@@ -320,13 +320,37 @@ PROVIDER_CHAIN = [
 
 
 def call_one(entry: dict, prompt: str, timeout: int = 30) -> Union[LLMResult, LLMFailure]:
-    """Call a single provider-chain entry. Returns LLMResult or LLMFailure -- never raises on a normal API-level failure."""
+    """
+    Call a single provider-chain entry. Returns LLMResult or LLMFailure --
+    never raises on a normal API-level failure.
+
+    Step 5 (quota_tracker.py) wired in here, the one real choke point
+    every caller (llm_replay_test.py, react_agent.py) already goes
+    through -- checks quota BEFORE sending a real request (short-
+    circuits to a "quota_exhausted" failure with zero real request sent
+    if already at 100% today, per the locked graceful-degradation
+    policy: never silently retry into a provider already known to be
+    dead), and records real usage only for a request that actually got
+    sent.
+    """
+    from quota_tracker import check_quota, record_call  # local import: avoids a hard dependency for any caller that only wants call_chain's pure LLM logic, e.g. a future unit test with no DB
+
+    quota = check_quota(entry["provider"], entry["model"])
+    if quota["status"] == "exhausted":
+        return LLMFailure(
+            entry["provider"], entry["model"], "quota_exhausted",
+            f"real daily limit reached ({quota['used']}/{quota['limit']}) -- no request sent",
+        )
+
     if entry["format"] == "gemini_native":
-        return _call_gemini(entry["model"], prompt, timeout)
-    return _call_openai_compat(
-        entry["provider"], entry["base_url"], entry["model"], prompt, timeout,
-        entry.get("max_tokens", 500), entry["tier"],
-    )
+        result = _call_gemini(entry["model"], prompt, timeout)
+    else:
+        result = _call_openai_compat(
+            entry["provider"], entry["base_url"], entry["model"], prompt, timeout,
+            entry.get("max_tokens", 500), entry["tier"],
+        )
+    record_call(entry["provider"], entry["model"])
+    return result
 
 
 def call_chain(prompt: str, chain: Optional[list] = None, timeout: int = 30):
