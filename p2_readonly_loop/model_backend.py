@@ -1,0 +1,357 @@
+"""
+Phase H provider-backend abstraction (step 1 of the locked 6-step build).
+
+Locked policy this file implements (wardence_context.md's Model Strategy
+section, Kimi review 09):
+- episode-scoped provider lock: no mid-episode switching. call_chain()
+  returns a typed failure per provider, never a half-answer -- the caller
+  (the ReAct loop, step 3) is responsible for retrying the WHOLE episode
+  against the next provider, since only the loop knows what "from step 0"
+  means.
+- intra-provider fallback before crossing providers (consecutive Groq
+  entries below are tried before ever reaching OpenRouter).
+- temperature=0 for every trust-ladder-scored call.
+- provider-aware confidence extraction, tagged with its source
+  ("logprob" for Gemini's real avgLogprobs, "self_reported" for
+  Groq/OpenRouter) -- never mixed in the same calibration bin without
+  the tag.
+- real model IDs verified live against provider accounts 2026-07-29, not
+  guessed from stale docs. Re-verify before trusting these again if this
+  file goes untouched for a long stretch (see the Gemini preview-model
+  deprecation history in wardence_context.md -- ~4.5-8 months of real
+  life, only 2 weeks' minimum shutdown notice).
+
+NOT in scope here (later Phase H steps, do not assume done):
+- retry-the-whole-episode orchestration (step 3, needs episode/loop context)
+- the semantic tool-call validator in front of the RBAC cage (step 2)
+- model-tier gating enforcement for auto-fix promotion streaks (step 4 --
+  `tier` is exposed on every result here for step 4 to consume, not
+  enforced in this file)
+- token/quota budget tracking + the Gemini staleness guard (step 5)
+"""
+import json
+import math
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Union
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+TEMPERATURE = 0  # locked: determinism for every trust-ladder-scored call
+
+
+@dataclass
+class LLMResult:
+    text: str
+    parsed: Optional[dict]
+    provider: str
+    model: str
+    tier: str  # "primary" | "fallback" -- consumed by step 4, not enforced here
+    confidence: Optional[float]
+    confidence_source: Optional[str]  # "logprob" | "self_reported"
+    raw: dict
+
+
+@dataclass
+class LLMFailure:
+    provider: str
+    model: str
+    failure_type: str  # "timeout" | "rate_limited" | "bad_response" | "parse_failure"
+    detail: str
+
+
+def _extract_json(text: str) -> Optional[dict]:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def _call_gemini(model: str, prompt: str, timeout: int) -> Union[LLMResult, LLMFailure]:
+    key = os.environ["GEMINI_API_KEY"]
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": TEMPERATURE,
+                    # confirmed live 2026-07-29: gemini-3-flash-preview
+                    # honors thinkingBudget:0 (drops to zero thinking
+                    # tokens); the "-latest" alias currently resolves to
+                    # a model that REJECTS this with a hard 400 -- never
+                    # point this chain at the alias.
+                    "thinkingConfig": {"thinkingBudget": 0},
+                    # avgLogprobs is NOT returned unless explicitly
+                    # requested -- without this, the logprob-confidence
+                    # branch below is dead code and every call silently
+                    # falls back to self-reported (found live, 2026-07-29).
+                    "responseLogprobs": True,
+                    "logprobs": 1,
+                },
+            },
+            timeout=timeout,
+        )
+    except requests.exceptions.Timeout:
+        return LLMFailure("gemini", model, "timeout", f"timed out after {timeout}s")
+    except requests.exceptions.RequestException as e:
+        return LLMFailure("gemini", model, "bad_response", str(e))
+
+    if resp.status_code == 429:
+        return LLMFailure("gemini", model, "rate_limited", resp.text[:500])
+    if resp.status_code >= 500:
+        return LLMFailure("gemini", model, "bad_response", f"HTTP {resp.status_code}: {resp.text[:500]}")
+    if resp.status_code != 200:
+        return LLMFailure("gemini", model, "bad_response", f"HTTP {resp.status_code}: {resp.text[:500]}")
+
+    data = resp.json()
+    try:
+        candidate = data["candidates"][0]
+        text = candidate["content"]["parts"][0]["text"]
+    except (KeyError, IndexError):
+        return LLMFailure("gemini", model, "bad_response", json.dumps(data)[:500])
+
+    parsed = _extract_json(text)
+    if parsed is None:
+        return LLMFailure("gemini", model, "parse_failure", text[:500])
+
+    # Real logprob-derived confidence per locked policy: Gemini exposes
+    # avgLogprobs (a log-probability); convert to a 0-1 confidence via
+    # exp(avg_logprob). Falls back to the model's own self-reported
+    # confidence field only if avgLogprobs isn't present on the response.
+    confidence = None
+    confidence_source = None
+    avg_logprob = candidate.get("avgLogprobs")
+    if avg_logprob is not None:
+        confidence = math.exp(avg_logprob)
+        confidence_source = "logprob"
+    elif isinstance(parsed.get("confidence"), (int, float)):
+        confidence = parsed["confidence"]
+        confidence_source = "self_reported"
+
+    return LLMResult(
+        text=text, parsed=parsed, provider="gemini", model=model, tier="primary",
+        confidence=confidence, confidence_source=confidence_source, raw=data,
+    )
+
+
+def _call_openai_compat(
+    provider: str, base_url: str, model: str, prompt: str, timeout: int, max_tokens: int, tier: str,
+) -> Union[LLMResult, LLMFailure]:
+    key_env = {
+        "groq": "GROQ_API_KEY", "openrouter": "OPENROUTER_API_KEY",
+        "cloudflare": "CLOUDFLARE_API_KEY", "deepinfra": "DEEPINFRA_API_KEY",
+    }[provider]
+    key = os.environ[key_env]
+    # Real logprobs confirmed live 2026-07-30 for Cloudflare/DeepInfra
+    # (gemma-4-26b-a4b-it, kimi-k2.6, Nemotron-3-Nano-30B-A3B) -- unlike
+    # Groq/OpenRouter, which strip/never return it. Requesting it
+    # unconditionally is harmless for providers that ignore it (Groq
+    # errors on unknown params instead, so keep it OFF for groq/
+    # openrouter specifically -- confirmed today Groq documents logprobs
+    # as unsupported).
+    request_logprobs = provider in ("cloudflare", "deepinfra")
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": TEMPERATURE,
+        "max_tokens": max_tokens,
+    }
+    if request_logprobs:
+        body["logprobs"] = True
+        body["top_logprobs"] = 1
+    try:
+        resp = requests.post(
+            base_url,
+            headers={"Authorization": f"Bearer {key}"},
+            json=body,
+            timeout=timeout,
+        )
+    except requests.exceptions.Timeout:
+        return LLMFailure(provider, model, "timeout", f"timed out after {timeout}s")
+    except requests.exceptions.RequestException as e:
+        return LLMFailure(provider, model, "bad_response", str(e))
+
+    if resp.status_code == 429:
+        return LLMFailure(provider, model, "rate_limited", resp.text[:500])
+    if resp.status_code >= 500:
+        return LLMFailure(provider, model, "bad_response", f"HTTP {resp.status_code}: {resp.text[:500]}")
+    if resp.status_code != 200:
+        return LLMFailure(provider, model, "bad_response", f"HTTP {resp.status_code}: {resp.text[:500]}")
+
+    data = resp.json()
+    try:
+        choice = data["choices"][0]
+        message = choice["message"]
+        text = message.get("content")
+    except (KeyError, IndexError):
+        return LLMFailure(provider, model, "bad_response", json.dumps(data)[:500])
+
+    if not text:
+        # Confirmed real failure mode (live-tested 2026-07-29): gpt-oss
+        # models can consume the ENTIRE max_tokens budget on hidden
+        # reasoning, leaving content null with no visible answer at all.
+        reasoning_tokens = (
+            data.get("usage", {}).get("completion_tokens_details", {}).get("reasoning_tokens")
+        )
+        return LLMFailure(
+            provider, model, "bad_response",
+            f"empty content (reasoning_tokens={reasoning_tokens}, raw={json.dumps(data)[:300]})",
+        )
+
+    parsed = _extract_json(text)
+    if parsed is None:
+        return LLMFailure(provider, model, "parse_failure", text[:500])
+
+    # Real avgLogprobs-derived confidence for Cloudflare/DeepInfra (same
+    # derivation as Gemini's -- confidence = exp(avg per-token logprob)),
+    # confirmed live 2026-07-30. Groq/OpenRouter never get real logprobs
+    # (request_logprobs is False for them), so they always fall back to
+    # the model's own self-reported confidence field.
+    confidence = None
+    confidence_source = None
+    logprobs_content = (choice.get("logprobs") or {}).get("content") if request_logprobs else None
+    if logprobs_content:
+        avg_logprob = sum(t["logprob"] for t in logprobs_content) / len(logprobs_content)
+        confidence = math.exp(avg_logprob)
+        confidence_source = "logprob"
+    elif isinstance(parsed.get("confidence"), (int, float)):
+        confidence = parsed["confidence"]
+        confidence_source = "self_reported"
+
+    return LLMResult(
+        text=text, parsed=parsed, provider=provider, model=model, tier=tier,
+        confidence=confidence, confidence_source=confidence_source, raw=data,
+    )
+
+
+# Real, FINAL provider chain -- locked 2026-07-30 after an extensive
+# real search across ~25 candidate providers (see wardence_context.md's
+# Model Strategy section for the full accounting: what was tested,
+# real accuracy numbers, real quota/cost, and what was ruled out and
+# why). Order here reflects real cost-efficiency, NOT the `tier` tag:
+#
+# 1. gemma-4-26b-a4b-it (Cloudflare, FREE, ~90 real episodes/day) --
+#    tried first specifically because it's free and ongoing, preserving
+#    both the free daily pool and Nemotron's finite paid credit for
+#    when actually needed.
+# 2. Nemotron-3-Nano-30B-A3B (DeepInfra, PAID, real overflow) -- a
+#    one-time ~$5 credit real-measured at ~$0.000674/episode
+#    (~7,400 episodes total, does NOT reset daily unlike #1). Real
+#    accuracy 6/6, matching gemma's.
+# 3. gemini-3-flash-preview (Gemini, FREE but thin, ~20 req/day) --
+#    real logprobs, but a small preview-model quota, likely already
+#    thin from testing.
+# 4. kimi-k2.6 (Cloudflare, FREE, SAME pool as #1) -- last, since it
+#    shares gemma's exact daily budget (if gemma failed on quota
+#    exhaustion, kimi would too); real accuracy 6/6 but a real 20%
+#    500-error rate seen in burst testing, so tier=fallback despite
+#    equal accuracy.
+#
+# `tier` (primary/fallback, consumed by step 4's promotion-streak gate,
+# not enforced here) is a SEPARATE dimension from list order: gemma,
+# Nemotron, and gemini are all tier="primary" (all confirmed strong,
+# real confidence signals), kimi is tier="fallback" specifically for
+# its real reliability flakiness, not its accuracy.
+#
+# Real, previously-considered-then-ruled-out models NOT in this chain,
+# logged here so they aren't silently re-added later without re-reading
+# why: reka-edge (3/6 accuracy), Cloudflare's llama-3.2-3b-instruct
+# (3/6) and gemma-2b-it-lora (1/6, systematically biased toward
+# "crash-loop"), DeepInfra's Meta-Llama-3.1-8B-Instruct-Turbo (4/6),
+# NVIDIA's llama-3.1-8b-instruct (4/6, also a finite one-time quota).
+# Groq/OpenRouter models below are real, high-volume, SELF-REPORTED-
+# confidence contributors -- they still carry the bulk of real episode
+# volume despite the logprobs roster above, per the locked calibration-
+# layer design (Kimi review 11) that makes their confidence honest.
+PROVIDER_CHAIN = [
+    {
+        "provider": "cloudflare", "model": "@cf/google/gemma-4-26b-a4b-it",
+        "format": "openai_compat", "tier": "primary",
+        "base_url": f"https://api.cloudflare.com/client/v4/accounts/{os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')}/ai/v1/chat/completions",
+        "max_tokens": 2000,
+    },
+    {
+        "provider": "deepinfra", "model": "nvidia/Nemotron-3-Nano-30B-A3B",
+        "format": "openai_compat", "tier": "primary",
+        "base_url": "https://api.deepinfra.com/v1/openai/chat/completions",
+        "max_tokens": 2000,
+    },
+    {
+        "provider": "gemini", "model": "gemini-3-flash-preview",
+        "format": "gemini_native", "tier": "primary",
+    },
+    {
+        "provider": "cloudflare", "model": "@cf/moonshotai/kimi-k2.6",
+        "format": "openai_compat", "tier": "fallback",
+        "base_url": f"https://api.cloudflare.com/client/v4/accounts/{os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')}/ai/v1/chat/completions",
+        "max_tokens": 2000,
+    },
+    {
+        "provider": "groq", "model": "llama-3.3-70b-versatile",
+        "format": "openai_compat", "tier": "fallback",
+        "base_url": "https://api.groq.com/openai/v1/chat/completions",
+        "max_tokens": 500,
+    },
+    {
+        # gpt-oss models reason internally; verified live that a small
+        # max_tokens can let reasoning eat the whole budget before any
+        # visible answer is written -- kept generous here on purpose.
+        "provider": "groq", "model": "openai/gpt-oss-120b",
+        "format": "openai_compat", "tier": "fallback",
+        "base_url": "https://api.groq.com/openai/v1/chat/completions",
+        "max_tokens": 800,
+    },
+    {
+        "provider": "openrouter", "model": "openai/gpt-oss-20b:free",
+        "format": "openai_compat", "tier": "fallback",
+        "base_url": "https://openrouter.ai/api/v1/chat/completions",
+        "max_tokens": 800,
+    },
+]
+
+
+def call_one(entry: dict, prompt: str, timeout: int = 30) -> Union[LLMResult, LLMFailure]:
+    """Call a single provider-chain entry. Returns LLMResult or LLMFailure -- never raises on a normal API-level failure."""
+    if entry["format"] == "gemini_native":
+        return _call_gemini(entry["model"], prompt, timeout)
+    return _call_openai_compat(
+        entry["provider"], entry["base_url"], entry["model"], prompt, timeout,
+        entry.get("max_tokens", 500), entry["tier"],
+    )
+
+
+def call_chain(prompt: str, chain: Optional[list] = None, timeout: int = 30):
+    """
+    Try each entry in the chain in order, stopping at the first success.
+
+    This is ONE diagnosis attempt against whichever provider succeeds --
+    it does NOT retry a half-completed reasoning trace across providers.
+    There is no reasoning trace to preserve yet (step 1 is single-shot);
+    step 3's ReAct loop is where the real episode-scoped-lock behavior
+    (abort the WHOLE episode, retry from step 0 against the next
+    provider) actually gets implemented, since only the loop knows what
+    "from step 0" means.
+
+    Returns (LLMResult, attempts) on success, or (None, attempts) if
+    every entry in the chain failed, where `attempts` is the list of
+    LLMFailure objects in the order tried. The caller decides what
+    "every provider failed" means (report-only fallback, an
+    LLM_UNAVAILABLE episode status, etc.) -- not decided in this file.
+    """
+    chain = chain if chain is not None else PROVIDER_CHAIN
+    attempts = []
+    for entry in chain:
+        result = call_one(entry, prompt, timeout=timeout)
+        if isinstance(result, LLMResult):
+            return result, attempts
+        attempts.append(result)
+    return None, attempts

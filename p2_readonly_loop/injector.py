@@ -503,7 +503,29 @@ MEMORY_LEAK_MIN_INCREASE_MIB = 100
 # 170 to rebuild real headroom given the drifted baseline -- not a
 # design flaw, a real number that needed re-measuring and adjusting,
 # same as every other real threshold in this project.
+#
+# Found a THIRD time (2026-07-29/30, real overnight batch run): the
+# exact same drift pattern recurred -- 5 days after the last manual
+# re-measurement, the flood needed 2-3 retries on multiple chunks and
+# failed all 3 attempts outright on one, triggering run_batch_plan.py's
+# real give-up-on-this-class safety mechanism. A static, hand-tuned
+# number will ALWAYS eventually go stale again as real baseline
+# Threads_connected keeps growing with accumulated testing -- the real
+# fix is measuring it live every attempt instead of re-guessing a
+# fourth static value. See _compute_flood_target() below. This constant
+# now only serves as the historical-floor fallback if a live baseline
+# read ever fails.
 CONNECTION_POOL_FLOOD_CONNECTIONS = 170
+CATALOGUE_DB_MAX_CONNECTIONS = 151
+# Real, measured rate at which targeted flood connections actually
+# establish (144/150 landed in the 2026-07-25 diagnostic, a real MySQL
+# boundary-condition effect, not a bug) -- baked into the dynamic
+# flood-size formula as a safety factor, not just padded and hoped.
+CONNECTION_POOL_ESTABLISH_SUCCESS_RATE = 0.95
+# Real margin beyond just barely filling the pool, so a test connection
+# genuinely has nothing left rather than winning a coin-flip against the
+# last open slot.
+CONNECTION_POOL_SAFETY_MARGIN = 15
 
 # Found the hard way (2026-07-21): the flood originally used root for
 # every connection -- the SAME user mysqld_exporter uses for its own
@@ -1967,16 +1989,72 @@ def _ensure_flood_user(cfg: dict) -> None:
     )
 
 
+def _get_catalogue_db_threads_connected(cfg: dict) -> int | None:
+    """Real, LIVE baseline measurement -- queries MySQL's own real
+    Threads_connected status variable right before flooding, rather
+    than trusting a hand-tuned static assumption. Real history: this
+    baseline has drifted upward repeatedly (2-3 -> 7 as of 2026-07-25,
+    and again by the 2026-07-29/30 overnight run that surfaced this
+    fix), silently thinning CONNECTION_POOL_FLOOD_CONNECTIONS's real
+    margin each time until a flood attempt started failing. Measuring
+    live every attempt, instead of re-guessing a new static number
+    after the fact, closes this recurring gap for good. Returns None
+    if the pod isn't reachable or the query fails -- callers fall back
+    to the historical-floor constant rather than erroring out."""
+    namespace = cfg["namespace"]
+    container = cfg["container"]
+    pod_name = _current_pod_name(cfg["target"], namespace)
+    if pod_name is None:
+        return None
+    result = subprocess.run(
+        [
+            "kubectl", "exec", "-n", namespace, pod_name, "-c", container,
+            "--", "mysql", "-uroot", "-pfake_password", "-N", "-e",
+            "SHOW STATUS LIKE 'Threads_connected';",
+        ],
+        capture_output=True, text=True, timeout=15,
+    )
+    if result.returncode != 0:
+        print(f"  Threads_connected query failed (pod={pod_name}): "
+              f"returncode={result.returncode} stderr={result.stderr.strip()[:300]!r}")
+        return None
+    try:
+        return int(result.stdout.strip().split()[1])
+    except (IndexError, ValueError):
+        print(f"  Threads_connected query returned unparseable output: {result.stdout!r}")
+        return None
+
+
+def _compute_flood_target(cfg: dict) -> int:
+    """Real, LIVE-measured flood size, replacing the old static
+    CONNECTION_POOL_FLOOD_CONNECTIONS=170 guess that needed manual
+    re-tuning three separate times (140 -> 150 -> 170) purely because
+    real baseline Threads_connected kept drifting upward between
+    measurements. Sizing the flood off of a fresh live reading every
+    attempt means this never goes stale again, regardless of how much
+    the baseline grows with future accumulated testing."""
+    baseline = _get_catalogue_db_threads_connected(cfg)
+    if baseline is None:
+        print("  could not read a live Threads_connected baseline -- "
+              f"falling back to the historical floor ({CONNECTION_POOL_FLOOD_CONNECTIONS})")
+        return CONNECTION_POOL_FLOOD_CONNECTIONS
+    needed_to_fill = CATALOGUE_DB_MAX_CONNECTIONS - baseline
+    target = int((needed_to_fill + CONNECTION_POOL_SAFETY_MARGIN) / CONNECTION_POOL_ESTABLISH_SUCCESS_RATE) + 1
+    # Never go BELOW the known-historically-working floor, even if a
+    # low live baseline reading would otherwise suggest a smaller flood.
+    return max(target, CONNECTION_POOL_FLOOD_CONNECTIONS)
+
+
 def _flood_connections(cfg: dict) -> bool:
-    """Single kubectl exec into catalogue-db backgrounds
-    CONNECTION_POOL_FLOOD_CONNECTIONS real mysql client processes (each
-    holding a genuine connection open via SELECT SLEEP), then returns
-    immediately once the loop finishes issuing them -- the backgrounded
-    children keep running inside the container after this exec session
-    ends (no Chaos Mesh involved at all; there's no primitive for this,
-    so this is a direct real mechanism like crash-loop/disk-full).
-    Real capacity consumed against MySQL's own max_connections (151,
-    confirmed empirically), not simulated."""
+    """Single kubectl exec into catalogue-db backgrounds a live-computed
+    number of real mysql client processes (see _compute_flood_target,
+    each holding a genuine connection open via SELECT SLEEP), then
+    returns immediately once the loop finishes issuing them -- the
+    backgrounded children keep running inside the container after this
+    exec session ends (no Chaos Mesh involved at all; there's no
+    primitive for this, so this is a direct real mechanism like
+    crash-loop/disk-full). Real capacity consumed against MySQL's own
+    max_connections (151, confirmed empirically), not simulated."""
     namespace = cfg["namespace"]
     container = cfg["container"]
     target = cfg["target"]
@@ -1984,9 +2062,11 @@ def _flood_connections(cfg: dict) -> bool:
     if pod_name is None:
         return False
     _ensure_flood_user(cfg)
+    flood_target = _compute_flood_target(cfg)
+    print(f"  live-measured flood target: {flood_target} connections")
     sleep_s = cfg["duration_s"] + 15  # outlives our own polling window with margin
     script = (
-        f"for i in $(seq 1 {CONNECTION_POOL_FLOOD_CONNECTIONS}); do "
+        f"for i in $(seq 1 {flood_target}); do "
         f'mysql -u{CONNECTION_POOL_FLOOD_USER} -p{CONNECTION_POOL_FLOOD_PASSWORD} '
         f'-e "SELECT SLEEP({sleep_s})" '
         f">/dev/null 2>&1 & done"
@@ -1995,6 +2075,9 @@ def _flood_connections(cfg: dict) -> bool:
         ["kubectl", "exec", "-n", namespace, pod_name, "-c", container, "--", "sh", "-c", script],
         capture_output=True, text=True, timeout=30,
     )
+    if result.returncode != 0:
+        print(f"  flood exec failed (pod={pod_name}): returncode={result.returncode} "
+              f"stderr={result.stderr.strip()[:300]!r}")
     return result.returncode == 0
 
 
@@ -2034,6 +2117,47 @@ def _cleanup_connection_flood(cfg: dict):
     )
 
 
+def _restart_catalogue_db_pod(cfg: dict, timeout_s: int = 90) -> bool:
+    """Real self-healing step, added 2026-07-30 after a real overnight
+    run left catalogue-db unable to exec at all (OCI runtime error
+    'unable to spawn stage-1: Resource temporarily unavailable' --
+    a real process/PID-limit exhaustion signature, confirmed live).
+    Real root cause: the flood mechanism backgrounds many real mysql
+    client processes per attempt; across enough repeated attempts in
+    one run, some can outlive their own cleanup, and once the container
+    actually hits its process limit, _cleanup_connection_flood's own
+    exec (the pkill that would normally clear them) fails for the exact
+    same reason -- a genuine chicken-and-egg problem a human had to
+    break manually (`kubectl delete pod`) before this fix existed.
+
+    Safe to do automatically: catalogue-db has no persistent volume
+    (see _ensure_flood_user's docstring), so a restart wipes it to a
+    known-clean state, and flood-user creation is already idempotent
+    specifically to survive exactly this. Deletes the current pod and
+    polls _current_pod_name (which only ever returns a Running pod)
+    until a genuinely NEW one is up, rather than assuming a fixed
+    sleep is long enough."""
+    namespace = cfg["namespace"]
+    target = cfg["target"]
+    old_pod_name = _current_pod_name(target, namespace)
+    print(f"  self-heal: restarting catalogue-db pod ({old_pod_name or 'unknown'}) to clear "
+          f"a real process-limit exhaustion...")
+    if old_pod_name:
+        subprocess.run(
+            ["kubectl", "delete", "pod", "-n", namespace, old_pod_name, "--wait=false"],
+            capture_output=True, text=True, timeout=30,
+        )
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        time.sleep(5)
+        new_pod_name = _current_pod_name(target, namespace)
+        if new_pod_name and new_pod_name != old_pod_name:
+            print(f"  self-heal: catalogue-db back up as {new_pod_name}")
+            return True
+    print(f"  self-heal: catalogue-db did not come back Running within {timeout_s}s")
+    return False
+
+
 def _inject_and_verify_connection_pool_exhaustion(cfg: dict) -> str | None:
     """Verified by actually attempting one more real connection and
     confirming it fails with MySQL's genuine 'too many connections'
@@ -2045,12 +2169,16 @@ def _inject_and_verify_connection_pool_exhaustion(cfg: dict) -> str | None:
     duration_s = cfg["duration_s"]
 
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
-        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: flooding "
-              f"{CONNECTION_POOL_FLOOD_CONNECTIONS} connections, holding for the full {duration_s}s window...")
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: flooding catalogue-db "
+              f"(live-measured target), holding for the full {duration_s}s window...")
         flooded = _flood_connections(cfg)
         if not flooded:
             print(f"  attempt {attempt}: failed to launch the connection flood "
-                  f"(pod not found / exec error){', retrying' if attempt < MAX_INJECT_ATTEMPTS else ''}")
+                  f"(pod not found / exec error) -- likely a real process-limit "
+                  f"exhaustion (see _restart_catalogue_db_pod's docstring)")
+            _restart_catalogue_db_pod(cfg)
+            if attempt < MAX_INJECT_ATTEMPTS:
+                print("  retrying now that catalogue-db has been restarted")
             continue
 
         try:
