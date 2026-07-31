@@ -159,6 +159,8 @@ from pathlib import Path
 
 import requests
 
+from agent import OOM_STICKY_MAX_CONTAINER_AGE_S
+
 PROMETHEUS_URL = "http://localhost:9090"
 MAX_INJECT_ATTEMPTS = 3
 EFFECT_VERIFY_TIMEOUT_S = 35  # covers kube-state-metrics' ~30s scrape cycle
@@ -1224,7 +1226,8 @@ def _ensure_oom_baseline(cfg: dict):
     constant's docstring for why this is needed (a real successful fix
     permanently raises the limit, and nothing else reverts it).
     Idempotent: does nothing if the limit is already at baseline, which
-    is the common case (only matters right after a real fix cycle)."""
+    is the common case (only matters right after a real fix cycle).
+    """
     result = subprocess.run(
         [
             "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
@@ -1252,11 +1255,71 @@ def _ensure_oom_baseline(cfg: dict):
     )
     # Wait for the rollout to actually finish before injecting --
     # otherwise the stressor could target the OLD pod (still on the
-    # non-baseline limit) while it's mid-termination.
+    # non-baseline limit) while it's mid-termination. 300s not the old
+    # 180s -- real live bug found 2026-08-01: the app's own readiness
+    # probe has a 180s initial delay (see catalogue's real deployment
+    # spec), so a 180s rollout-status timeout races that exact number
+    # and can time out on a genuinely healthy rollout, not a stuck one.
     subprocess.run(
         [
             "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
-            "--timeout=180s",
+            "--timeout=300s",
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def _clear_stale_oom_sticky_flag(cfg: dict):
+    """Real, live-verified fix (2026-08-01) -- real incident: a real
+    under-provisioned-replicas episode fired on catalogue only ~4
+    minutes after a real oom episode got misdiagnosed as oom again,
+    because agent.py's sticky-OOM signal (bound to
+    container_start_time_seconds, deliberately kept true for
+    OOM_STICKY_MAX_CONTAINER_AGE_S=1200s so a delayed diagnosis still
+    catches a real kill) was still genuinely true. run_batch_plan.py's
+    own recency-wait guards against this in the batch runner, but a
+    real user firing faults from the live Operator frontend has no
+    schedule to protect it -- called from main() below (not from
+    run_batch_plan.py-only _ensure_oom_baseline) specifically because
+    main() is the one real entry point EVERY trigger path shares.
+
+    Queries the EXACT same sticky-OOM PromQL agent.py's own
+    oom_sticky_query uses, and if it's genuinely still active, forces a
+    real rollout restart to clear it (a fresh pod has no termination
+    history to match "OOMKilled" against at all) rather than passively
+    waiting out the full 1200s. Live-verified 2026-08-01: triggered a
+    real oom episode, confirmed the sticky query matched, ran a real
+    rollout restart, confirmed the same query returned empty afterward
+    -- not just theorized. Cheap no-op in the common case (query empty),
+    so safe to call unconditionally on every real episode, not just
+    ones that happen to be oom."""
+    query = (
+        f'kube_pod_container_status_last_terminated_reason{{namespace="{cfg["namespace"]}", '
+        f'pod=~"{cfg["target"]}-[^-]+-[^-]+$", reason="OOMKilled"}} == 1 '
+        f'and on(namespace, pod, container) ((time() - container_start_time_seconds'
+        f'{{namespace="{cfg["namespace"]}", pod=~"{cfg["target"]}-[^-]+-[^-]+$"}}) '
+        f'< {OOM_STICKY_MAX_CONTAINER_AGE_S})'
+    )
+    try:
+        resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()["data"]["result"]
+    except requests.RequestException:
+        return  # real Prometheus hiccup -- never block/crash the batch over a visibility check
+
+    if not result:
+        return
+
+    print(f"  {cfg['target']}'s sticky-OOM diagnostic signal is still active from a prior real "
+          f"kill -- restarting to clear it before any other class diagnoses this target...")
+    subprocess.run(
+        ["kubectl", "rollout", "restart", f"deployment/{cfg['target']}", "-n", cfg["namespace"]],
+        capture_output=True, text=True,
+    )
+    subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=300s",
         ],
         capture_output=True, text=True,
     )
@@ -2352,6 +2415,16 @@ def main():
 
     fault_class = args.fault_class
     cfg = FAULT_CONFIG[fault_class]
+
+    # Real, live-verified fix, 2026-08-01 -- see _clear_stale_oom_sticky_flag's
+    # own docstring for the full incident. Placed HERE, in main(), not
+    # inside _ensure_oom_baseline (which only run_batch_plan.py's own
+    # BASELINE_CHECKS ever calls) -- this is the one real entry point
+    # EVERY trigger path shares (run_batch_plan.py's subprocess call,
+    # AND operator_api.py's live-trigger subprocess call), so a fix
+    # placed here applies universally regardless of who or what
+    # triggered this specific episode. Cheap no-op in the common case.
+    _clear_stale_oom_sticky_flag(cfg)
 
     episode_id = str(uuid.uuid4())
     t0 = datetime.now(timezone.utc).isoformat()

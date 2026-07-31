@@ -70,7 +70,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent.parent / "p3_trust_action"))
 
 from model_backend import PROVIDER_CHAIN, _extract_json, call_one, LLMFailure  # noqa: E402
-from tool_call_validator import validate_tool_call  # noqa: E402
+from tool_call_validator import MAX_CPU_LIMIT_M, MAX_MEMORY_LIMIT_MI, MAX_REPLICAS, validate_tool_call  # noqa: E402
 from trust_engine import DB_PATH  # noqa: E402
 
 # Real, already-in-production deterministic mapping (p3_trust_action's
@@ -98,42 +98,89 @@ DETERMINISTIC_ACTION_MAP = {
     "bad-rollout": ("rollback_deployment", lambda t, n: {"name": t, "namespace": n}),
 }
 
+# Real, checked-against-source constraint, 2026-08-01: under-provisioned-
+# replicas' magnitude signal is NOT a passive tool_output field the way
+# oom/cpu-throttling's are -- it's catalogue_probe_p95_ms, produced by an
+# ACTIVE probe (agent.py's probe_catalogue_capacity), and its real current-
+# replica-count constraint is read live via kubectl at scoring time
+# (constraint_checks.py), never passed in the prompt at all. So the
+# "null field -> spiral" failure mode this whole redesign is fixing
+# structurally CANNOT happen for this class -- no null-fallback needed,
+# unlike oom/cpu-throttling below.
+#
+# Real review-18 resolution (Kimi, 2026-08-01, same chat): hardcoding
+# tool selection is safe ONLY for magnitude-sensitive classes, where
+# Dimension C already tests PARAMETER judgment via constraint_checks.
+# check_safe(), not tool choice -- for the 3 non-magnitude classes
+# (restart_deployment/rollback_deployment/restore_from_disk_full),
+# tool-only-match IS the entire Dimension C signal, so their schema
+# stays open below, not hardcoded.
+MAGNITUDE_SENSITIVE_NULL_FALLBACK = {
+    "oom": ("patch_memory_limit", "peak_memory_mib"),
+    "cpu-throttling": ("patch_cpu_limit", "cpu_throttle_periods_increase"),
+}
+
 # Schema-in-prompt (Kimi's Alternative 1, adopted unconditionally --
 # reduces validator rejections happening at all, independent of the
-# retry/escalation bound above).
-ACTION_SCHEMA_TEXT = """Available actions and their EXACT real parameter formats:
-- restart_deployment: {"tool": "restart_deployment", "params": {"name": "<deployment name>"}}
-- patch_memory_limit: {"tool": "patch_memory_limit", "params": {"name": "...", "container": "...", "limit": "<quantity>"}}
-  Valid limit examples: "256Mi", "400Mi", "1Gi" (Ki/Mi/Gi/Ti suffix only, no "m").
-- patch_cpu_limit: {"tool": "patch_cpu_limit", "params": {"name": "...", "container": "...", "limit": "<quantity>"}}
-  Valid limit examples: "300m", "600m", "1" (millicores with "m" suffix, or whole cores as a bare number).
-- scale_deployment: {"tool": "scale_deployment", "params": {"name": "...", "replicas": <int, 1-10>}}
-- rollback_deployment: {"tool": "rollback_deployment", "params": {"name": "..."}}
-- restore_from_disk_full: {"tool": "restore_from_disk_full", "params": {"name": "...", "replicas": <int, 1-10>}}"""
+# retry/escalation bound above). Caps here are the REAL, already-locked
+# constants tool_call_validator.py enforces server-side (MAX_MEMORY_LIMIT_MI/
+# MAX_CPU_LIMIT_M/MAX_REPLICAS) -- not new numbers, reused so the prompt
+# never asks for something the validator would reject anyway (the old
+# "1-10" replicas range here was stale against the real 1-20 cap).
+ACTION_SCHEMA_TEXT = f"""Available actions and their EXACT real parameter formats:
+- restart_deployment: {{"tool": "restart_deployment", "params": {{"name": "<deployment name>"}}}}
+- patch_memory_limit: {{"tool": "patch_memory_limit", "params": {{"name": "...", "container": "...", "limit": "<quantity>"}}}}
+  Valid limit examples: "256Mi", "512Mi", "1Gi" (Ki/Mi/Gi/Ti suffix only, no "m"). Must be > the real observed peak_memory_mib and <= {MAX_MEMORY_LIMIT_MI}Mi.
+- patch_cpu_limit: {{"tool": "patch_cpu_limit", "params": {{"name": "...", "container": "...", "limit": "<quantity>"}}}}
+  Valid limit examples: "300m", "600m", "1" (millicores with "m" suffix, or whole cores as a bare number). Must be <= {MAX_CPU_LIMIT_M}m.
+- scale_deployment: {{"tool": "scale_deployment", "params": {{"name": "...", "replicas": <int, 1-{MAX_REPLICAS}>}}}}
+- rollback_deployment: {{"tool": "rollback_deployment", "params": {{"name": "..."}}}}
+- restore_from_disk_full: {{"tool": "restore_from_disk_full", "params": {{"name": "...", "replicas": <int, 1-{MAX_REPLICAS}>}}}}"""
 
-PROMPT_TEMPLATE = """You are an SRE agent. You have already diagnosed the following real fault:
-diagnosis={diagnosis}, target={target}, namespace={namespace}, confidence={confidence}, reasoning="{reasoning}"
+# Fixed per call (no per-episode substitution) -- the rules/schema/
+# examples never change, only the real episode data below in
+# USER_PROMPT_TEMPLATE does. Split out per Kimi review 18 suggestion #6:
+# Cloudflare's endpoint is OpenAI-compatible and supports a real system
+# role; keeping fixed instructions there and only variable data in the
+# user message is meant to increase formatting compliance.
+SYSTEM_PROMPT = f"""You are an SRE agent proposing exactly one fix action for an already-diagnosed real fault. Respond with ONLY one JSON object, no markdown, no other text, no visible reasoning process:
+{{"tool": "<tool name>", "params": {{...}}, "reasoning": "<one brief sentence>"}}
 
-Real observed data at diagnosis time (from live Prometheus/log queries -- use the actual numbers here to size any magnitude-sensitive parameter, don't guess a generic/typical value):
+{ACTION_SCHEMA_TEXT}
+
+For diagnoses that map to a magnitude-sensitive action (patch_memory_limit for oom, patch_cpu_limit for cpu-throttling, scale_deployment for under-provisioned-replicas), you MUST use that exact tool -- do not substitute a different one, and do not reconsider the diagnosis, it is already confirmed correct.
+EXCEPTION: if the specific real metric needed to size a magnitude-sensitive action is null/missing in the observed data below (peak_memory_mib for oom, cpu_throttle_periods_increase for cpu-throttling), do NOT attempt that action at all -- use restart_deployment instead. This is a direct instruction, not something to reason your way to -- do not deliberate between options when the required data is simply absent.
+For every other diagnosis, select the correct tool from the schema above based on the diagnosis given.
+If the observed data contains signals that could suggest a different diagnosis than the one given, IGNORE them -- the diagnosis is already confirmed correct, do not re-evaluate it.
+
+Examples (illustrative values, not real production defaults -- compute your own answer from the real data given to you, don't copy these numbers):
+Input: diagnosis="oom", peak_memory_mib=290
+Output: {{"tool": "patch_memory_limit", "params": {{"name": "catalogue", "container": "catalogue", "limit": "512Mi"}}, "reasoning": "512Mi provides headroom above the observed 290Mi peak."}}
+
+Input: diagnosis="oom", peak_memory_mib=null
+Output: {{"tool": "restart_deployment", "params": {{"name": "catalogue"}}, "reasoning": "No peak memory data available, magnitude-sensitive fix not possible."}}
+
+Input: diagnosis="cpu-throttling", cpu_throttle_periods_increase=340
+Output: {{"tool": "patch_cpu_limit", "params": {{"name": "user", "container": "user", "limit": "800m"}}, "reasoning": "Limit raised above the observed throttling pressure."}}"""
+
+USER_PROMPT_TEMPLATE = """Diagnosed fault: diagnosis={diagnosis}, target={target}, namespace={namespace}, confidence={confidence}, reasoning="{reasoning}"
+
+Real observed data at diagnosis time:
 {tool_output}
 
-{schema}
-
-For patch_memory_limit/patch_cpu_limit specifically: base the new limit on the real usage numbers above (e.g. peak_memory_mib for memory), not on a commonly-seen default value -- pick a real headroom margin above the actual observed peak.
-
-Propose EXACTLY ONE fix action for this specific fault. Respond with ONLY one JSON object, no markdown, no other text:
-{{"tool": "<tool name>", "params": {{...}}, "reasoning": "<one sentence>"}}{feedback}"""
+Propose exactly one fix action for this fault.{feedback}"""
 
 
 def _propose_once(entry: dict, diagnosis: dict, target: str, namespace: str,
-                   tool_output: dict | None = None, feedback: str = "") -> dict:
-    prompt = PROMPT_TEMPLATE.format(
+                   tool_output: dict | None = None, feedback: str = "",
+                   episode_id: str | None = None) -> dict:
+    user_prompt = USER_PROMPT_TEMPLATE.format(
         diagnosis=diagnosis["diagnosis"], target=target, namespace=namespace,
         confidence=diagnosis.get("confidence"), reasoning=diagnosis.get("reasoning", ""),
         tool_output=json.dumps(tool_output, default=str) if tool_output else "(not available)",
-        schema=ACTION_SCHEMA_TEXT, feedback=feedback,
+        feedback=feedback,
     )
-    result = call_one(entry, prompt, timeout=30)
+    result = call_one(entry, user_prompt, timeout=30, system_prompt=SYSTEM_PROMPT, episode_id=episode_id)
     if isinstance(result, LLMFailure):
         return {"outcome": "provider_failure", "detail": result.__dict__}
 
@@ -164,7 +211,8 @@ def _find_chain_entry(provider: str, model: str) -> Optional[dict]:
 
 
 def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: str,
-                    diagnosis_provider: str, diagnosis_model: str, tool_output: dict | None = None) -> dict:
+                    diagnosis_provider: str, diagnosis_model: str, tool_output: dict | None = None,
+                    episode_id: str | None = None) -> dict:
     """
     fault_class: the LLM's OWN diagnosed class (not ground truth -- this
     proposes an action for whatever the loop just diagnosed, same
@@ -197,14 +245,14 @@ def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: st
 
     if diagnosis_entry is not None:
         # Attempt 1 + 1 retry, SAME provider that succeeded at diagnosis.
-        attempt = _propose_once(diagnosis_entry, diagnosis, target, namespace, tool_output=tool_output)
+        attempt = _propose_once(diagnosis_entry, diagnosis, target, namespace, tool_output=tool_output, episode_id=episode_id)
         attempts.append(attempt)
         if attempt["outcome"] == "validated":
             return {**attempt, "source": "llm_primary_retry", "fault_class": fault_class, "attempts": attempts}
 
         if attempt["outcome"] == "validator_rejected":
             feedback = f'\nYour previous attempt was rejected: {attempt["reason"]}. Correct it and try again.'
-            attempt2 = _propose_once(diagnosis_entry, diagnosis, target, namespace, tool_output=tool_output, feedback=feedback)
+            attempt2 = _propose_once(diagnosis_entry, diagnosis, target, namespace, tool_output=tool_output, feedback=feedback, episode_id=episode_id)
             attempts.append(attempt2)
             if attempt2["outcome"] == "validated":
                 return {**attempt2, "source": "llm_primary_retry", "fault_class": fault_class, "attempts": attempts}
@@ -214,7 +262,7 @@ def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: st
         diag_idx = PROVIDER_CHAIN.index(diagnosis_entry)
         if diag_idx < len(PROVIDER_CHAIN) - 1:
             escalated_entry = PROVIDER_CHAIN[diag_idx + 1]
-            attempt3 = _propose_once(escalated_entry, diagnosis, target, namespace, tool_output=tool_output)
+            attempt3 = _propose_once(escalated_entry, diagnosis, target, namespace, tool_output=tool_output, episode_id=episode_id)
             attempts.append(attempt3)
             if attempt3["outcome"] == "validated":
                 return {**attempt3, "source": "llm_escalated", "fault_class": fault_class, "attempts": attempts}

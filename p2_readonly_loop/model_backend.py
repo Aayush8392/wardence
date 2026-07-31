@@ -75,29 +75,35 @@ def _extract_json(text: str) -> Optional[dict]:
         return None
 
 
-def _call_gemini(model: str, prompt: str, timeout: int) -> Union[LLMResult, LLMFailure]:
+def _call_gemini(model: str, prompt: str, timeout: int, system_prompt: str | None = None) -> Union[LLMResult, LLMFailure]:
     key = os.environ["GEMINI_API_KEY"]
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": TEMPERATURE,
+            # confirmed live 2026-07-29: gemini-3-flash-preview
+            # honors thinkingBudget:0 (drops to zero thinking
+            # tokens); the "-latest" alias currently resolves to
+            # a model that REJECTS this with a hard 400 -- never
+            # point this chain at the alias.
+            "thinkingConfig": {"thinkingBudget": 0},
+            # avgLogprobs is NOT returned unless explicitly
+            # requested -- without this, the logprob-confidence
+            # branch below is dead code and every call silently
+            # falls back to self-reported (found live, 2026-07-29).
+            "responseLogprobs": True,
+            "logprobs": 1,
+        },
+    }
+    # Real Gemini API shape: system instructions are a separate top-level
+    # field, not part of `contents` -- added only when the caller passes
+    # one (react_agent.py's diagnosis loop never does, unaffected).
+    if system_prompt:
+        body["systemInstruction"] = {"parts": [{"text": system_prompt}]}
     try:
         resp = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "temperature": TEMPERATURE,
-                    # confirmed live 2026-07-29: gemini-3-flash-preview
-                    # honors thinkingBudget:0 (drops to zero thinking
-                    # tokens); the "-latest" alias currently resolves to
-                    # a model that REJECTS this with a hard 400 -- never
-                    # point this chain at the alias.
-                    "thinkingConfig": {"thinkingBudget": 0},
-                    # avgLogprobs is NOT returned unless explicitly
-                    # requested -- without this, the logprob-confidence
-                    # branch below is dead code and every call silently
-                    # falls back to self-reported (found live, 2026-07-29).
-                    "responseLogprobs": True,
-                    "logprobs": 1,
-                },
-            },
+            json=body,
             timeout=timeout,
         )
     except requests.exceptions.Timeout:
@@ -145,6 +151,7 @@ def _call_gemini(model: str, prompt: str, timeout: int) -> Union[LLMResult, LLMF
 
 def _call_openai_compat(
     provider: str, base_url: str, model: str, prompt: str, timeout: int, max_tokens: int, tier: str,
+    system_prompt: str | None = None,
 ) -> Union[LLMResult, LLMFailure]:
     key_env = {
         "groq": "GROQ_API_KEY", "openrouter": "OPENROUTER_API_KEY",
@@ -159,9 +166,15 @@ def _call_openai_compat(
     # openrouter specifically -- confirmed today Groq documents logprobs
     # as unsupported).
     request_logprobs = provider in ("cloudflare", "deepinfra")
+    # Standard OpenAI-compatible system-role message, prepended only when
+    # the caller passes one (react_agent.py/llm_replay_test.py never do,
+    # unaffected) -- Kimi review 18 suggestion #6.
+    messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [
+        {"role": "user", "content": prompt}
+    ]
     body = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "temperature": TEMPERATURE,
         "max_tokens": max_tokens,
     }
@@ -290,10 +303,23 @@ def _call_openai_compat(
 # layer design (Kimi review 11) that makes their confidence honest.
 PROVIDER_CHAIN = [
     {
+        # 2026-07-31: real live failure confirmed (oom action-proposal call,
+        # episode d57c4801...) -- gemma's own reasoning_content spent the
+        # entire 2000-token budget before ever reaching the real answer,
+        # coming back with content="" and finish_reason="length" (same
+        # failure shape as the 2026-07-29 Groq gpt-oss finding, just a
+        # different model). Originally bumped to 6000 (a guess), then
+        # RE-CALIBRATED 2026-08-01 from real data after the prompt fix
+        # (review 18): 5 real successful calls across 3 classes
+        # (diagnosis + action-proposal, this value is shared by both)
+        # topped out at 2192 tokens -- 3500 keeps a real ~1.6x margin
+        # over that observed max while still acting as a real circuit
+        # breaker (a future spiral fails fast into retry/escalation
+        # instead of accommodating thousands of wasted tokens).
         "provider": "cloudflare", "model": "@cf/google/gemma-4-26b-a4b-it",
         "format": "openai_compat", "tier": "primary",
         "base_url": f"https://api.cloudflare.com/client/v4/accounts/{os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')}/ai/v1/chat/completions",
-        "max_tokens": 2000,
+        "max_tokens": 3500,
     },
     {
         "provider": "deepinfra", "model": "nvidia/Nemotron-3-Nano-30B-A3B",
@@ -306,10 +332,19 @@ PROVIDER_CHAIN = [
         "format": "gemini_native", "tier": "primary",
     },
     {
+        # Same real reasoning-eats-the-budget risk as gemma above -- same
+        # provider, same visible reasoning_content behavior -- widened
+        # for the same reason, not yet observed failing but no reason to
+        # wait for a live failure to fix an identical known risk. 3500
+        # extrapolated from gemma's real 2026-08-01 calibration data
+        # (same provider family) -- kimi itself was never actually
+        # exercised this session (same-pool fallback, never fired), so
+        # this specific value is untested for kimi, not independently
+        # confirmed the way gemma's is.
         "provider": "cloudflare", "model": "@cf/moonshotai/kimi-k2.6",
         "format": "openai_compat", "tier": "fallback",
         "base_url": f"https://api.cloudflare.com/client/v4/accounts/{os.environ.get('CLOUDFLARE_ACCOUNT_ID', '')}/ai/v1/chat/completions",
-        "max_tokens": 2000,
+        "max_tokens": 3500,
     },
     {
         "provider": "groq", "model": "llama-3.3-70b-versatile",
@@ -335,7 +370,42 @@ PROVIDER_CHAIN = [
 ]
 
 
-def call_one(entry: dict, prompt: str, timeout: int = 30) -> Union[LLMResult, LLMFailure]:
+def _extract_total_tokens(result: Union["LLMResult", "LLMFailure"]) -> int:
+    """Real total-token count from the provider's own response, never
+    estimated. openai_compat providers (cloudflare, deepinfra, groq,
+    openrouter) share one response shape (`usage.total_tokens`, standard
+    OpenAI-compatible contract); gemini uses its own
+    `usageMetadata.totalTokenCount`. Defensive .get() chains throughout --
+    a provider whose response happens to omit the field just contributes
+    0, never crashes the call. LLMFailure has no `raw` attribute at all
+    (a failed call, e.g. a timeout, may never have gotten a response body
+    to read tokens from), so this only ever applies to LLMResult.
+    """
+    raw = getattr(result, "raw", None)
+    if not raw:
+        return 0
+    if result.provider == "gemini":
+        return raw.get("usageMetadata", {}).get("totalTokenCount") or 0
+    return raw.get("usage", {}).get("total_tokens") or 0
+
+
+def _extract_neurons(result: Union["LLMResult", "LLMFailure"]) -> float:
+    """Real Cloudflare Neuron cost for this specific call, straight from
+    their own response (`usage.neurons`, confirmed live 2026-07-31 --
+    also mirrored in the `cf-ai-neurons` response header, body used here
+    since call_one() only ever sees the parsed JSON, not raw headers).
+    Only Cloudflare reports this; every other provider's raw response has
+    no such field, so this safely returns 0 for them."""
+    raw = getattr(result, "raw", None)
+    if not raw or getattr(result, "provider", None) != "cloudflare":
+        return 0
+    return raw.get("usage", {}).get("neurons") or 0
+
+
+def call_one(
+    entry: dict, prompt: str, timeout: int = 30, system_prompt: str | None = None,
+    episode_id: str | None = None,
+) -> Union[LLMResult, LLMFailure]:
     """
     Call a single provider-chain entry. Returns LLMResult or LLMFailure --
     never raises on a normal API-level failure.
@@ -365,13 +435,16 @@ def call_one(entry: dict, prompt: str, timeout: int = 30) -> Union[LLMResult, LL
         return LLMFailure(entry["provider"], entry["model"], "quota_exhausted", detail)
 
     if entry["format"] == "gemini_native":
-        result = _call_gemini(entry["model"], prompt, timeout)
+        result = _call_gemini(entry["model"], prompt, timeout, system_prompt=system_prompt)
     else:
         result = _call_openai_compat(
             entry["provider"], entry["base_url"], entry["model"], prompt, timeout,
-            entry.get("max_tokens", 500), entry["tier"],
+            entry.get("max_tokens", 500), entry["tier"], system_prompt=system_prompt,
         )
-    record_call(entry["provider"], entry["model"])
+    record_call(
+        entry["provider"], entry["model"], tokens=_extract_total_tokens(result),
+        neurons=_extract_neurons(result), episode_id=episode_id,
+    )
     return result
 
 

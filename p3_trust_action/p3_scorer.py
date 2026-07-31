@@ -350,7 +350,8 @@ def main():
 
     # Phase 1: diagnosis only (stub + background LLM), independently timed.
     diag_resp = requests.post(
-        DIAGNOSE_URL, json={"target": target, "namespace": namespace}, timeout=DIAGNOSE_TIMEOUT_S
+        DIAGNOSE_URL, json={"target": target, "namespace": namespace, "episode_id": episode_id},
+        timeout=DIAGNOSE_TIMEOUT_S,
     )
     diag_resp.raise_for_status()
     result = diag_resp.json()

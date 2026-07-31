@@ -80,12 +80,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from agent import OOM_STICKY_MAX_CONTAINER_AGE_S  # noqa: E402
 from run_episodes import (  # noqa: E402
     DEFAULT_TARGET_RECENCY_WINDOW_S,
     SETTLE_SECONDS,
     TARGET_RECENCY_WINDOW_S,
     _Tee,
     _update_timings,
+    _update_token_usage,
     run as run_script,
     wait_for_infra_ready,
 )
@@ -134,6 +136,23 @@ DB_PATH = Path.home() / "wardence_p2_data" / "wardence.db"
 # style caps -- a persistent real problem should stop the batch, not
 # retry the same slot forever.
 MAX_CONSECUTIVE_REAL_FAILURES = 3
+
+
+def _latest_episode_id(fault_class: str) -> str | None:
+    """Real most-recently-created episode_id for this class -- safe to
+    take "most recent by t0" (not full set-diffing) because this batch
+    runner is strictly sequential, never concurrent episode creation,
+    unlike operator_api.py's live-trigger path. Used right after a
+    successful injection to attribute real per-call token/Neuron usage
+    (provider_call_log) back to the specific episode that just ran, for
+    _update_token_usage below."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT episode_id FROM episodes WHERE fault_class = ? ORDER BY t0 DESC LIMIT 1",
+        (fault_class,),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 def _real_episode_count(fault_class: str) -> int:
@@ -371,7 +390,7 @@ def _run_baseline_check() -> bool:
     return True
 
 
-def _wait_for_target_recency(target: str, fault_class: str, last_fault_time: dict) -> None:
+def _wait_for_target_recency(target: str, fault_class: str, last_fault_time: dict, last_fault_class: dict) -> None:
     """Per-TARGET, not a single global scalar -- a multi-class batch can
     move between genuinely unrelated targets (shipping, orders,
     catalogue-db, ...), and a global last-injection timestamp would
@@ -386,14 +405,33 @@ def _wait_for_target_recency(target: str, fault_class: str, last_fault_time: dic
     the real risk being guarded against is a stale prior signal still
     sitting inside THIS episode's own diagnosis lookback query, so the
     margin must be sized against the window the upcoming diagnosis will
-    actually use. In today's roster every class targets a distinct
-    service, so this is equivalent to keying by target either way -- but
-    keying by fault_class is the technically correct choice if a future
-    batch ever mixes two classes sharing a target (e.g. network-latency/
-    network-partition, both on orders)."""
+    actually use.
+
+    CORRECTED 2026-08-01 -- this docstring used to claim "today's roster
+    every class targets a distinct service," used to justify keying by
+    fault_class as equivalent to keying by target. That claim was
+    factually wrong: oom and under-provisioned-replicas both target
+    catalogue (confirmed directly in FAULT_CONFIG), a real, current,
+    same-roster collision, not a hypothetical future one. Real,
+    live-confirmed bug this caused: running oom then under-provisioned-
+    replicas on catalogue only ~4 minutes apart produced a real false
+    "oom" diagnosis on the second (unrelated) episode, because agent.py's
+    sticky-OOM signal (OOM_STICKY_MAX_CONTAINER_AGE_S=1200s, bound to
+    container_start_time_seconds, deliberately outlives a single
+    diagnosis-query lookback so a delayed check still catches a real
+    kill) was still genuinely true -- the container hadn't restarted
+    since the real oom episode. The window-by-upcoming-class logic above
+    only ever guarded against a stale signal sitting inside the NEXT
+    class's OWN diagnosis query -- it had no way to know a DIFFERENT,
+    longer-lived signal from a PRIOR class could contaminate it. Real
+    fix: if the last real fault on this target was itself oom, force
+    waiting the full sticky window regardless of what's about to run
+    next, on top of (not instead of) the existing per-class window."""
     if target not in last_fault_time:
         return
     window = TARGET_RECENCY_WINDOW_S.get(fault_class, DEFAULT_TARGET_RECENCY_WINDOW_S)
+    if last_fault_class.get(target) == "oom":
+        window = max(window, OOM_STICKY_MAX_CONTAINER_AGE_S)
     elapsed = time.time() - last_fault_time[target]
     if elapsed < window:
         remaining = window - elapsed
@@ -401,19 +439,35 @@ def _wait_for_target_recency(target: str, fault_class: str, last_fault_time: dic
         time.sleep(remaining)
 
 
-def run_one_episode(fault_class: str, last_fault_time: dict) -> bool:
+def run_one_episode(fault_class: str, last_fault_time: dict, last_fault_class: dict) -> bool:
     target = FAULT_CONFIG[fault_class]["target"]
 
     if not wait_for_infra_ready():
         print("Infra unreachable for too long, stopping.")
         return False
 
-    _wait_for_target_recency(target, fault_class, last_fault_time)
-    last_fault_time[target] = time.time()
+    _wait_for_target_recency(target, fault_class, last_fault_time, last_fault_class)
 
     if not run_script("injector.py", ["--class", fault_class]):
         print("Injector failed, stopping.")
         return False
+
+    # Real refinement, 2026-08-01: this used to be stamped BEFORE calling
+    # injector.py, using the injection-ATTEMPT-start time as the anchor
+    # for both the ordinary recency window and the sticky-OOM guard
+    # above. injector.py's own verification loop (up to 3 attempts, each
+    # polling Prometheus for up to EFFECT_VERIFY_TIMEOUT_S=35s) only
+    # returns success once the real effect is CONFIRMED -- meaning the
+    # real underlying event (e.g. the actual OOM kill / container
+    # restart) can land anywhere up to ~1-3 minutes AFTER the old anchor
+    # point, leaving the sticky-OOM wait potentially short by that same
+    # margin in a worst case. Stamping AFTER injector.py returns success
+    # instead anchors to the real, verified moment the effect was
+    # confirmed to exist -- as close to the true event time as this
+    # script can get without injector.py reporting its own internal
+    # verification timestamp back explicitly.
+    last_fault_time[target] = time.time()
+    last_fault_class[target] = fault_class
 
     time.sleep(SETTLE_SECONDS)
 
@@ -516,6 +570,13 @@ def main():
     # for free. setdefault so a plan saved before this fix still loads.
     plan_state.setdefault("last_fault_time", {})
     last_fault_time = plan_state["last_fault_time"]
+    # Real fix, 2026-08-01: tracks which class last touched each target,
+    # persisted the same way as last_fault_time (survives pause/resume)
+    # -- needed so _wait_for_target_recency can detect "the last thing
+    # here was oom" regardless of what's about to run next. setdefault
+    # so a plan saved before this fix still loads.
+    plan_state.setdefault("last_fault_class", {})
+    last_fault_class = plan_state["last_fault_class"]
     stopped_early = False
 
     # Real end-of-run summary tracking, added 2026-07-29 -- run_episodes.py
@@ -573,7 +634,7 @@ def main():
 
             before_count = _real_episode_count(fault_class)
 
-            if not run_one_episode(fault_class, last_fault_time):
+            if not run_one_episode(fault_class, last_fault_time, last_fault_class):
                 plan_state["status"] = "paused"
                 _save_plan(plan_state)
                 stopped_early = True
@@ -619,6 +680,7 @@ def main():
 
             consecutive_real_failures = 0
             _update_timings(fault_class, episode_elapsed_s)
+            _update_token_usage(fault_class, _latest_episode_id(fault_class))
             per_class_durations_s.setdefault(fault_class, []).append(episode_elapsed_s)
             plan_state["completed"][idx] = done_so_far + 1
             _save_plan(plan_state)

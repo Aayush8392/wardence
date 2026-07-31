@@ -178,7 +178,9 @@ def _has_strong_signal(tool_name: str, observation) -> bool:
     return any(observation.get(field) for field in _STRONG_SIGNAL_FIELDS)
 
 
-def _run_episode_with_provider(entry: dict, target: str, namespace: str, tools: dict) -> dict:
+def _run_episode_with_provider(
+    entry: dict, target: str, namespace: str, tools: dict, episode_id: str | None = None,
+) -> dict:
     """
     One full attempt of the evidence loop against a SINGLE provider-chain
     entry, fresh transcript, no carryover from any prior provider. Returns
@@ -188,6 +190,15 @@ def _run_episode_with_provider(entry: dict, target: str, namespace: str, tools: 
     transcript_lines = []
     parse_failures = 0
     called_tools = set()
+    # Real structured tool results, 2026-08-01 addition -- transcript_lines
+    # is human-readable only (formatted strings), which forced any caller
+    # wanting an actual gathered value (e.g. propose_action() needing the
+    # real catalogue_probe_p95_ms the loop already fetched) to either
+    # parse transcript text or re-invoke a real, non-free tool a second
+    # time (probe_catalogue_capacity fires an actual k6 burst -- see its
+    # own docstring on why it's deliberately not called eagerly). This
+    # dict is the clean alternative: reuse what was already gathered.
+    observations = {}
 
     for turn_num in range(1, MAX_TURNS + 1):
         prompt = SYSTEM_TEMPLATE.format(
@@ -200,7 +211,7 @@ def _run_episode_with_provider(entry: dict, target: str, namespace: str, tools: 
             transcript="\n".join(transcript_lines) if transcript_lines else "(none yet)",
             turn_num=turn_num,
         )
-        result = call_one(entry, prompt, timeout=30)
+        result = call_one(entry, prompt, timeout=30, episode_id=episode_id)
         if isinstance(result, LLMFailure):
             return {"status": "provider_failure", "detail": result, "transcript": transcript_lines}
 
@@ -210,7 +221,7 @@ def _run_episode_with_provider(entry: dict, target: str, namespace: str, tools: 
         if action == "diagnose":
             return {
                 "status": "diagnosed", "result": result, "parsed": parsed,
-                "turns_used": turn_num, "transcript": transcript_lines,
+                "turns_used": turn_num, "transcript": transcript_lines, "observations": observations,
             }
 
         if action == "call_tool":
@@ -219,12 +230,13 @@ def _run_episode_with_provider(entry: dict, target: str, namespace: str, tools: 
                 return {
                     "status": "invalid_tool_name",
                     "detail": f"model called non-existent tool {tool_name!r}",
-                    "turns_used": turn_num, "transcript": transcript_lines,
+                    "turns_used": turn_num, "transcript": transcript_lines, "observations": observations,
                 }
             try:
                 observation = tools[tool_name]()
             except Exception as e:  # real tool execution failure -- feed back, don't crash the loop
                 observation = {"error": str(e)}
+            observations[tool_name] = observation
             transcript_lines.append(f"[Turn {turn_num}] Action: call_tool {tool_name}")
             transcript_lines.append(f"Result: {json.dumps(observation, default=str)}")
             called_tools.add(tool_name)
@@ -262,10 +274,13 @@ def _run_episode_with_provider(entry: dict, target: str, namespace: str, tools: 
             '"confidence": <0-1>, "reasoning": "..."}. No markdown, no other text. Try again.'
         )
 
-    return {"status": "max_turns_exceeded", "transcript": transcript_lines}
+    return {"status": "max_turns_exceeded", "transcript": transcript_lines, "observations": observations}
 
 
-def run_react_diagnosis(target: str, namespace: str, tools: dict[str, Callable[[], object]]) -> dict:
+def run_react_diagnosis(
+    target: str, namespace: str, tools: dict[str, Callable[[], object]],
+    chain: list[dict] | None = None, episode_id: str | None = None,
+) -> dict:
     """
     tools: {tool_name: zero_arg_callable} -- the caller's own real tool
     functions, each already bound (via lambda/functools.partial) to THIS
@@ -276,6 +291,12 @@ def run_react_diagnosis(target: str, namespace: str, tools: dict[str, Callable[[
     dependency on agent.py/p3_agent.py and can never create a circular
     import wiring it into either.
 
+    `chain` defaults to the real, locked PROVIDER_CHAIN -- override only
+    for a deliberate calibration/test call that needs to force a
+    SPECIFIC provider (e.g. test_react_agent.py's --force-provider),
+    never for a real production episode, which must always see the full
+    real fallback chain.
+
     Returns a plain dict, always with a "status" key
     ("diagnosed" | "max_turns_exceeded" | "invalid_tool_name" | "llm_unavailable").
     Never raises on a normal LLM/tool failure. COMPARISON-ONLY -- see
@@ -283,8 +304,8 @@ def run_react_diagnosis(target: str, namespace: str, tools: dict[str, Callable[[
     logged and must not feed it into trust_engine/ACTION_MAP.
     """
     failed_attempts = []
-    for entry in PROVIDER_CHAIN:
-        attempt = _run_episode_with_provider(entry, target, namespace, tools)
+    for entry in (chain if chain is not None else PROVIDER_CHAIN):
+        attempt = _run_episode_with_provider(entry, target, namespace, tools, episode_id=episode_id)
 
         if attempt["status"] == "diagnosed":
             parsed, result = attempt["parsed"], attempt["result"]
@@ -298,12 +319,19 @@ def run_react_diagnosis(target: str, namespace: str, tools: dict[str, Callable[[
                 "turns_used": attempt["turns_used"],
                 "transcript": attempt["transcript"],
                 "failed_attempts": failed_attempts,
+                # Real structured tool results gathered during THIS
+                # diagnosis attempt (e.g. catalogue_probe_p95_ms) -- lets
+                # a caller like propose_action() reuse real data the loop
+                # already fetched instead of re-invoking a non-free tool
+                # (probe_catalogue_capacity fires a real k6 burst).
+                "observations": attempt.get("observations", {}),
             }
         if attempt["status"] in ("invalid_tool_name", "max_turns_exceeded"):
             return {
                 "status": attempt["status"], "llm_diagnosis": None,
                 "detail": attempt.get("detail"), "transcript": attempt["transcript"],
                 "failed_attempts": failed_attempts,
+                "observations": attempt.get("observations", {}),
             }
         # "provider_failure" -- abort this provider's attempt, retry the
         # WHOLE episode from turn 1 against the next chain entry. Fresh

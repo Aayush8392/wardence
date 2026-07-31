@@ -141,6 +141,12 @@ ACTION_MAP = {
 class HandleRequest(BaseModel):
     target: str
     namespace: str
+    # Real per-call token/Neuron attribution, 2026-08-01 -- optional, not
+    # ground truth (unlike ActRequest's actual_class field below), just
+    # an identifier so provider_call_log rows can be tied back to a real
+    # episode instead of reconstructed via timestamp-window diffing.
+    # None means "no attribution" (e.g. a caller other than p3_scorer.py).
+    episode_id: str | None = None
 
 
 class ActRequest(BaseModel):
@@ -263,7 +269,7 @@ def diagnose(req: HandleRequest):
                        "failed_attempts": [], "detail": "WARDENCE_STUB_ONLY set -- LLM call skipped"}
     else:
         llm_tools = _build_llm_tools(req.target, req.namespace)
-        llm_result = run_react_diagnosis(req.target, req.namespace, llm_tools)
+        llm_result = run_react_diagnosis(req.target, req.namespace, llm_tools, episode_id=req.episode_id)
 
     conn = sqlite3.connect(DB_PATH)
     ensure_trust_tables(conn)
@@ -434,6 +440,7 @@ def act(req: ActRequest):
         proposal = propose_action(
             fault_class, production_result, req.target, req.namespace,
             req.llm_provider, req.llm_model, tool_output=req.tool_output,
+            episode_id=req.episode_id,
         )
         response["llm_action_proposal"] = proposal
 

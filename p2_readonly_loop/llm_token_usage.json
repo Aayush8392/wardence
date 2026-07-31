@@ -1,0 +1,81 @@
+{
+  "network-partition": {
+    "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "gemini:gemini-3-flash-preview": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "cloudflare:@cf/moonshotai/kimi-k2.6": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "groq:llama-3.3-70b-versatile": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "groq:openai/gpt-oss-120b": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "openrouter:openai/gpt-oss-20b:free": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    }
+  }
+}

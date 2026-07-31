@@ -24,6 +24,7 @@ truth for these values/helpers.
 """
 
 import json
+import os
 import subprocess
 import sys
 import time
@@ -35,6 +36,19 @@ SETTLE_SECONDS = 35  # kube-state-metrics scrapes every 30s; wait a full cycle +
                       # so the last fault action in the injection window is reflected
 
 TIMINGS_PATH = Path(__file__).parent / "episode_timings.json"
+# Real LLM-inclusive durations are structurally different from stub-only
+# ones (a multi-turn ReAct loop + possible action-proposal calls sit on
+# top of the same base injection/settle/scoring time) -- blending both
+# populations into one running avg_s would produce a number that's
+# neither honestly stub-only nor honestly LLM-inclusive, same category
+# error this project already ruled out for logprob-vs-self-reported
+# confidence (Kimi review 09 item 5). Split at the same env var that
+# already decides whether an episode's diagnosis calls the real LLM at
+# all (2026-07-31): WARDENCE_STUB_ONLY=1 -> episode_timings.json (stub-
+# only, unchanged, real historical data); unset -> llm_episode_timings.json
+# (new, starts empty, populated only by real LLM-inclusive episodes from
+# here on).
+LLM_TIMINGS_PATH = Path(__file__).parent / "llm_episode_timings.json"
 
 
 class _Tee:
@@ -201,13 +215,17 @@ def run(script: str, extra_args: list[str] | None = None):
 
 
 def _update_timings(fault_class: str, elapsed_s: float) -> None:
-    """Updates episode_timings.json's running count/avg/min/max/total for
-    this class. Read-modify-write on every completed episode (not batched
-    at the end) so a long overnight run's stats are visible mid-run, not
-    only after it finishes or if it's interrupted."""
+    """Updates the running count/avg/min/max/total for this class, in
+    EITHER episode_timings.json (stub-only) or llm_episode_timings.json
+    (real LLM-inclusive) depending on WARDENCE_STUB_ONLY -- never both,
+    never blended. Read-modify-write on every completed episode (not
+    batched at the end) so a long overnight run's stats are visible
+    mid-run, not only after it finishes or if it's interrupted."""
+    path = TIMINGS_PATH if os.environ.get("WARDENCE_STUB_ONLY") == "1" else LLM_TIMINGS_PATH
+
     timings: dict[str, dict[str, float]] = {}
-    if TIMINGS_PATH.exists():
-        timings = json.loads(TIMINGS_PATH.read_text())
+    if path.exists():
+        timings = json.loads(path.read_text())
 
     stats = timings.get(fault_class, {"count": 0, "total_s": 0.0, "min_s": elapsed_s, "max_s": elapsed_s})
     stats["count"] += 1
@@ -217,4 +235,64 @@ def _update_timings(fault_class: str, elapsed_s: float) -> None:
     stats["max_s"] = max(stats["max_s"], elapsed_s)
     timings[fault_class] = stats
 
-    TIMINGS_PATH.write_text(json.dumps(timings, indent=2) + "\n")
+    path.write_text(json.dumps(timings, indent=2) + "\n")
+
+
+TOKEN_USAGE_PATH = Path(__file__).parent / "llm_token_usage.json"
+
+
+def _update_token_usage(fault_class: str, episode_id: str | None) -> None:
+    """Real per-class, per-provider token/Neuron min/max/avg -- same
+    read-modify-write-every-episode pattern as _update_timings, so this
+    project stops guessing/reconstructing usage after the fact (2026-08-01,
+    direct user request: "make an episode's token usage file similar to
+    the episode timings file"). Sums this ONE episode's real attributed
+    calls (provider_call_log, now that episode_id is actually threaded
+    through call_one()) and folds the episode-level total into the
+    running per-class-per-provider stats -- min/max/avg are over REAL
+    EPISODE TOTALS, not individual calls, so a class needing more turns/
+    retries is reflected honestly as "this class costs more per episode",
+    not diluted across however many calls it happened to take.
+    episode_id=None (e.g. injector ran but nothing was ever attributed)
+    is a real no-op, not an error -- can't update stats for calls that
+    were never tagged."""
+    if episode_id is None:
+        return
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from quota_tracker import get_episode_usage  # noqa: E402 -- local import, same style as call_one()'s own quota_tracker import
+
+    rows = get_episode_usage(episode_id)
+    if not rows:
+        return  # real no-op: comparison-only/stub-only episode, or every call failed before attribution
+
+    per_provider_totals: dict[str, dict[str, float]] = {}
+    for row in rows:
+        key = f'{row["provider"]}:{row["model"]}'
+        totals = per_provider_totals.setdefault(key, {"tokens": 0, "neurons": 0.0})
+        totals["tokens"] += row["tokens"]
+        totals["neurons"] += row["neurons"]
+
+    usage: dict[str, dict[str, dict]] = {}
+    if TOKEN_USAGE_PATH.exists():
+        usage = json.loads(TOKEN_USAGE_PATH.read_text())
+
+    class_usage = usage.setdefault(fault_class, {})
+    for provider_key, totals in per_provider_totals.items():
+        tokens, neurons = totals["tokens"], totals["neurons"]
+        stats = class_usage.get(provider_key, {
+            "count": 0, "total_tokens": 0, "min_tokens": tokens, "max_tokens": tokens,
+            "total_neurons": 0.0, "min_neurons": neurons, "max_neurons": neurons,
+        })
+        stats["count"] += 1
+        stats["total_tokens"] += tokens
+        stats["avg_tokens"] = stats["total_tokens"] / stats["count"]
+        stats["min_tokens"] = min(stats["min_tokens"], tokens)
+        stats["max_tokens"] = max(stats["max_tokens"], tokens)
+        stats["total_neurons"] += neurons
+        stats["avg_neurons"] = stats["total_neurons"] / stats["count"]
+        stats["min_neurons"] = min(stats["min_neurons"], neurons)
+        stats["max_neurons"] = max(stats["max_neurons"], neurons)
+        class_usage[provider_key] = stats
+
+    TOKEN_USAGE_PATH.write_text(json.dumps(usage, indent=2) + "\n")
