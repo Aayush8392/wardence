@@ -78,6 +78,13 @@ p5_dl_hardening/check_pipeline_fault_contamination.py
 p5_dl_hardening/check_track_b_hmm_fit_quality.py
 p5_dl_hardening/check_track_b_regime_shift.py
 p2_readonly_loop/llm_smoke_test.py
+p3_trust_action/check_all_episode_counts.py
+p3_trust_action/check_episode_action.py
+p3_trust_action/check_episode_tool_output.py
+p3_trust_action/check_last_action_proposal.py
+p3_trust_action/check_last_llm_diagnosis.py
+p3_trust_action/check_trust_state.py
+p3_trust_action/restore_after_cb_test_bug.py
 
 # Phase D run output -- regenerated per run, not source
 p2_readonly_loop/phase_d_batch1.json
