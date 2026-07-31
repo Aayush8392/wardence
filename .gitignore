@@ -97,8 +97,10 @@ p2_readonly_loop/phase_d_round4.json
 p2_readonly_loop/phase_d_rounds_manifest.json
 p2_readonly_loop/phase_d_run_summary.json
 
-# run_batch_plan.py's archived completed-plan snapshots -- run output,
-# regenerated per run, same category as the Phase D files above.
+# run_batch_plan.py's live in-progress state AND archived completed-plan
+# snapshots -- run output, regenerated per run, same category as the
+# Phase D files above.
+p2_readonly_loop/batch_plan_progress.json
 p2_readonly_loop/batch_plan_progress_*.json
 
 # Phase E run output -- regenerated per run, not source
