@@ -973,10 +973,20 @@ def run_crash_loop_injection(cfg: dict, duration_s: int):
 
 
 def _restart_count(target: str, namespace: str) -> int:
-    """Prefix-match sum is fine here -- called only as a pre-injection
-    baseline, before anything has happened to create ambiguity between
-    an old and new pod."""
-    query = f'kube_pod_container_status_restarts_total{{namespace="{namespace}", pod=~"{target}.*"}}'
+    """Prefix-match sum was originally reasoned as fine here (called only
+    as a pre-injection baseline, before anything has happened to create
+    ambiguity between an old and new pod) -- but that reasoning only
+    covered old-vs-new-pod timing, not cross-SERVICE collisions.
+    CORRECTED 2026-07-31 (same real bug as agent.py's own fix, see its
+    docstring): several targets have a same-namespace <target>-db sibling
+    service (carts/carts-db, orders/orders-db, user/user-db,
+    catalogue/catalogue-db) that a bare "{target}.*" prefix match also
+    catches -- an unrelated restart on the sibling service would
+    corrupt this baseline (or a later verification comparison against
+    it) with a completely unrelated event. Anchored to the real k8s
+    pod-name shape (exactly two more hyphen-separated segments after the
+    target name) to exclude it."""
+    query = f'kube_pod_container_status_restarts_total{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}'
     resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
     resp.raise_for_status()
     result = resp.json()["data"]["result"]
@@ -994,7 +1004,7 @@ def _memory_working_set_mib(target: str, namespace: str, container: str) -> floa
     if no data point exists yet, treated as "can't verify" by callers."""
     query = (
         f'container_memory_working_set_bytes{{namespace="{namespace}", '
-        f'pod=~"{target}.*", container="{container}"}}'
+        f'pod=~"{target}-[^-]+-[^-]+$", container="{container}"}}'
     )
     resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
     resp.raise_for_status()
@@ -1012,7 +1022,7 @@ def _cfs_throttled_periods(target: str, namespace: str, container: str) -> int:
     baseline snapshot, never a raw/instant value alone."""
     query = (
         f'container_cpu_cfs_throttled_periods_total{{namespace="{namespace}", '
-        f'pod=~"{target}.*", container="{container}"}}'
+        f'pod=~"{target}-[^-]+-[^-]+$", container="{container}"}}'
     )
     resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
     resp.raise_for_status()
@@ -1036,7 +1046,7 @@ def _crash_loop_backoff_now(target: str, namespace: str) -> bool:
     """
     query = (
         f'kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
-        f'pod=~"{target}.*", reason="CrashLoopBackOff"}} == 1'
+        f'pod=~"{target}-[^-]+-[^-]+$", reason="CrashLoopBackOff"}} == 1'
     )
     resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
     resp.raise_for_status()
@@ -1065,9 +1075,9 @@ def _pod_evicted_since(target: str, namespace: str, since_ts: float) -> bool:
     """
     query = (
         f'(kube_pod_status_reason{{namespace="{namespace}", '
-        f'pod=~"{target}.*", reason="Evicted"}} == 1) '
+        f'pod=~"{target}-[^-]+-[^-]+$", reason="Evicted"}} == 1) '
         f'and on(namespace, pod) (kube_pod_deletion_timestamp'
-        f'{{namespace="{namespace}", pod=~"{target}.*"}} > {since_ts})'
+        f'{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}} > {since_ts})'
     )
     resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
     resp.raise_for_status()
@@ -1250,6 +1260,42 @@ def _ensure_oom_baseline(cfg: dict):
         ],
         capture_output=True, text=True,
     )
+
+
+def _ensure_queue_master_pod_cleanup(cfg: dict):
+    """Deletes any leftover Failed/Evicted queue-master pod object from a
+    PRIOR disk-full episode, before the next injection starts -- mirrors
+    _ensure_oom_baseline's "reset right before injecting, not immediately
+    after fixing" pattern, moved here specifically because the scorer's
+    own /diagnose call (which runs between one episode's injection and
+    the next) needs the evicted pod to still exist to correctly diagnose
+    disk-full at all (see _inject_and_verify_disk_full's own docstring
+    for the real regression this replaced).
+
+    Computed as ALL pods for this label minus the currently-Running one
+    (via the existing _current_pod_name helper, --field-selector-based,
+    already proven reliable) rather than a kubectl jsonpath filter
+    expression (?(@.status.phase!=...)) -- kubectl's jsonpath filter
+    support is a known-unreliable subset, not worth trusting for
+    something a plain field-selector already does robustly elsewhere in
+    this file."""
+    all_result = subprocess.run(
+        [
+            "kubectl", "get", "pods", "-n", cfg["namespace"],
+            "-l", f"name={cfg['target']}",
+            "-o", "jsonpath={.items[*].metadata.name}",
+        ],
+        capture_output=True, text=True,
+    )
+    all_pods = all_result.stdout.split()
+    running_pod = _current_pod_name(cfg["target"], cfg["namespace"])
+    dead_pods = [p for p in all_pods if p != running_pod]
+    for pod_name in dead_pods:
+        print(f"  cleaning up leftover non-Running {cfg['target']} pod {pod_name} from a prior episode...")
+        subprocess.run(
+            ["kubectl", "delete", "pod", pod_name, "-n", cfg["namespace"], "--ignore-not-found"],
+            capture_output=True, text=True,
+        )
 
 
 def _ensure_cpu_throttle_baseline(cfg: dict):
@@ -1750,6 +1796,31 @@ def _inject_and_verify_disk_full(cfg: dict) -> bool:
             # this whole verify-before-record fix exists to prevent.
             _cleanup_disk_full_files(cfg["target"], cfg["namespace"], cfg["container"])
         if verified:
+            # Real gap found 2026-07-31: Kubernetes does NOT auto-delete
+            # an evicted pod's Failed object (same "lingers indefinitely"
+            # behavior agent.py's own oom_query/evicted_query docstrings
+            # already document) -- 17 leftover Failed queue-master pods
+            # accumulated across one overnight batch's 15 real disk-full
+            # episodes.
+            #
+            # REAL REGRESSION found and reverted the same day, live-
+            # tested: the first fix attempt deleted baseline_pod_name
+            # (the evicted pod) IMMEDIATELY here, right after injector-
+            # side verification succeeds. That's too early -- the
+            # scorer's own /diagnose call runs AFTER this function
+            # returns, and its evicted_query needs THIS SAME pod object
+            # to still exist (kube_pod_status_reason{reason="Evicted"})
+            # to correctly diagnose disk-full at all. Deleting it here
+            # removed the evidence before diagnosis ever ran, confirmed
+            # live: a real disk-full episode came back "no anomaly
+            # detected" (evicted_pods: []) and wrongly demoted a real
+            # streak-20 can_act class. Cleanup is now deferred to
+            # _ensure_queue_master_pod_cleanup, called right before the
+            # NEXT disk-full injection -- same "reset before injecting,
+            # not immediately after fixing" pattern _ensure_oom_baseline/
+            # _ensure_cpu_throttle_baseline already use, for exactly this
+            # reason (the diagnosis step needs to see the evidence in
+            # between).
             return True
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
         print(f"  attempt {attempt}: no eviction/pod-churn detected{suffix}")
@@ -2287,6 +2358,7 @@ def main():
     print(f"Episode {episode_id}: attempting {fault_class} on {cfg['target']} ({cfg['namespace']}) at {t0}")
 
     if fault_class == "disk-full":
+        _ensure_queue_master_pod_cleanup(cfg)
         verified = _inject_and_verify_disk_full(cfg)
         chaos_name = "manual-exec" if verified else None
     elif fault_class == "crash-loop":

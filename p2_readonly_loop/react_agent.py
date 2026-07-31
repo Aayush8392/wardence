@@ -37,21 +37,25 @@ already existed and had never been built against:
   every extra turn beyond ~5 is a billed call against thin free-tier
   quotas with no real evidence it improves convergence).
 
-COMPARISON-ONLY, per direct user instruction (2026-07-30 session):
-until a fault class has 150+ real episodes, `run_react_diagnosis`'s
-output must NEVER be written to `scores`/`trust_state`/`trust_history`
-and must NEVER drive a real action. This module enforces that by
-construction, not by convention -- it has no import of trust_engine,
-actions.py, or ACTION_MAP, and returns a plain dict for the CALLER to
-log wherever it likes (llm_diagnosis_log, or a caller-side console
-comparison). The caller is responsible for keeping stub_diagnose as
-the only thing that drives real trust-ladder/action behavior until the
-150-episode floor is cleared.
+COMPARISON-ONLY BY CONSTRUCTION, not by a floor -- this module itself
+has no import of trust_engine, actions.py, or ACTION_MAP, and returns a
+plain dict for the CALLER to log wherever it likes (llm_diagnosis_log,
+or a caller-side console comparison). It never decides whether its own
+output drives a real action; that's the caller's job.
 
-NOT built here (explicitly deferred):
-- Phase 2 (single-shot action proposal after a can_act auto-fix
-  diagnosis) -- moot right now anyway, since nothing acts below the
-  150-episode floor. Revisit once that floor is cleared per-class.
+CORRECTED 2026-07-30/31 (this line used to gate on a 150-episode-per-
+class floor -- that floor is DROPPED, see wardence_context.md's Model
+Strategy section, "THE 150-EPISODE FLOOR IS DROPPED"). What actually
+gates whether this module's output drives real production behavior now
+is p3_trust_action/llm_trust_state.py's per-class diagnoser_mode
+(stub/llm, promoted via 5-consecutive-correct background-comparison
+streaks, reverted instantly on one miss) -- see p3_agent.py's /handle
+for the real wiring.
+
+NOT built here (Phase 2 IS built now, in a separate module):
+- Phase 2 (single-shot action proposal) lives in action_proposer.py,
+  not this file -- kept separate per Kimi review 12's structural
+  finding (see that module's own docstring).
 - query_logs as a fourth tool (review 10's own recommendation: ship the
   3-tool loop, validate it, add logs only if a specific class's real
   accuracy shows it's needed).
@@ -88,14 +92,15 @@ FAULT_CLASSES = [
 # back would be a circular import. Keep these in sync with agent.py's
 # own HIGH_LATENCY_THRESHOLD_MS/MEMORY_LEAK_THRESHOLD_MIB/
 # CONNECTION_POOL_THRESHOLD/NETWORK_PARTITION_MAX_THROUGHPUT_BPS/
-# CPU_THROTTLE_INCREASE_THRESHOLD/UNDER_PROVISIONED_PROBE_THRESHOLD_MS
-# by hand if any of those ever change.
+# NETWORK_PARTITION_LATENCY_SATURATION_MS/CPU_THROTTLE_INCREASE_THRESHOLD/
+# UNDER_PROVISIONED_PROBE_THRESHOLD_MS by hand if any of those ever change.
 FIELD_GUIDANCE = """Field meanings and thresholds (a null/false/empty field means that signal did not fire):
 - oom_pods: non-empty -> oom.
 - evicted_pods: non-empty -> disk-full.
 - crashlooping_pods: non-empty (and oom_pods/evicted_pods empty) -> crash-loop.
-- p95_latency_ms (orders only): >= 300ms -> network-latency.
-- combined_throughput_bps (orders only): < 200 bytes/s -> network-partition (check before network-latency).
+- combined_throughput_bps (orders only): < 200 bytes/s -> network-partition (check before either latency check below).
+- p95_latency_ms (orders only): >= 10000ms -> network-partition, NOT network-latency (a request hanging until client timeout, not organic latency -- the real network-latency mechanism only ever injects 500ms+jitter, so nothing that high can be real latency). Check this BEFORE the network-latency check below.
+- p95_latency_ms (orders only): >= 300ms (and < 10000ms) -> network-latency.
 - payment_stuck_not_ready: true -> init-failure.
 - session_db_replicas_hit_zero: true -> session-cart-failure.
 - peak_memory_mib (shipping only): >= 380 MiB -> memory-leak.

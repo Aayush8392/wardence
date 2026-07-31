@@ -33,12 +33,42 @@ from pathlib import Path
 import requests
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "p2_readonly_loop"))
 
 from circuit_breaker import ensure_circuit_breaker_table, record_failure  # noqa: E402
 from trust_engine import DB_PATH, PROMOTION_STREAK, ensure_trust_tables, record_outcome  # noqa: E402
 from verifier import verify_durability  # noqa: E402
+from llm_trust_state import (  # noqa: E402
+    ensure_llm_trust_tables, record_action_outcome, record_diagnoser_outcome,
+)
+from action_proposer import DETERMINISTIC_ACTION_MAP, log_proposal  # noqa: E402
+from llm_replay_test import _same_diagnosis, ensure_llm_diagnosis_log_table  # noqa: E402
+from trust_gate import action_is_correct, eligible_action_for_streak, eligible_for_trust_ladder  # noqa: E402
+from misdispatch_guard import ensure_misdispatch_tables, record_misdispatch  # noqa: E402
 
-AGENT_URL = "http://localhost:8001/handle"
+DIAGNOSE_URL = "http://localhost:8001/diagnose"
+ACT_URL = "http://localhost:8001/act"
+
+# Split into two independently-timed calls, 2026-07-31 (Kimi review 13's
+# locked decision, see p3_agent.py's module docstring for the full
+# reasoning): a slow/stuck action-proposal call can no longer also blow
+# out the diagnosis call's budget, or vice versa. Diagnosis keeps the
+# old combined-call's 180s -- still the heavier of the two (a full
+# 5-turn ReAct loop, with episode-scoped retry across the whole
+# provider chain on failure).
+#
+# ACT_TIMEOUT_S must cover BOTH real components of /act, not just the
+# LLM side: action_proposer.py's own bounded design caps the LLM part
+# at 3 real calls (~90s worst case), but /act then also DISPATCHES the
+# real action afterward -- restore_from_disk_full alone genuinely polls
+# for up to POD_TERMINATE_TIMEOUT_S + POD_START_TIMEOUT_S = 120s (see
+# actions.py). 90s alone would have been a real, live timeout risk for
+# disk-full specifically (one of the 6 currently can_act classes) the
+# moment its diagnoser_mode ever promotes to "llm". 240s covers the
+# worst realistic case (90s LLM + 120s dispatch + margin) without
+# resorting to a per-class special case.
+DIAGNOSE_TIMEOUT_S = 180
+ACT_TIMEOUT_S = 240
 
 # Found the hard way (2026-07-21): get_unscored_episode always picked
 # the most recent unscored episode by t0, with no check on how OLD
@@ -186,13 +216,99 @@ def diagnosis_matches(predicted: str, actual: str) -> bool:
     # "none" control episodes never went through p3_scorer.py before Phase
     # D (only p2_readonly_loop/scorer.py's systematic validation used
     # them) -- this special case already exists there and is mirrored here
-    # for the same reason: the agent reports "no anomaly detected", never
+    # for the same reason: the STUB reports "no anomaly detected", never
     # the literal string "none".
+    #
+    # CORRECTED 2026-07-31: `predicted` here is now p3_agent's
+    # production_result["diagnosis"], which can ALSO come from the real
+    # LLM (once a class is promoted to Dimension B's "llm" mode) -- and
+    # the LLM speaks FAULT_CLASSES' own vocabulary, "none" literally, not
+    # "no anomaly detected". Without this, every correct "none" diagnosis
+    # from an LLM-mode class would score as WRONG, corrupting Dimension A
+    # itself. Accept either spelling.
     actual = actual.strip().lower()
     predicted = predicted.strip().lower()
     if actual == "none":
-        return predicted == "no anomaly detected"
+        return predicted in ("no anomaly detected", "none")
     return predicted == actual
+
+
+def record_llm_trust(conn: sqlite3.Connection, episode_id: str, actual_class: str,
+                      target: str, namespace: str, result: dict):
+    """
+    Real Dimension B/C wiring (step 4). Runs for EVERY episode -- p3_agent's
+    /handle always runs the real LLM in the background, regardless of
+    current diagnoser_mode, so this always has something to log/compare.
+    This is the ONLY place that ever calls llm_trust_state.record_*
+    (the scorer is the only piece allowed to see ground truth, same
+    discipline as trust_engine's Dimension A above). Never raises on a
+    normal missing-data case (llm_unavailable, non-auto-fix class,
+    fallback-tier) -- those just mean nothing gets recorded this episode,
+    not an error.
+    """
+    stub_result = result.get("stub_result") or {}
+    llm_result = result.get("llm_result") or {}
+    stub_predicted = stub_result.get("diagnosis")
+    llm_diagnosis = llm_result.get("llm_diagnosis")
+
+    ensure_llm_diagnosis_log_table(conn)
+    conn.execute(
+        """
+        INSERT INTO llm_diagnosis_log (
+            episode_id, actual_class, stub_predicted_class, stub_correct,
+            llm_diagnosis, llm_confidence, llm_confidence_source, llm_reasoning,
+            provider, model, tier, matches_ground_truth, matches_stub, failed_attempts_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            episode_id, actual_class, stub_predicted,
+            int(diagnosis_matches(stub_predicted, actual_class)) if stub_predicted else None,
+            llm_diagnosis, llm_result.get("llm_confidence"), llm_result.get("llm_confidence_source"),
+            llm_result.get("llm_reasoning"), llm_result.get("provider"), llm_result.get("model"),
+            llm_result.get("tier"),
+            int(llm_diagnosis == actual_class) if llm_diagnosis else None,
+            int(_same_diagnosis(llm_diagnosis, stub_predicted)) if llm_diagnosis and stub_predicted else None,
+            json.dumps(llm_result.get("failed_attempts", []), default=lambda o: getattr(o, "__dict__", str(o))),
+        ),
+    )
+    conn.commit()
+
+    # Dimension B: only when the LLM actually produced a diagnosis this
+    # episode -- llm_unavailable/max_turns_exceeded/invalid_tool_name have
+    # no diagnosis to score, so no streak movement either way (a dead
+    # provider shouldn't be able to revert a class's mode by producing
+    # nothing, same "don't punish silence" reasoning circuit_breaker.py
+    # already uses elsewhere).
+    if llm_result.get("status") == "diagnosed":
+        diag_eligible, diag_reason = eligible_for_trust_ladder(llm_result.get("tier"))
+        if diag_eligible:
+            diag_correct = llm_diagnosis == actual_class
+            b_result = record_diagnoser_outcome(conn, actual_class, diag_correct, episode_id=episode_id)
+            print("Dimension B update:", b_result)
+        else:
+            print(f"Dimension B: not recorded -- {diag_reason}")
+
+    # Dimension C: only when p3_agent actually computed a real action
+    # proposal this episode (diagnoser_mode_used=='llm' AND the LLM's own
+    # diagnosis landed on an auto-fix class) AND the TRUE class is itself
+    # an auto-fix class (nothing real to compare a proposal against
+    # otherwise -- same "ground truth must be an auto-fix class" gate
+    # trust_engine's own record_outcome enforces for Dimension A).
+    proposal = result.get("llm_action_proposal")
+    if proposal is not None and proposal.get("tool_name") is not None and actual_class in DETERMINISTIC_ACTION_MAP:
+        log_proposal(episode_id, target, namespace, proposal)  # opens its own connection, ensures its own table
+
+        gt_tool, gt_params_fn = DETERMINISTIC_ACTION_MAP[actual_class]
+        gt_params = gt_params_fn(target, namespace)
+        action_ok, action_reason = action_is_correct(
+            actual_class, proposal["tool_name"], proposal["params"], gt_tool, gt_params
+        )
+        action_eligible, action_gate_reason = eligible_action_for_streak(proposal.get("tier"))
+        if action_eligible:
+            c_result = record_action_outcome(conn, actual_class, action_ok, episode_id=episode_id)
+            print("Dimension C update:", c_result, "--", action_reason)
+        else:
+            print(f"Dimension C: not recorded -- {action_gate_reason}")
 
 
 def main():
@@ -208,6 +324,7 @@ def main():
     ensure_episode_snapshots_table(conn)
     ensure_trust_tables(conn)
     ensure_circuit_breaker_table(conn)
+    ensure_llm_trust_tables(conn)
 
     if args.episode_id:
         episode = get_episode_by_id(conn, args.episode_id)
@@ -219,16 +336,34 @@ def main():
 
     episode_id, actual_class, target, namespace = episode
 
-    # 180s, not 15s -- restore_from_disk_full (2026-07-22) now genuinely
-    # polls for pod replacement instead of returning the instant the API
-    # accepts a patch: up to POD_TERMINATE_TIMEOUT_S (60s) waiting for
-    # the old pod to actually go, plus up to POD_START_TIMEOUT_S (60s)
-    # for the replacement to reach Running = 120s worst case, plus
-    # diagnosis time. A real disk-full fix legitimately takes far longer
-    # than crash-loop/oom's near-instant actions.
-    resp = requests.post(AGENT_URL, json={"target": target, "namespace": namespace}, timeout=180)
-    resp.raise_for_status()
-    result = resp.json()
+    # Phase 1: diagnosis only (stub + background LLM), independently timed.
+    diag_resp = requests.post(
+        DIAGNOSE_URL, json={"target": target, "namespace": namespace}, timeout=DIAGNOSE_TIMEOUT_S
+    )
+    diag_resp.raise_for_status()
+    result = diag_resp.json()
+
+    # Phase 2: action proposal + real dispatch, ONLY when /diagnose said
+    # it's worth it (an auto-fix class currently can_act) -- skipping the
+    # call entirely for report-only classes avoids a wasted round trip,
+    # same early-return behavior the old combined /handle had.
+    if result.get("eligible_for_action"):
+        act_req = {
+            "target": target, "namespace": namespace,
+            "predicted": result["diagnosis"], "diagnoser_mode_used": result["diagnoser_mode_used"],
+            "confidence": result.get("confidence"), "reasoning": result.get("reasoning"),
+            "llm_provider": (result.get("llm_result") or {}).get("provider"),
+            "llm_model": (result.get("llm_result") or {}).get("model"),
+            "tool_output": result.get("tool_output"),
+        }
+        act_resp = requests.post(ACT_URL, json=act_req, timeout=ACT_TIMEOUT_S)
+        act_resp.raise_for_status()
+        result.update(act_resp.json())
+    else:
+        result.setdefault("action_taken", None)
+        result.setdefault("action_result", None)
+        result.setdefault("action_source", None)
+        result.setdefault("llm_action_proposal", None)
 
     predicted_class = result["diagnosis"]
     confidence = result.get("confidence")
@@ -310,6 +445,32 @@ def main():
         print("trust update:", trust_result)
         if breaker_result and breaker_result["tripped"]:
             print("CIRCUIT BREAKER TRIPPED:", breaker_result)
+
+    # Cross-class misdispatch guard -- REVISED 2026-07-31 after Kimi
+    # review 15 rejected the original fix (which called record_outcome
+    # on predicted_class, penalizing its OWN promotion streak). Real
+    # reasoning for the reversal: predicted_class's action mechanism
+    # executed exactly as designed (dry-run passed, patch applied) --
+    # the failure was entirely in diagnosis, not in that class's own
+    # action reliability. Penalizing its streak for that would corrupt
+    # what "N consecutive correct" is supposed to measure (a class
+    # frequently confused with others would get demoted despite a
+    # perfectly reliable action mechanism). See misdispatch_guard.py's
+    # own module docstring for the full reasoning and the accepted
+    # alternative: track misdispatches separately, force a temporary
+    # safety hold (NOT a demotion, streak untouched) if they recur
+    # often enough, never touch trust_state's streak at all here.
+    if action_taken is not None and predicted_class != actual_class and predicted_class in PROMOTION_STREAK:
+        ensure_misdispatch_tables(conn)
+        misdispatch_result = record_misdispatch(conn, episode_id, predicted_class, actual_class)
+        print("misdispatch guard:", misdispatch_result)
+        if misdispatch_result["hold_triggered"]:
+            print(f"SAFETY HOLD TRIGGERED for {predicted_class} -- streak preserved, dispatch paused.")
+
+    # Dimension B/C -- always runs, independent of Dimension A above,
+    # since /handle always ran the real LLM in the background regardless
+    # of this episode's action outcome.
+    record_llm_trust(conn, episode_id, actual_class, target, namespace, result)
 
     conn.close()
 

@@ -68,6 +68,42 @@ CONNECTION_POOL_THRESHOLD = 100
 # real fault.
 NETWORK_PARTITION_MAX_THROUGHPUT_BPS = 200
 
+# Real bug found live (2026-07-31, overnight batch): the throughput
+# check above can still miss a genuine partition -- confirmed via two
+# real misdiagnosed episodes where the min_over_time([2m]) throughput
+# query read 2506/9864 bytes/s (at or ABOVE the ~1900-2400 bytes/s
+# normal baseline, not below it -- the query's lookback window missed
+# the actual low-throughput period during the fault, likely reading
+# post-recovery/retry-burst traffic instead; a shuffled multi-hour
+# batch run's real diagnosis timing is less predictable than the
+# original 2026-07-24 fix assumed). Both misdiagnosed episodes shared
+# a second, independent tell the throughput check doesn't use at all:
+# p95_latency_ms landed at an exact ~60000ms ceiling -- k6's own
+# default request timeout, not an organic percentile. A genuine
+# network-latency episode can NEVER produce this: the real injected
+# delay is only 500ms (+/-50ms jitter, see NETWORK_LATENCY_DELAY in
+# injector.py) -- nothing about that mechanism can push a real p95
+# anywhere near 10 real seconds, let alone 60. A request that HANGS
+# until timeout (rather than completing slow) is only possible when
+# the network is genuinely cut, not merely delayed -- so a p95 this
+# high is itself an unambiguous partition signal, independent of
+# whether the throughput check happened to catch the same episode.
+# 10000ms sits with a large real margin above what 500ms+jitter could
+# ever organically produce and a large real margin below the 60000ms
+# timeout artifact itself.
+NETWORK_PARTITION_LATENCY_SATURATION_MS = 10000
+
+# See oom_sticky_query's own docstring for the full reasoning -- bounds
+# the sticky OOMKilled gauge to the specific container instance that was
+# actually restarted (container_start_time_seconds), not to unrelated
+# pod churn on the same target. 20 minutes is a reasoned starting value
+# (comfortably covers retries + a reset-rollout + --shuffle queueing
+# stacking worse than the 6-minute case that just failed), not yet
+# re-derived from a real measured worst-case batch-run delay -- revisit
+# and tighten once that's measured, per Kimi's own recommendation not to
+# re-guess a bigger number again without real data behind it.
+OOM_STICKY_MAX_CONTAINER_AGE_S = 1200
+
 # user's container_cpu_cfs_throttled_periods_total is a non-resetting
 # counter, already nonzero under light idle traffic (553 at measurement
 # time, 2026-07-24) -- but increase() over a window is well-defined
@@ -300,31 +336,87 @@ def query_prometheus(target: str, namespace: str) -> dict:
     # confirmed and fixed for cpu-throttling's [2m]->[6m] widen, just
     # manifesting here as a cross-metric join failure instead of
     # [0]-indexing. Widened to match the same real margin.
+    # Real bug found live (2026-07-31): pod=~"{target}.*" over-matches --
+    # "catalogue" also matches "catalogue-db" (a completely different
+    # service, independently restarted by e.g. connection-pool-
+    # exhaustion's own mechanism against catalogue-db specifically).
+    # Confirmed live via a direct Prometheus query: catalogue-db really
+    # does show up under a bare "catalogue.*" match. Sock Shop has
+    # several <service>/<service>-db pairs (orders/orders-db,
+    # carts/carts-db, user/user-db), so this wasn't catalogue-specific
+    # exposure, just the one we happened to hit. Fixed by anchoring to
+    # the real k8s pod-name shape (<name>-<replicaset-hash>-<pod-suffix>,
+    # exactly two more hyphen-separated segments, nothing else in
+    # between) -- verified this correctly excludes "catalogue-db-..."
+    # (3 segments after "catalogue-") while still matching
+    # "catalogue-c5cb8d777-5klwz" (exactly 2).
+    _pod_re = f'{target}-[^-]+-[^-]+$'
     oom_query = (
         f'(kube_pod_container_status_last_terminated_reason{{namespace="{namespace}", '
-        f'pod=~"{target}.*", reason="OOMKilled"}} == 1) '
+        f'pod=~"{_pod_re}", reason="OOMKilled"}} == 1) '
         f'and on(namespace, pod) (increase(kube_pod_container_status_restarts_total'
-        f'{{namespace="{namespace}", pod=~"{target}.*"}}[6m]) > 0)'
+        f'{{namespace="{namespace}", pod=~"{_pod_re}"}}[6m]) > 0)'
+    )
+    # Real bug found live (2026-07-31, overnight batch): the [6m] widen
+    # above (2026-07-27) fixed the common case, but the restart-count
+    # JOIN is still time-bound even though the terminated-reason gauge
+    # itself is sticky -- a worse-than-6-minute delay (e.g. a reset-
+    # rollout stacked with a retry, during a long interleaved --shuffle
+    # run) still fails the join even though the gauge alone would still
+    # show OOMKilled==1.
+    #
+    # FIRST fix attempt (reused evicted_query's own "trust the sticky
+    # gauge only if a fresh replacement pod exists" technique) was
+    # caught and rejected before shipping, via Kimi review (one-off,
+    # same chat as reviews 12-15, not archived): eviction genuinely
+    # replaces the pod object (new name), so "a fresh replacement pod
+    # exists" is causally tied to eviction. OOM does NOT replace the
+    # pod -- kubelet restarts the SAME pod object in place. Since oom
+    # and under-provisioned-replicas share the same target (catalogue),
+    # "any recent replacement pod" would have let an unrelated
+    # under-provisioned-replicas episode's own pod churn wrongly
+    # validate a stale OOM reading.
+    #
+    # REAL fix: bind the sticky gauge to container_start_time_seconds
+    # instead -- a real cAdvisor metric (confirmed present on this
+    # cluster via a direct query, 2026-07-31), updated whenever THIS
+    # SPECIFIC container restarts, in place or not. Causally tied to
+    # the actual OOM-restart event, not to unrelated churn on the same
+    # target. OOM_STICKY_MAX_CONTAINER_AGE_S (1200s = 20min) is a
+    # starting value, not yet re-derived from a real measured worst-case
+    # batch-run delay -- revisit and tighten once that's measured, per
+    # Kimi's own recommendation not to re-guess a bigger number again.
+    oom_sticky_query = (
+        f'kube_pod_container_status_last_terminated_reason{{namespace="{namespace}", '
+        f'pod=~"{_pod_re}", reason="OOMKilled"}} == 1 '
+        f'and on(namespace, pod, container) ((time() - container_start_time_seconds'
+        f'{{namespace="{namespace}", pod=~"{_pod_re}"}}) < OOM_STICKY_MAX_CONTAINER_AGE_S)'
     )
     evicted_query = (
         f'kube_pod_status_reason{{namespace="{namespace}", '
-        f'pod=~"{target}.*", reason="Evicted"}} == 1'
+        f'pod=~"{_pod_re}", reason="Evicted"}} == 1'
     )
     recent_running_pod_query = (
-        f'(kube_pod_status_phase{{namespace="{namespace}", pod=~"{target}.*", phase="Running"}} == 1) '
+        f'(kube_pod_status_phase{{namespace="{namespace}", pod=~"{_pod_re}", phase="Running"}} == 1) '
         f'and on(namespace, pod) ((time() - kube_pod_created'
-        f'{{namespace="{namespace}", pod=~"{target}.*"}}) < 180)'
+        f'{{namespace="{namespace}", pod=~"{_pod_re}"}}) < 180)'
     )
     crash_query = (
         f'(kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
-        f'pod=~"{target}.*", reason="CrashLoopBackOff"}} == 1) '
+        f'pod=~"{_pod_re}", reason="CrashLoopBackOff"}} == 1) '
         f'or (increase(kube_pod_container_status_restarts_total{{namespace="{namespace}", '
-        f'pod=~"{target}.*"}}[3m]) > 0)'
+        f'pod=~"{_pod_re}"}}[3m]) > 0)'
     )
 
     oom_resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": oom_query}, timeout=10)
     oom_resp.raise_for_status()
     oom_result = oom_resp.json()["data"]["result"]
+
+    oom_sticky_resp = requests.get(
+        f"{PROMETHEUS_URL}/api/v1/query", params={"query": oom_sticky_query}, timeout=10
+    )
+    oom_sticky_resp.raise_for_status()
+    oom_sticky_result = oom_sticky_resp.json()["data"]["result"]
 
     evicted_resp = requests.get(
         f"{PROMETHEUS_URL}/api/v1/query", params={"query": evicted_query}, timeout=10
@@ -427,9 +519,9 @@ def query_prometheus(target: str, namespace: str) -> dict:
     if target == "orders":
         throughput_query = (
             f'min_over_time((sum(rate(container_network_transmit_bytes_total{{namespace="{namespace}", '
-            f'pod=~"{target}-.*"}}[30s])))[2m:30s]) + '
+            f'pod=~"{target}-[^-]+-[^-]+$"}}[30s])))[2m:30s]) + '
             f'min_over_time((sum(rate(container_network_receive_bytes_total{{namespace="{namespace}", '
-            f'pod=~"{target}-.*"}}[30s])))[2m:30s])'
+            f'pod=~"{target}-[^-]+-[^-]+$"}}[30s])))[2m:30s])'
         )
         throughput_resp = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query", params={"query": throughput_query}, timeout=10
@@ -467,7 +559,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
     # at the exact instant of a plain snapshot query.
     if target == "payment":
         ready_false_query = (
-            f'max_over_time(kube_pod_status_ready{{namespace="{namespace}", pod=~"{target}.*", '
+            f'max_over_time(kube_pod_status_ready{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$", '
             f'condition="false"}}[2m]) == 1'
         )
         ready_false_resp = requests.get(
@@ -495,7 +587,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
     if target == "front-end":
         image_pull_failing_query = (
             f'max_over_time(kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
-            f'pod=~"{target}.*", reason=~"ImagePullBackOff|ErrImagePull"}}[2m]) == 1'
+            f'pod=~"{target}-[^-]+-[^-]+$", reason=~"ImagePullBackOff|ErrImagePull"}}[2m]) == 1'
         )
         image_pull_failing_resp = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query", params={"query": image_pull_failing_query}, timeout=10
@@ -553,7 +645,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
     if target == "shipping":
         memory_query = (
             f'max_over_time(container_memory_working_set_bytes{{namespace="{namespace}", '
-            f'pod=~"{target}.*", container="{target}"}}[3m])'
+            f'pod=~"{target}-[^-]+-[^-]+$", container="{target}"}}[3m])'
         )
         memory_resp = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query", params={"query": memory_query}, timeout=10
@@ -579,7 +671,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
     if target == "catalogue-db":
         threads_query = (
             f'max_over_time(mysql_global_status_threads_connected{{namespace="{namespace}", '
-            f'pod=~"{target}.*"}}[3m])'
+            f'pod=~"{target}-[^-]+-[^-]+$"}}[3m])'
         )
         threads_resp = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query", params={"query": threads_query}, timeout=10
@@ -631,7 +723,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
     if target == "user":
         throttle_query = (
             f'increase(container_cpu_cfs_throttled_periods_total{{namespace="{namespace}", '
-            f'pod=~"{target}-.*", container="{target}"}}[6m])'
+            f'pod=~"{target}-[^-]+-[^-]+$", container="{target}"}}[6m])'
         )
         throttle_resp = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query", params={"query": throttle_query}, timeout=10
@@ -664,6 +756,14 @@ def query_prometheus(target: str, namespace: str) -> dict:
         cpu_throttle_periods_increase = None
 
     oom_pods = [entry["metric"].get("pod") for entry in oom_result]
+    if not oom_pods:
+        # Fast join found nothing (real delay exceeded the [6m] restart-
+        # count window) -- fall back to the sticky-gauge-bound-by-
+        # container-start-time query, which is already causally scoped
+        # to the actual restarted container (see oom_sticky_query's own
+        # docstring) -- no separate has_recent_replacement_pod trust
+        # condition needed here, unlike evicted_pods below.
+        oom_pods = [entry["metric"].get("pod") for entry in oom_sticky_result]
     # Only trust the Evicted signal if there's ALSO a freshly-created
     # Running pod for this target -- see query docstring above for why
     # the evicted pod's own metadata can't be trusted for recency.
@@ -757,6 +857,22 @@ def stub_diagnose(tool_output: dict) -> dict:
             "confidence": 0.6,
             "reasoning": f"orders' combined network throughput {combined_throughput_bps:.1f} bytes/s "
                          f"< {NETWORK_PARTITION_MAX_THROUGHPUT_BPS} bytes/s threshold (stubbed rule, not LLM)",
+        }
+    # Second, independent partition signal (2026-07-31, see
+    # NETWORK_PARTITION_LATENCY_SATURATION_MS's own docstring): catches
+    # a real partition the throughput check above missed (its lookback
+    # window can land after the fault has already recovered). A p95
+    # this high is only mechanically possible when requests HANG until
+    # a client timeout, never from the real 500ms+jitter latency
+    # mechanism -- so this is checked before the plain latency-threshold
+    # check below, same "more specific evidence first" principle.
+    if p95_latency_ms is not None and p95_latency_ms >= NETWORK_PARTITION_LATENCY_SATURATION_MS:
+        return {
+            "diagnosis": "network-partition",
+            "confidence": 0.6,
+            "reasoning": f"p95 request latency {p95_latency_ms}ms >= {NETWORK_PARTITION_LATENCY_SATURATION_MS}ms "
+                         f"saturation ceiling -- a request hanging until client timeout, not organic latency "
+                         f"(the real network-latency mechanism only ever injects 500ms+jitter) (stubbed rule, not LLM)",
         }
     if p95_latency_ms is not None and p95_latency_ms >= HIGH_LATENCY_THRESHOLD_MS:
         return {

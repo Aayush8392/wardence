@@ -46,10 +46,20 @@ Real cost bound: at most 3 real LLM calls per action proposal (2 on the
 first provider + 1 escalated), versus an unbounded worst case if every
 provider in the chain were retried twice.
 
-COMPARISON-ONLY, same discipline as react_agent.py, until the 150-
-episode-per-class floor clears (see trust_gate.py): this module NEVER
-calls actions.ALLOWED_ACTIONS for real. It returns a plain dict for the
-caller to log; nothing here dispatches a live Kubernetes action yet.
+This module itself NEVER calls actions.ALLOWED_ACTIONS -- it returns a
+plain dict (tool_name/params/source/tier) for the caller to either log
+only, or dispatch for real via ALLOWED_ACTIONS itself.
+
+CORRECTED 2026-07-30/31: the 150-episode-per-class floor this used to
+be gated on is DROPPED (see wardence_context.md's Model Strategy
+section). p3_agent.py's /handle now dispatches this module's proposal
+for real when Dimension C (action_trust, see
+p3_trust_action/llm_trust_state.py) is "llm_can_act" for the fault
+class -- earned via 5 consecutive both-diagnosis-and-action-correct
+episodes, revoked instantly on one miss. Below that state, this
+module's output is still computed (Dimension C's streak needs the
+data) but only logged, never dispatched -- the deterministic mapping
+above is what actually runs instead.
 """
 import json
 import sqlite3
@@ -104,16 +114,23 @@ ACTION_SCHEMA_TEXT = """Available actions and their EXACT real parameter formats
 PROMPT_TEMPLATE = """You are an SRE agent. You have already diagnosed the following real fault:
 diagnosis={diagnosis}, target={target}, namespace={namespace}, confidence={confidence}, reasoning="{reasoning}"
 
+Real observed data at diagnosis time (from live Prometheus/log queries -- use the actual numbers here to size any magnitude-sensitive parameter, don't guess a generic/typical value):
+{tool_output}
+
 {schema}
+
+For patch_memory_limit/patch_cpu_limit specifically: base the new limit on the real usage numbers above (e.g. peak_memory_mib for memory), not on a commonly-seen default value -- pick a real headroom margin above the actual observed peak.
 
 Propose EXACTLY ONE fix action for this specific fault. Respond with ONLY one JSON object, no markdown, no other text:
 {{"tool": "<tool name>", "params": {{...}}, "reasoning": "<one sentence>"}}{feedback}"""
 
 
-def _propose_once(entry: dict, diagnosis: dict, target: str, namespace: str, feedback: str = "") -> dict:
+def _propose_once(entry: dict, diagnosis: dict, target: str, namespace: str,
+                   tool_output: dict | None = None, feedback: str = "") -> dict:
     prompt = PROMPT_TEMPLATE.format(
         diagnosis=diagnosis["diagnosis"], target=target, namespace=namespace,
         confidence=diagnosis.get("confidence"), reasoning=diagnosis.get("reasoning", ""),
+        tool_output=json.dumps(tool_output, default=str) if tool_output else "(not available)",
         schema=ACTION_SCHEMA_TEXT, feedback=feedback,
     )
     result = call_one(entry, prompt, timeout=30)
@@ -147,7 +164,7 @@ def _find_chain_entry(provider: str, model: str) -> Optional[dict]:
 
 
 def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: str,
-                    diagnosis_provider: str, diagnosis_model: str) -> dict:
+                    diagnosis_provider: str, diagnosis_model: str, tool_output: dict | None = None) -> dict:
     """
     fault_class: the LLM's OWN diagnosed class (not ground truth -- this
     proposes an action for whatever the loop just diagnosed, same
@@ -157,6 +174,16 @@ def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: st
     diagnosis_provider/diagnosis_model: from that SAME result -- used to
     locate where in PROVIDER_CHAIN to start (Kimi's structural gap d1:
     never blindly restart from chain[0]).
+    tool_output: the REAL observed metrics from /diagnose's own
+    query_prometheus call (2026-07-31 addition, real bug found live-
+    testing: without this, the model has no actual numbers to size a
+    magnitude parameter from and defaults to a generic/typical-looking
+    value instead of reasoning from this container's real headroom --
+    confirmed live, oom proposed 512Mi twice in a row against a real
+    tested-safe 400Mi, with zero access to the real peak_memory_mib
+    that would have let it reason about it). Optional/None-safe so this
+    doesn't become a hard dependency for any future caller that doesn't
+    have it handy.
 
     Returns a dict, always with "source" in {"llm_primary_retry",
     "llm_escalated", "deterministic_fallback", "not_auto_fix_class"}.
@@ -170,14 +197,14 @@ def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: st
 
     if diagnosis_entry is not None:
         # Attempt 1 + 1 retry, SAME provider that succeeded at diagnosis.
-        attempt = _propose_once(diagnosis_entry, diagnosis, target, namespace)
+        attempt = _propose_once(diagnosis_entry, diagnosis, target, namespace, tool_output=tool_output)
         attempts.append(attempt)
         if attempt["outcome"] == "validated":
             return {**attempt, "source": "llm_primary_retry", "fault_class": fault_class, "attempts": attempts}
 
         if attempt["outcome"] == "validator_rejected":
             feedback = f'\nYour previous attempt was rejected: {attempt["reason"]}. Correct it and try again.'
-            attempt2 = _propose_once(diagnosis_entry, diagnosis, target, namespace, feedback=feedback)
+            attempt2 = _propose_once(diagnosis_entry, diagnosis, target, namespace, tool_output=tool_output, feedback=feedback)
             attempts.append(attempt2)
             if attempt2["outcome"] == "validated":
                 return {**attempt2, "source": "llm_primary_retry", "fault_class": fault_class, "attempts": attempts}
@@ -187,7 +214,7 @@ def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: st
         diag_idx = PROVIDER_CHAIN.index(diagnosis_entry)
         if diag_idx < len(PROVIDER_CHAIN) - 1:
             escalated_entry = PROVIDER_CHAIN[diag_idx + 1]
-            attempt3 = _propose_once(escalated_entry, diagnosis, target, namespace)
+            attempt3 = _propose_once(escalated_entry, diagnosis, target, namespace, tool_output=tool_output)
             attempts.append(attempt3)
             if attempt3["outcome"] == "validated":
                 return {**attempt3, "source": "llm_escalated", "fault_class": fault_class, "attempts": attempts}

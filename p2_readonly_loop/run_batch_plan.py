@@ -292,14 +292,41 @@ def _run_baseline_check() -> bool:
     )
     print(result.stdout.strip())
     if result.returncode != 0:
+        # Real UX change (2026-07-31): this used to hard-refuse and make
+        # the user manually run --fix every single time drift was found
+        # (config left over from a prior real fix, or a leftover dead
+        # pod -- both well-understood, idempotent, already-safe
+        # corrective actions check_all_baselines.py --fix already knows
+        # how to do, same self-healing philosophy as _ensure_oom_baseline/
+        # _restart_catalogue_db_pod elsewhere in this project). Auto-run
+        # --fix, then re-verify clean before proceeding -- only hard-
+        # refuse if the fix itself doesn't actually resolve it (a real,
+        # unexpected problem worth a human looking at, not routine
+        # drift).
         print(result.stderr.strip())
-        print(
-            "\nBaseline drift found -- refusing to start/resume against a "
-            "possibly-broken cluster state. Run:\n"
-            "  python3 check_all_baselines.py --fix\n"
-            "then rerun this script."
+        print("\nBaseline drift found -- auto-fixing (config reset to documented baseline / dead-pod cleanup, both idempotent)...")
+        fix_result = subprocess.run(
+            [sys.executable, str(BASELINE_CHECK_SCRIPT), "--fix"],
+            capture_output=True, text=True, start_new_session=True,
         )
-        return False
+        print(fix_result.stdout.strip())
+        if fix_result.returncode != 0:
+            print(fix_result.stderr.strip())
+            print("\n--fix itself failed to resolve the drift -- this is a real, unexpected "
+                  "problem, not routine drift. Refusing to start/resume. Investigate manually.")
+            return False
+
+        reverify = subprocess.run(
+            [sys.executable, str(BASELINE_CHECK_SCRIPT)],
+            capture_output=True, text=True, start_new_session=True,
+        )
+        if reverify.returncode != 0:
+            print(reverify.stdout.strip())
+            print(reverify.stderr.strip())
+            print("\nStill dirty after --fix -- refusing to start/resume. Investigate manually.")
+            return False
+        print("Baselines clean after auto-fix.\n")
+        return True
     print("Baselines clean.\n")
     return True
 
