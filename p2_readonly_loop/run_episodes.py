@@ -167,7 +167,20 @@ def wait_for_infra_ready() -> bool:
 
 
 def run(script: str, extra_args: list[str] | None = None):
-    cmd = [sys.executable, script] + (extra_args or [])
+    # Real bug found 2026-07-31: `script` used to be passed bare
+    # ("injector.py"), which subprocess.run resolves relative to the
+    # PARENT process's cwd, not this file's own directory -- worked fine
+    # whenever run_batch_plan.py happened to be invoked from inside
+    # p2_readonly_loop/ (the project's habitual pattern), but broke with
+    # a real "can't open file" the moment someone ran it from the repo
+    # root instead (e.g. `python3 p2_readonly_loop/run_batch_plan.py`).
+    # Resolved to an absolute path off THIS file's own location, and
+    # cwd explicitly pinned to the same directory -- covers both the
+    # script-not-found case and any future relative-path assumption
+    # inside injector.py/scorer.py itself, regardless of where the
+    # caller's own shell happens to be sitting.
+    script_dir = Path(__file__).parent
+    cmd = [sys.executable, str(script_dir / script)] + (extra_args or [])
     # start_new_session=True (2026-07-28): launches the child in its OWN
     # process group, not the terminal's foreground one -- without this, a
     # Ctrl+C at the terminal delivers SIGINT to injector.py/scorer.py
@@ -178,7 +191,9 @@ def run(script: str, extra_args: list[str] | None = None):
     # child always runs to its own natural completion undisturbed --
     # required for run_batch_plan.py's "Ctrl+C is safe, stops at the next
     # safe point" guarantee to actually be true, not just aspirational.
-    result = subprocess.run(cmd, capture_output=True, text=True, start_new_session=True)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, start_new_session=True, cwd=script_dir
+    )
     print(result.stdout.strip())
     if result.returncode != 0:
         print(result.stderr.strip())

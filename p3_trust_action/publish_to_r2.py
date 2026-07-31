@@ -137,7 +137,7 @@ def build_episodes(conn: sqlite3.Connection) -> list[dict]:
             s.trust_correct, s.phase_e_status, s.phase_e_note,
             snap.tool_output, snap.reasoning, snap.confidence AS snapshot_confidence,
             snap.action_result, snap.durability_verdict AS snapshot_durability_verdict,
-            snap.durability_elapsed_s
+            snap.durability_elapsed_s, snap.gate_substitution
         FROM episodes e
         JOIN scores s ON e.episode_id = s.episode_id
         LEFT JOIN episode_snapshots snap ON e.episode_id = snap.episode_id
@@ -156,6 +156,8 @@ def build_episodes(conn: sqlite3.Connection) -> list[dict]:
             d["tool_output"] = json.loads(d["tool_output"])
         if d.get("action_result"):
             d["action_result"] = json.loads(d["action_result"])
+        if d.get("gate_substitution"):
+            d["gate_substitution"] = json.loads(d["gate_substitution"])
         episodes.append(d)
     return episodes
 

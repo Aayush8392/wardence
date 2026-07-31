@@ -148,6 +148,17 @@ def ensure_episode_snapshots_table(conn: sqlite3.Connection):
         )
         """
     )
+    # gate_substitution added 2026-07-31 (review 16) -- same
+    # table-may-already-exist pattern as ensure_scores_table above.
+    # Populated only on episodes where the dispatch gate actually
+    # redirected the real action; NULL otherwise. This is the real,
+    # honest record the Replay Viewer reads to show "agent diagnosed Y,
+    # actual fault was X, gate applied the correct fix instead" rather
+    # than silently showing the substituted action as if the agent had
+    # proposed it.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(episode_snapshots)")}
+    if "gate_substitution" not in existing_cols:
+        conn.execute("ALTER TABLE episode_snapshots ADD COLUMN gate_substitution TEXT")
     conn.commit()
 
 
@@ -301,7 +312,8 @@ def record_llm_trust(conn: sqlite3.Connection, episode_id: str, actual_class: st
         gt_tool, gt_params_fn = DETERMINISTIC_ACTION_MAP[actual_class]
         gt_params = gt_params_fn(target, namespace)
         action_ok, action_reason = action_is_correct(
-            actual_class, proposal["tool_name"], proposal["params"], gt_tool, gt_params
+            actual_class, proposal["tool_name"], proposal["params"], gt_tool, gt_params,
+            tool_output=result.get("tool_output"),
         )
         action_eligible, action_gate_reason = eligible_action_for_streak(proposal.get("tier"))
         if action_eligible:
@@ -355,6 +367,12 @@ def main():
             "llm_provider": (result.get("llm_result") or {}).get("provider"),
             "llm_model": (result.get("llm_result") or {}).get("model"),
             "tool_output": result.get("tool_output"),
+            # Ground truth, review 16's dispatch gate -- p3_scorer.py is
+            # the only piece of this system allowed to know this; /act
+            # uses it exclusively for the gate's internal comparison,
+            # never forwards it to propose_action/run_react_diagnosis.
+            "episode_id": episode_id,
+            "actual_class": actual_class,
         }
         act_resp = requests.post(ACT_URL, json=act_req, timeout=ACT_TIMEOUT_S)
         act_resp.raise_for_status()
@@ -364,6 +382,7 @@ def main():
         result.setdefault("action_result", None)
         result.setdefault("action_source", None)
         result.setdefault("llm_action_proposal", None)
+        result.setdefault("gate_substitution", None)
 
     predicted_class = result["diagnosis"]
     confidence = result.get("confidence")
@@ -424,8 +443,9 @@ def main():
         """
         INSERT INTO episode_snapshots
             (episode_id, tool_output, reasoning, confidence,
-             action_taken, action_result, durability_verdict, durability_elapsed_s)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             action_taken, action_result, durability_verdict, durability_elapsed_s,
+             gate_substitution)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             episode_id,
@@ -436,6 +456,7 @@ def main():
             json.dumps(action_result) if action_result is not None else None,
             durability_verdict,
             durability_elapsed_s,
+            json.dumps(result.get("gate_substitution")) if result.get("gate_substitution") else None,
         ),
     )
     conn.commit()

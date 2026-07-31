@@ -38,6 +38,26 @@ roughly 3x above what's actually been observed -- a genuine, detectable
 change in diagnostic reliability, not a plausible fluke at normal
 volumes. Revisit if real data ever shows this threshold firing on
 normal, non-anomalous days.
+
+REFRAMED 2026-07-31 (review 16, the dispatch gate, built same
+session): with dispatch_gate.py now sitting in front of every real
+/act dispatch, a cross-class misdispatch that would previously have
+let a wrong action reach the real cluster now gets redirected to the
+actual fault's correct fix instead. This means the safety-hold
+mechanism below is NO LONGER primary blast-radius protection for that
+scenario -- it's now diagnostic-hold + defense-in-depth:
+  1. The gate could have a bug (wrong lookup, race condition, an
+     actual_class the gate's ACTION_MAP has no entry for) -- the hold
+     is a real backstop against the gate itself being wrong.
+  2. The gate only covers dispatches that flow through p3_agent.py's
+     /act. A future dispatch path that doesn't call /act would bypass
+     it entirely; the hold doesn't have that gap.
+  3. misdispatch_log remains the real, honest signal for which classes
+     the diagnostic layer keeps confusing -- valuable operational
+     intelligence regardless of whether the gate is preventing real
+     damage from any single instance of it.
+The threshold/window values above are UNCHANGED by this reframe --
+still real, still sized off the same observed base rate.
 """
 import sqlite3
 from pathlib import Path

@@ -89,11 +89,41 @@ from run_episodes import (  # noqa: E402
     run as run_script,
     wait_for_infra_ready,
 )
-from injector import FAULT_CONFIG  # noqa: E402 -- real per-class targets, not hardcoded
+from injector import (  # noqa: E402 -- real per-class targets, not hardcoded
+    FAULT_CONFIG,
+    _ensure_cpu_throttle_baseline,
+    _ensure_oom_baseline,
+)
 
 HERE = Path(__file__).parent
 PLAN_PATH = HERE / "batch_plan_progress.json"
 PAUSE_FLAG_PATH = HERE / "PAUSE_REQUESTED"
+
+# Real per-class resource-limit baselines that a successful fix
+# permanently changes and nothing else ever reverts (see
+# OOM_BASELINE_MEMORY_LIMIT / CPU_THROTTLE_BASELINE_CPU_LIMIT's own
+# docstrings in injector.py). Originally only reset right before the
+# NEXT same-class injection -- moved here (2026-07-31) to run
+# unconditionally at the one safe pause point, right after a durability
+# verdict has already been recorded and before the pause prompt fires,
+# so the cluster is left in a clean baseline state whether the batch
+# continues or pauses. Both functions are idempotent (no-op if already
+# at baseline) and each does its own kubectl get + patch + rollout-wait
+# internally -- cheap relative to an episode's real runtime (minutes),
+# so no need to check "did this episode's class touch this baseline"
+# first; always run both. A newly added non-self-reverting baseline in
+# the future just gets appended to this list, no dispatch logic needed.
+BASELINE_CHECKS = [
+    lambda: _ensure_oom_baseline(FAULT_CONFIG["oom"]),
+    lambda: _ensure_cpu_throttle_baseline(FAULT_CONFIG["cpu-throttling"]),
+]
+
+
+def _run_baseline_checks():
+    for check in BASELINE_CHECKS:
+        check()
+
+
 BASELINE_CHECK_SCRIPT = HERE / "check_all_baselines.py"
 OUTPUT_DIR = HERE / "output"
 PROMPT_WINDOW_S = 5
@@ -309,7 +339,17 @@ def _run_baseline_check() -> bool:
             [sys.executable, str(BASELINE_CHECK_SCRIPT), "--fix"],
             capture_output=True, text=True, start_new_session=True,
         )
-        print(fix_result.stdout.strip())
+        # check_all_baselines.py's own main() always reprints the FULL
+        # per-item report before applying fixes, --fix or not -- calling
+        # it a second time here would otherwise duplicate the same 7-item
+        # report already shown by the plain check above. Only print from
+        # its "Applying fixes..." marker onward (a real, stable string in
+        # that script's own output) -- the fix actions themselves, not
+        # the redundant re-detection.
+        fix_stdout = fix_result.stdout.strip()
+        marker = "Applying fixes..."
+        idx = fix_stdout.find(marker)
+        print(fix_stdout[idx:] if idx != -1 else fix_stdout)
         if fix_result.returncode != 0:
             print(fix_result.stderr.strip())
             print("\n--fix itself failed to resolve the drift -- this is a real, unexpected "
@@ -584,6 +624,8 @@ def main():
             _save_plan(plan_state)
             print(f"--- real episode recorded, took {episode_elapsed_s:.1f}s "
                   f"({fault_class}: {plan_state['completed'][idx]}/{target_count}, this chunk) ---")
+
+            _run_baseline_checks()
 
             if _pause_requested():
                 plan_state["status"] = "paused"

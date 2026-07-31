@@ -181,7 +181,23 @@ def _call_openai_compat(
         return LLMFailure(provider, model, "bad_response", str(e))
 
     if resp.status_code == 429:
-        return LLMFailure(provider, model, "rate_limited", resp.text[:500])
+        # Review 17 (2026-07-31): Cloudflare's real daily-Neuron-
+        # exhaustion 429 is a distinct, pattern-matchable event (error
+        # code 4006, "daily free allocation" in the body) -- confirmed
+        # via Cloudflare's own community reports, not guessed. Without
+        # this, every subsequent real episode today would re-discover
+        # the exact same 429 and waste a real round-trip before falling
+        # through to the next provider. Mark it exhausted-until-UTC-
+        # midnight so quota_tracker.check_quota() skips it proactively
+        # from the next call onward. The failure TYPE returned here
+        # stays "rate_limited" either way -- this is a side effect, not
+        # a reclassification (quota_tracker's own "quota_exhausted" type
+        # is what a FUTURE skipped call will see, via call_one() above).
+        body_text = resp.text[:500]
+        if provider == "cloudflare" and ("4006" in body_text or "daily free allocation" in body_text):
+            from quota_tracker import mark_exhausted  # local import, same style as call_one()'s own quota_tracker import
+            mark_exhausted(provider, model, reason="Cloudflare 4006: daily free Neuron allocation exhausted")
+        return LLMFailure(provider, model, "rate_limited", body_text)
     if resp.status_code >= 500:
         return LLMFailure(provider, model, "bad_response", f"HTTP {resp.status_code}: {resp.text[:500]}")
     if resp.status_code != 200:
@@ -337,10 +353,16 @@ def call_one(entry: dict, prompt: str, timeout: int = 30) -> Union[LLMResult, LL
 
     quota = check_quota(entry["provider"], entry["model"])
     if quota["status"] == "exhausted":
-        return LLMFailure(
-            entry["provider"], entry["model"], "quota_exhausted",
-            f"real daily limit reached ({quota['used']}/{quota['limit']}) -- no request sent",
+        # quota["limit"] is None for a provider marked exhausted via a
+        # real Cloudflare-4006-style event (review 17) rather than a
+        # known RPD count -- use the real recorded reason in that case
+        # instead of printing "None/None".
+        detail = (
+            f"real daily limit reached ({quota['used']}/{quota['limit']}) -- no request sent"
+            if quota.get("limit") is not None
+            else f"{quota.get('reason', 'marked exhausted')} -- no request sent"
         )
+        return LLMFailure(entry["provider"], entry["model"], "quota_exhausted", detail)
 
     if entry["format"] == "gemini_native":
         result = _call_gemini(entry["model"], prompt, timeout)

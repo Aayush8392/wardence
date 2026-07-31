@@ -67,6 +67,7 @@ from llm_trust_state import (  # noqa: E402
 from action_proposer import DETERMINISTIC_ACTION_MAP, propose_action  # noqa: E402
 from react_agent import run_react_diagnosis  # noqa: E402
 from misdispatch_guard import ensure_misdispatch_tables, get_safety_hold  # noqa: E402
+import dispatch_gate  # noqa: E402
 
 # Both P2 and P3 have a file named agent.py -- a plain `from agent import
 # ...` here would resolve to THIS file (already partially loaded) instead
@@ -152,6 +153,15 @@ class ActRequest(BaseModel):
     llm_provider: str | None = None
     llm_model: str | None = None
     tool_output: dict | None = None
+    # Ground truth, review 16's dispatch gate -- ONLY ever populated by
+    # p3_scorer.py, the sole piece of this system allowed to see it.
+    # Used exclusively for the gate's own comparison inside this
+    # endpoint; never forwarded to propose_action()/run_react_diagnosis
+    # or any other LLM-facing call. None means "no gate check" (e.g. a
+    # caller other than the real scorer, or a live-trigger path that
+    # hasn't been updated to pass it yet) -- never assumed correct.
+    episode_id: str | None = None
+    actual_class: str | None = None
 
 
 def _build_llm_tools(target: str, namespace: str) -> dict:
@@ -320,6 +330,56 @@ def diagnose(req: HandleRequest):
     return response
 
 
+def _dispatch_with_gate(predicted_class: str, proposed_tool: str, proposed_params: dict,
+                         action_source: str, req: "ActRequest") -> tuple[str, dict, str, "dict | None"]:
+    """
+    Real dispatch, gate-checked first (review 16). If req.actual_class
+    is None (caller didn't pass ground truth -- e.g. a live-trigger path
+    not yet wired to it), the gate is skipped entirely and the agent's
+    own proposal dispatches unmodified, same as before this change.
+
+    Never touches req.actual_class for anything except this comparison
+    -- not returned in a form that reaches propose_action/
+    run_react_diagnosis, not stored anywhere the diagnosing agent could
+    read it back on a future call.
+
+    Returns (action_taken, action_result, action_source,
+    gate_substitution). gate_substitution is None unless a real
+    redirect happened, in which case it's the full honest record (what
+    the agent proposed, what actually dispatched, why) -- p3_scorer.py
+    copies this verbatim into episode_snapshots.gate_substitution for
+    the Replay Viewer, so a substitution is never silently invisible.
+    """
+    if req.actual_class is not None:
+        gate_result = dispatch_gate.check(
+            ACTION_MAP, predicted_class, req.actual_class,
+            proposed_tool, proposed_params, req.target, req.namespace, req.tool_output,
+        )
+        if gate_result["substituted"]:
+            conn = sqlite3.connect(DB_PATH)
+            dispatch_gate.log_intervention(
+                conn, req.episode_id, predicted_class, req.actual_class,
+                proposed_tool, gate_result["actual_tool"], gate_result["reason"],
+            )
+            conn.close()
+            action_fn = ALLOWED_ACTIONS[gate_result["actual_tool"]]
+            action_result = action_fn(**gate_result["actual_params"])
+            gate_substitution = {
+                "predicted_class": predicted_class,
+                "actual_class": req.actual_class,
+                "proposed_tool": proposed_tool,
+                "proposed_params": proposed_params,
+                "substituted_tool": gate_result["actual_tool"],
+                "substituted_params": gate_result["actual_params"],
+                "reason": gate_result["reason"],
+            }
+            return gate_result["actual_tool"], action_result, "gate_substituted", gate_substitution
+
+    action_fn = ALLOWED_ACTIONS[proposed_tool]
+    action_result = action_fn(**proposed_params)
+    return proposed_tool, action_result, action_source, None
+
+
 @app.post("/act")
 def act(req: ActRequest):
     """
@@ -338,7 +398,10 @@ def act(req: ActRequest):
     auto-fix class at all -- never raises just because the world moved
     on since /diagnose ran.
     """
-    response = {"action_taken": None, "action_result": None, "action_source": None, "llm_action_proposal": None}
+    response = {
+        "action_taken": None, "action_result": None, "action_source": None,
+        "llm_action_proposal": None, "gate_substitution": None,
+    }
 
     mapping = ACTION_MAP.get(req.predicted)
     if mapping is None:
@@ -379,23 +442,32 @@ def act(req: ActRequest):
             # class -- dispatch WHAT IT PROPOSED (which may already be
             # the deterministic_fallback shape if both LLM attempts
             # failed validation; propose_action always returns something
-            # dispatchable-or-not, never raises).
-            action_fn = ALLOWED_ACTIONS[proposal["tool_name"]]
-            action_result = action_fn(**proposal["params"])
-            response["action_taken"] = proposal["tool_name"]
+            # dispatchable-or-not, never raises). Gate-checked first
+            # (review 16) -- if req.predicted is wrong and this proposal
+            # would misfire on the real fault, the real dispatch is
+            # redirected; Dimension C's own scoring in p3_scorer.py is
+            # untouched either way (still scores what the LLM proposed).
+            action_taken, action_result, action_source, gate_substitution = _dispatch_with_gate(
+                req.predicted, proposal["tool_name"], proposal["params"], proposal["source"], req,
+            )
+            response["action_taken"] = action_taken
             response["action_result"] = action_result
-            response["action_source"] = proposal["source"]
+            response["action_source"] = action_source
+            response["gate_substitution"] = gate_substitution
             return response
 
-    # Deterministic production dispatch -- unchanged from before this
-    # session's build, still the path for: stub-mode classes, LLM-mode
-    # classes not yet Dimension-C-trusted, and any class outside
-    # DETERMINISTIC_ACTION_MAP entirely.
-    action_fn = ALLOWED_ACTIONS[action_name]
-    action_result = action_fn(**kwargs_fn(req.target, req.namespace))
-    response["action_taken"] = action_name
+    # Deterministic production dispatch -- still the path for:
+    # stub-mode classes, LLM-mode classes not yet Dimension-C-trusted,
+    # and any class outside DETERMINISTIC_ACTION_MAP entirely. Gate-
+    # checked the same as the LLM path above -- a wrong STUB diagnosis
+    # is just as real a misdispatch risk as a wrong LLM one.
+    action_taken, action_result, action_source, gate_substitution = _dispatch_with_gate(
+        req.predicted, action_name, kwargs_fn(req.target, req.namespace), "deterministic_production", req,
+    )
+    response["action_taken"] = action_taken
     response["action_result"] = action_result
-    response["action_source"] = "deterministic_production"
+    response["gate_substitution"] = gate_substitution
+    response["action_source"] = action_source
 
     return response
 
