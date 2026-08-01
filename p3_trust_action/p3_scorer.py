@@ -64,11 +64,23 @@ ACT_URL = "http://localhost:8001/act"
 # for up to POD_TERMINATE_TIMEOUT_S + POD_START_TIMEOUT_S = 120s (see
 # actions.py). 90s alone would have been a real, live timeout risk for
 # disk-full specifically (one of the 6 currently can_act classes) the
-# moment its diagnoser_mode ever promotes to "llm". 240s covers the
-# worst realistic case (90s LLM + 120s dispatch + margin) without
-# resorting to a per-class special case.
-DIAGNOSE_TIMEOUT_S = 180
-ACT_TIMEOUT_S = 240
+# moment its diagnoser_mode ever promotes to "llm".
+#
+# RAISED 2026-08-01, real live incident: model_backend.py's new DNS
+# flush-and-retry (real fix for a real recurring stale-DNS failure that
+# night) adds up to one extra `timeout`-length retry to the FIRST
+# provider that fails within any 60s window (cooldown-gated -- every
+# OTHER provider failing in that same window skips the retry and fails
+# fast, same as before). Real corrected worst case for a genuinely bad
+# night (multiple providers failing together): ~240s for diagnosis
+# (60s first-failure-with-retry + 6*30s the rest, 7-entry chain) and
+# ~240s for the LLM part of /act alone (60s + 2*30s, 3-call bound) before
+# even reaching dispatch -- both already at or past the OLD flat
+# ceilings, confirmed live (a real oom episode hit exactly this wall).
+# 300s/450s below are real-margin-over-corrected-worst-case, not
+# arbitrary round numbers.
+DIAGNOSE_TIMEOUT_S = 300
+ACT_TIMEOUT_S = 450
 
 # Found the hard way (2026-07-21): get_unscored_episode always picked
 # the most recent unscored episode by t0, with no check on how OLD

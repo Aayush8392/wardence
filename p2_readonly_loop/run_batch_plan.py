@@ -420,23 +420,45 @@ def _wait_for_target_recency(target: str, fault_class: str, last_fault_time: dic
     container_start_time_seconds, deliberately outlives a single
     diagnosis-query lookback so a delayed check still catches a real
     kill) was still genuinely true -- the container hadn't restarted
-    since the real oom episode. The window-by-upcoming-class logic above
-    only ever guarded against a stale signal sitting inside the NEXT
-    class's OWN diagnosis query -- it had no way to know a DIFFERENT,
-    longer-lived signal from a PRIOR class could contaminate it. Real
-    fix: if the last real fault on this target was itself oom, force
-    waiting the full sticky window regardless of what's about to run
-    next, on top of (not instead of) the existing per-class window."""
+    since the real oom episode.
+
+    SUPERSEDED same day -- this function originally forced the FULL
+    1200s sticky window here when the last class was oom, as a
+    correctness backstop. Real problem found live: this wait blocks
+    BEFORE injector.py is ever called, so it never gave the real fix
+    (injector.py's own _clear_stale_oom_sticky_flag(), which checks the
+    ACTUAL live signal directly and clears it via a real ~3-3.5min
+    rollout restart when needed -- confirmed live, both for real
+    injections and for the live-trigger frontend path) a chance to run
+    at all. The two fixes weren't coordinated -- this one just
+    unconditionally paid the full 20 minutes every time, even though
+    the faster, more precise, already-proven mechanism was sitting right
+    there. Removed the OOM-specific override entirely -- injector.py's
+    own real-time check is strictly better (checks the ACTUAL signal,
+    not an elapsed-time guess) and is universal across every trigger
+    path, not just this batch runner. This function now only enforces
+    each class's own ordinary per-class window again, same as before
+    the oom incident."""
     if target not in last_fault_time:
         return
     window = TARGET_RECENCY_WINDOW_S.get(fault_class, DEFAULT_TARGET_RECENCY_WINDOW_S)
-    if last_fault_class.get(target) == "oom":
-        window = max(window, OOM_STICKY_MAX_CONTAINER_AGE_S)
     elapsed = time.time() - last_fault_time[target]
     if elapsed < window:
         remaining = window - elapsed
         print(f"  waiting {remaining:.0f}s so {target}'s last fault clears the recency window")
-        time.sleep(remaining)
+        # Real fix, 2026-08-01: a plain time.sleep(remaining) here is
+        # NOT safely interruptible -- Python (PEP 475) auto-retries a
+        # sleep interrupted by a signal, so Ctrl+C during this wait would
+        # set _stop_requested but the sleep would just keep running for
+        # its full remaining duration regardless (same class of bug
+        # already found and fixed for _prompt_for_pause's select() call,
+        # not yet applied here until now). Sleeping in short chunks and
+        # checking the real stop flag between them makes this wait
+        # actually stoppable, not just theoretically so.
+        while remaining > 0 and not _stop_requested:
+            chunk = min(remaining, 5)
+            time.sleep(chunk)
+            remaining -= chunk
 
 
 def run_one_episode(fault_class: str, last_fault_time: dict, last_fault_class: dict) -> bool:

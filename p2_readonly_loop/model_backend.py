@@ -33,6 +33,8 @@ import json
 import math
 import os
 import re
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Union
@@ -43,6 +45,61 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 TEMPERATURE = 0  # locked: determinism for every trust-ladder-scored call
+
+_last_dns_flush_at = 0.0
+_DNS_FLUSH_COOLDOWN_S = 60  # don't flush more than once/minute -- if it didn't help last time, flushing again immediately won't either
+
+
+def _flush_windows_dns_once() -> bool:
+    """Real, reactive fix, 2026-08-01: a stale Windows DNS cache entry
+    caused genuine connection failures/timeouts to provider APIs during
+    the first real overnight batch run, confirmed fixed TWICE live by a
+    manual `ipconfig /flushdns` (once for a real NameResolutionError,
+    once for a plain 30s timeout -- both cleared by the same fix, so
+    this is wired to both failure shapes below, not just resolution
+    errors specifically). WSL2 can call Windows executables directly
+    (confirmed live before wiring this in). Reactive, not proactive --
+    only ever fires on an actual real failure, zero overhead on the
+    common successful-call path. Cooldown-gated so a burst of near-
+    simultaneous failures (e.g. multiple providers failing in the same
+    episode) doesn't spam powershell.exe calls for no added benefit --
+    if a flush didn't help within the last minute, flushing again
+    immediately is very unlikely to either. Returns False (best-effort,
+    never crashes a real LLM call over a flush failure) if the flush
+    itself couldn't run or the cooldown is still active."""
+    global _last_dns_flush_at
+    now = time.time()
+    if now - _last_dns_flush_at < _DNS_FLUSH_COOLDOWN_S:
+        return False
+    _last_dns_flush_at = now
+    try:
+        subprocess.run(
+            ["powershell.exe", "-Command", "ipconfig /flushdns"],
+            capture_output=True, text=True, timeout=15,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _post_with_dns_retry(url: str, **kwargs) -> requests.Response:
+    """Shared by _call_gemini/_call_openai_compat -- one real attempt,
+    and on a network-level failure (timeout or any other connection-
+    level RequestException, e.g. NameResolutionError), one flush + one
+    retry before giving up. Re-raises the ORIGINAL exception (not the
+    retry's) if the retry also fails, so the caller's existing except
+    blocks/failure-type classification are completely unaffected --
+    this is purely an extra attempt inserted before the caller ever
+    sees a failure, not a new failure type."""
+    try:
+        return requests.post(url, **kwargs)
+    except (requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+        if _flush_windows_dns_once():
+            try:
+                return requests.post(url, **kwargs)
+            except (requests.exceptions.Timeout, requests.exceptions.RequestException):
+                pass  # retry also failed -- fall through to re-raising the ORIGINAL error
+        raise e
 
 
 @dataclass
@@ -101,7 +158,7 @@ def _call_gemini(model: str, prompt: str, timeout: int, system_prompt: str | Non
     if system_prompt:
         body["systemInstruction"] = {"parts": [{"text": system_prompt}]}
     try:
-        resp = requests.post(
+        resp = _post_with_dns_retry(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
             json=body,
             timeout=timeout,
@@ -182,7 +239,7 @@ def _call_openai_compat(
         body["logprobs"] = True
         body["top_logprobs"] = 1
     try:
-        resp = requests.post(
+        resp = _post_with_dns_retry(
             base_url,
             headers={"Authorization": f"Bearer {key}"},
             json=body,
