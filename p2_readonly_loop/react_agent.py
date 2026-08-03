@@ -98,9 +98,8 @@ FIELD_GUIDANCE = """Field meanings and thresholds (a null/false/empty field mean
 - oom_pods: non-empty -> oom.
 - evicted_pods: non-empty -> disk-full.
 - crashlooping_pods: non-empty (and oom_pods/evicted_pods/front_end_image_pull_failing all empty/false) -> crash-loop. Check front_end_image_pull_failing (below) BEFORE concluding crash-loop -- a bad-rollout episode's own image-reset step can leave residual restart activity on front-end that satisfies this signal even when nothing is actually crash-looping; front_end_image_pull_failing is the more specific, direct signal and wins.
-- combined_throughput_bps (orders only): < 200 bytes/s -> network-partition (check before either latency check below).
-- p95_latency_ms (orders only): >= 10000ms -> network-partition, NOT network-latency (a request hanging until client timeout, not organic latency -- the real network-latency mechanism only ever injects 500ms+jitter, so nothing that high can be real latency). Check this BEFORE the network-latency check below.
-- p95_latency_ms (orders only): >= 300ms (and < 10000ms) -> network-latency.
+- p95_latency_ms (orders only), if NOT null: >= 10000ms -> network-partition (a request hanging until client timeout, not organic latency -- the real network-latency mechanism only ever injects 500ms+jitter, so nothing that high can be real latency). >= 300ms and < 10000ms -> network-latency. Check p95_latency_ms BEFORE combined_throughput_bps below when p95_latency_ms is present -- confirmed via real production data (Kimi review 20) that combined_throughput_bps alone cannot reliably distinguish these two classes (real network-partition and real network-latency episodes' throughput readings genuinely overlap), but a present, non-null p95_latency_ms in either band above is a clean, reliable signal -- across all real ground-truth network-partition episodes checked, none ever showed a mid-range p95 value.
+- combined_throughput_bps (orders only): < 200 bytes/s -> network-partition, but ONLY if p95_latency_ms above is null or did not already give you an answer. This is a weaker, fallback signal, not a primary one, for this specific pair of classes.
 - payment_stuck_not_ready: true -> init-failure.
 - session_db_replicas_hit_zero: true -> session-cart-failure.
 - peak_memory_mib (shipping only): >= 380 MiB -> memory-leak.

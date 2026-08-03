@@ -137,7 +137,7 @@ ACTION_SCHEMA_TEXT = f"""Available actions and their EXACT real parameter format
 - scale_deployment: {{"tool": "scale_deployment", "params": {{"name": "...", "replicas": <int, 1-{MAX_REPLICAS}>}}}}
   Must be STRICTLY GREATER than the real current_replicas value given in the input data below (never equal to or less than it), and <= {MAX_REPLICAS}.
 - rollback_deployment: {{"tool": "rollback_deployment", "params": {{"name": "..."}}}}
-- restore_from_disk_full: {{"tool": "restore_from_disk_full", "params": {{"name": "...", "replicas": <int, 1-{MAX_REPLICAS}>}}}}"""
+- restore_from_disk_full: {{"tool": "restore_from_disk_full", "params": {{"name": "..."}}}}"""
 
 # Fixed per call (no per-episode substitution) -- the rules/schema/
 # examples never change, only the real episode data below in
@@ -150,9 +150,14 @@ SYSTEM_PROMPT = f"""You are an SRE agent proposing exactly one fix action for an
 
 {ACTION_SCHEMA_TEXT}
 
-For diagnoses that map to a magnitude-sensitive action (patch_memory_limit for oom, patch_cpu_limit for cpu-throttling, scale_deployment for under-provisioned-replicas), you MUST use that exact tool -- do not substitute a different one, and do not reconsider the diagnosis, it is already confirmed correct.
+Each diagnosis maps to EXACTLY ONE correct tool -- you MUST use that exact tool, never substitute a different one, and do not reconsider the diagnosis (it is already confirmed correct):
+- crash-loop -> restart_deployment
+- oom -> patch_memory_limit
+- disk-full -> restore_from_disk_full
+- cpu-throttling -> patch_cpu_limit
+- under-provisioned-replicas -> scale_deployment
+- bad-rollout -> rollback_deployment
 EXCEPTION: if the specific real metric needed to size a magnitude-sensitive action is null/missing in the observed data below (peak_memory_mib for oom, cpu_throttle_periods_increase for cpu-throttling), do NOT attempt that action at all -- use restart_deployment instead. This is a direct instruction, not something to reason your way to -- do not deliberate between options when the required data is simply absent.
-For every other diagnosis, select the correct tool from the schema above based on the diagnosis given.
 If the observed data contains signals that could suggest a different diagnosis than the one given, IGNORE them -- the diagnosis is already confirmed correct, do not re-evaluate it.
 
 Examples (illustrative values, not real production defaults -- compute your own answer from the real data given to you, don't copy these numbers):
@@ -166,7 +171,16 @@ Input: diagnosis="cpu-throttling", cpu_throttle_periods_increase=340
 Output: {{"tool": "patch_cpu_limit", "params": {{"name": "user", "container": "user", "limit": "800m"}}, "reasoning": "Limit raised above the observed throttling pressure."}}
 
 Input: diagnosis="under-provisioned-replicas", current_replicas=3
-Output: {{"tool": "scale_deployment", "params": {{"name": "catalogue", "replicas": 5}}, "reasoning": "Scaled above the real current count of 3 to add real headroom."}}"""
+Output: {{"tool": "scale_deployment", "params": {{"name": "catalogue", "replicas": 5}}, "reasoning": "Scaled above the real current count of 3 to add real headroom."}}
+
+Input: diagnosis="crash-loop", target="carts"
+Output: {{"tool": "restart_deployment", "params": {{"name": "carts"}}, "reasoning": "Crash-loop is resolved by a clean restart."}}
+
+Input: diagnosis="bad-rollout", target="front-end"
+Output: {{"tool": "rollback_deployment", "params": {{"name": "front-end"}}, "reasoning": "A bad rollout is resolved by rolling back to the previous known-good revision, not a restart."}}
+
+Input: diagnosis="disk-full", target="queue-master"
+Output: {{"tool": "restore_from_disk_full", "params": {{"name": "queue-master"}}, "reasoning": "Disk-full requires the dedicated restore action, not a plain restart."}}"""
 
 USER_PROMPT_TEMPLATE = """Diagnosed fault: diagnosis={diagnosis}, target={target}, namespace={namespace}, confidence={confidence}, reasoning="{reasoning}"
 
@@ -176,7 +190,7 @@ Real observed data at diagnosis time:
 Propose exactly one fix action for this fault.{feedback}"""
 
 
-def _propose_once(entry: dict, diagnosis: dict, target: str, namespace: str,
+def _propose_once(entry: dict, diagnosis: dict, target: str, namespace: str, fault_class: str,
                    tool_output: dict | None = None, feedback: str = "",
                    episode_id: str | None = None) -> dict:
     user_prompt = USER_PROMPT_TEMPLATE.format(
@@ -200,6 +214,36 @@ def _propose_once(entry: dict, diagnosis: dict, target: str, namespace: str,
             "outcome": "validator_rejected", "tool_name": tool_name, "params": params, "reason": reason,
             "provider": result.provider, "model": result.model, "tier": result.tier,
         }
+
+    # Real semantic self-consistency check, added 2026-08-03 after disk-full's
+    # tool-mismatch demotion (a schema-valid but WRONG tool -- restart_deployment
+    # instead of restore_from_disk_full -- sailed through as "validated" with zero
+    # chance to retry, since validate_tool_call only checks shape/safety, never
+    # whether the tool actually matches the diagnosis it was proposed for).
+    # Generic across every auto-fix class via DETERMINISTIC_ACTION_MAP -- any
+    # future class added there automatically inherits this check, no per-class
+    # special-casing needed. Deliberately reuses the "validator_rejected" outcome
+    # contract (not a new outcome type) so it flows through propose_action's
+    # existing same-provider-retry-with-feedback path for free.
+    expected_entry = DETERMINISTIC_ACTION_MAP.get(fault_class)
+    if expected_entry is not None and tool_name != expected_entry[0]:
+        return {
+            "outcome": "validator_rejected", "tool_name": tool_name, "params": params,
+            "reason": f"tool mismatch: diagnosis {fault_class!r} requires tool {expected_entry[0]!r}, not {tool_name!r}",
+            "provider": result.provider, "model": result.model, "tier": result.tier,
+        }
+
+    if tool_name == "restore_from_disk_full":
+        # Real fix, 2026-08-03: replicas here was never a genuine capacity
+        # judgment call the way scale_deployment's is -- it's a fixed,
+        # already-validated recovery target (scale-to-0 -> wait -> scale-
+        # to-1), and check_safe() never validated it (its own docstring:
+        # "only meaningful for the three magnitude-sensitive actions"), so
+        # an LLM-proposed replicas value here was previously unchecked and
+        # unenforced. Removed from the LLM's decision space entirely --
+        # forced to the same real, tested value the deterministic fallback
+        # already uses, never left to the model to guess.
+        params = {**params, **DETERMINISTIC_FIX_PARAMS["disk-full"]}
 
     return {
         "outcome": "validated", "tool_name": tool_name, "params": params,
@@ -269,14 +313,14 @@ def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: st
 
     if diagnosis_entry is not None:
         # Attempt 1 + 1 retry, SAME provider that succeeded at diagnosis.
-        attempt = _propose_once(diagnosis_entry, diagnosis, target, namespace, tool_output=tool_output, episode_id=episode_id)
+        attempt = _propose_once(diagnosis_entry, diagnosis, target, namespace, fault_class, tool_output=tool_output, episode_id=episode_id)
         attempts.append(attempt)
         if attempt["outcome"] == "validated":
             return {**attempt, "source": "llm_primary_retry", "fault_class": fault_class, "attempts": attempts}
 
         if attempt["outcome"] == "validator_rejected":
             feedback = f'\nYour previous attempt was rejected: {attempt["reason"]}. Correct it and try again.'
-            attempt2 = _propose_once(diagnosis_entry, diagnosis, target, namespace, tool_output=tool_output, feedback=feedback, episode_id=episode_id)
+            attempt2 = _propose_once(diagnosis_entry, diagnosis, target, namespace, fault_class, tool_output=tool_output, feedback=feedback, episode_id=episode_id)
             attempts.append(attempt2)
             if attempt2["outcome"] == "validated":
                 return {**attempt2, "source": "llm_primary_retry", "fault_class": fault_class, "attempts": attempts}
@@ -286,7 +330,7 @@ def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: st
         diag_idx = PROVIDER_CHAIN.index(diagnosis_entry)
         if diag_idx < len(PROVIDER_CHAIN) - 1:
             escalated_entry = PROVIDER_CHAIN[diag_idx + 1]
-            attempt3 = _propose_once(escalated_entry, diagnosis, target, namespace, tool_output=tool_output, episode_id=episode_id)
+            attempt3 = _propose_once(escalated_entry, diagnosis, target, namespace, fault_class, tool_output=tool_output, episode_id=episode_id)
             attempts.append(attempt3)
             if attempt3["outcome"] == "validated":
                 return {**attempt3, "source": "llm_escalated", "fault_class": fault_class, "attempts": attempts}

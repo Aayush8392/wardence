@@ -880,27 +880,23 @@ def stub_diagnose(tool_output: dict) -> dict:
                          "the session/cart store itself is down, not a crash-loop or generic "
                          "restart (stubbed rule, not LLM)",
         }
-    # Checked BEFORE p95 latency, same "more specific evidence first"
-    # principle as OOM/Evicted before crash-loop above: a real partition
-    # likely leaves p95_latency_ms stale or unelevated anyway (k6's
-    # requests are hanging, not completing, during a genuine partition
-    # -- see combined_throughput_bps's own docstring), but checking
-    # throughput first removes any ambiguity rather than relying on that.
-    if combined_throughput_bps is not None and combined_throughput_bps < NETWORK_PARTITION_MAX_THROUGHPUT_BPS:
-        return {
-            "diagnosis": "network-partition",
-            "confidence": 0.6,
-            "reasoning": f"orders' combined network throughput {combined_throughput_bps:.1f} bytes/s "
-                         f"< {NETWORK_PARTITION_MAX_THROUGHPUT_BPS} bytes/s threshold (stubbed rule, not LLM)",
-        }
-    # Second, independent partition signal (2026-07-31, see
-    # NETWORK_PARTITION_LATENCY_SATURATION_MS's own docstring): catches
-    # a real partition the throughput check above missed (its lookback
-    # window can land after the fault has already recovered). A p95
-    # this high is only mechanically possible when requests HANG until
-    # a client timeout, never from the real 500ms+jitter latency
-    # mechanism -- so this is checked before the plain latency-threshold
-    # check below, same "more specific evidence first" principle.
+    # REORDERED 2026-08-03, after Kimi review 20 (reviews/20_network_partition_
+    # latency_discrimination_kimi_review.md) plus real production data from a
+    # 290-episode batch: a present, mid-range p95_latency_ms (300-10000ms) is
+    # checked BEFORE combined_throughput_bps now, not after. Real reason,
+    # empirically confirmed (not assumed): combined_throughput_bps alone
+    # cannot discriminate the two classes -- real network-partition episodes'
+    # own throughput readings (26-89 bytes/s) directly overlap false-positive
+    # network-latency episodes' readings (32-73 bytes/s), confirmed via two
+    # independent real Prometheus signals (bytes AND packet counts both
+    # falsified as clean discriminators, see the same review). But p95_latency_ms,
+    # when present and in the 300-10000ms band, is a CLEAN signal -- across
+    # 10 real ground-truth network-partition episodes, not one ever showed a
+    # mid-range p95 (they land at ~60000ms, the k6 client-timeout ceiling, or
+    # None entirely). The old ordering let a real, diagnostic p95 value get
+    # short-circuited by the throughput check every time (confirmed live: one
+    # real episode with p95=4706ms was still misdiagnosed as network-partition
+    # solely because throughput also happened to be low that episode).
     if p95_latency_ms is not None and p95_latency_ms >= NETWORK_PARTITION_LATENCY_SATURATION_MS:
         return {
             "diagnosis": "network-partition",
@@ -914,6 +910,18 @@ def stub_diagnose(tool_output: dict) -> dict:
             "diagnosis": "network-latency",
             "confidence": 0.6,
             "reasoning": f"p95 request latency {p95_latency_ms}ms >= {HIGH_LATENCY_THRESHOLD_MS}ms threshold (stubbed rule, not LLM)",
+        }
+    # Falls through to here only when p95_latency_ms is None (no k6 sample
+    # landed in the lookback window -- confirmed via review 20 to be a real,
+    # currently-unresolved ambiguous zone between network-partition and a
+    # sparse-traffic network-latency episode, not fixable by reordering or
+    # by any passive metric tried so far) or below the latency threshold.
+    if combined_throughput_bps is not None and combined_throughput_bps < NETWORK_PARTITION_MAX_THROUGHPUT_BPS:
+        return {
+            "diagnosis": "network-partition",
+            "confidence": 0.6,
+            "reasoning": f"orders' combined network throughput {combined_throughput_bps:.1f} bytes/s "
+                         f"< {NETWORK_PARTITION_MAX_THROUGHPUT_BPS} bytes/s threshold (stubbed rule, not LLM)",
         }
     if peak_memory_mib is not None and peak_memory_mib >= MEMORY_LEAK_THRESHOLD_MIB:
         return {

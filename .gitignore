@@ -85,6 +85,8 @@ p3_trust_action/check_last_action_proposal.py
 p3_trust_action/check_last_llm_diagnosis.py
 p3_trust_action/check_trust_state.py
 p3_trust_action/restore_after_cb_test_bug.py
+p3_trust_action/diag_network_latency_confusion.py
+p3_trust_action/diag_packet_count_discriminator.py
 
 # Phase D run output -- regenerated per run, not source
 p2_readonly_loop/phase_d_batch1.json
