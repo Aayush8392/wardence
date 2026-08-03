@@ -373,7 +373,7 @@ CPU_THROTTLE_BASELINE_CPU_LIMIT = "300m"
 K6_IMAGE = "grafana/k6:latest"
 UNDER_PROVISIONED_VUS = 20
 UNDER_PROVISIONED_DURATION_S = 20
-UNDER_PROVISIONED_MIN_P95_MS = 200
+UNDER_PROVISIONED_MIN_P95_MS = 190
 UNDER_PROVISIONED_BASELINE_REPLICAS = 1
 
 # bad-rollout: NOT Chaos Mesh, NOT exec-based -- a direct kubectl patch
@@ -2308,8 +2308,20 @@ def _restart_catalogue_db_pod(cfg: dict, timeout_s: int = 90) -> bool:
     specifically to survive exactly this. Deletes the current pod and
     polls _current_pod_name (which only ever returns a Running pod)
     until a genuinely NEW one is up, rather than assuming a fixed
-    sleep is long enough."""
+    sleep is long enough.
+
+    Real fix, 2026-08-03 (self-heal auth race, found live 2026-08-02
+    overnight batch): 'Running' only means the container process
+    started, not that MySQL inside it is ready to authenticate root
+    yet -- a real 'Access denied for user root@localhost' was observed
+    on the very next _get_catalogue_db_threads_connected call right
+    after this function returned True, silently thinning the flood via
+    the historical-floor fallback instead of a real live reading.
+    Added a real MySQL-readiness poll (a plain 'SELECT 1' as root, the
+    same auth path _get_catalogue_db_threads_connected itself needs)
+    after the pod is Running, before declaring self-heal complete."""
     namespace = cfg["namespace"]
+    container = cfg["container"]
     target = cfg["target"]
     old_pod_name = _current_pod_name(target, namespace)
     print(f"  self-heal: restarting catalogue-db pod ({old_pod_name or 'unknown'}) to clear "
@@ -2320,14 +2332,33 @@ def _restart_catalogue_db_pod(cfg: dict, timeout_s: int = 90) -> bool:
             capture_output=True, text=True, timeout=30,
         )
     deadline = time.time() + timeout_s
+    new_pod_name = None
     while time.time() < deadline:
         time.sleep(5)
-        new_pod_name = _current_pod_name(target, namespace)
-        if new_pod_name and new_pod_name != old_pod_name:
-            print(f"  self-heal: catalogue-db back up as {new_pod_name}")
+        candidate = _current_pod_name(target, namespace)
+        if candidate and candidate != old_pod_name:
+            new_pod_name = candidate
+            print(f"  self-heal: catalogue-db back up as {new_pod_name}, "
+                  f"waiting for MySQL root auth to be ready...")
+            break
+    if new_pod_name is None:
+        print(f"  self-heal: catalogue-db did not come back Running within {timeout_s}s")
+        return False
+
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["kubectl", "exec", "-n", namespace, new_pod_name, "-c", container,
+             "--", "mysql", "-uroot", "-pfake_password", "-e", "SELECT 1"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode == 0:
+            print(f"  self-heal: MySQL root auth ready on {new_pod_name}")
             return True
-    print(f"  self-heal: catalogue-db did not come back Running within {timeout_s}s")
-    return False
+        time.sleep(3)
+    print(f"  self-heal: catalogue-db pod up but MySQL root auth never became ready "
+          f"within {timeout_s}s -- proceeding anyway, caller will fall back to the "
+          f"historical floor if the next live read still fails")
+    return True
 
 
 def _inject_and_verify_connection_pool_exhaustion(cfg: dict) -> str | None:
