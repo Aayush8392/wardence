@@ -158,6 +158,17 @@ class ActRequest(BaseModel):
     reasoning: str | None = None
     llm_provider: str | None = None
     llm_model: str | None = None
+    # The LLM's OWN raw diagnosis this episode, distinct from `predicted`
+    # above -- `predicted` is whichever diagnosis is AUTHORITATIVE for
+    # production (the stub's, while diagnoser_mode_used=="stub"). Added
+    # 2026-08-05 (real fix, see wardence_buildlog.md's Kimi review 23
+    # session) so Dimension C's background action-proposal comparison can
+    # run off the LLM's own belief even when it isn't what's driving
+    # production -- mirrors Dimension B's own "always compute, only
+    # conditionally drive production" split, which C never had until now.
+    llm_diagnosis: str | None = None
+    llm_confidence: float | None = None
+    llm_reasoning: str | None = None
     tool_output: dict | None = None
     # Ground truth, review 16's dispatch gate -- ONLY ever populated by
     # p3_scorer.py, the sole piece of this system allowed to see it.
@@ -409,16 +420,64 @@ def act(req: ActRequest):
         "llm_action_proposal": None, "gate_substitution": None,
     }
 
-    mapping = ACTION_MAP.get(req.predicted)
-    if mapping is None:
-        return response
-
-    fault_class, action_name, kwargs_fn = mapping
-
     conn = sqlite3.connect(DB_PATH)
     ensure_trust_tables(conn)
     ensure_llm_trust_tables(conn)
     ensure_misdispatch_tables(conn)
+
+    # Dimension C background comparison, real fix 2026-08-05 (Kimi review
+    # 23, reviews/23_trust_dimension_ABC_redesign_kimi_review.md, plus a
+    # follow-up round the same day). This block is DELIBERATELY placed
+    # BEFORE the real-dispatch gating below and no longer depends on
+    # req.predicted's (the AUTHORITATIVE diagnosis's) own mapping/
+    # trust_state passing first -- previously this whole endpoint was
+    # only ever CALLED AT ALL (by p3_scorer.py) when the authoritative
+    # diagnosis's own class was already can_act, so if the stub said
+    # "none" or a report-only class while the LLM privately believed it
+    # was a real auto-fix fault, C got zero data that episode. Triggering
+    # off the LLM's OWN diagnosis (req.llm_diagnosis) instead mirrors
+    # Dimension B's own "always compute in the background, regardless of
+    # what's driving production" split, which C never had until now.
+    #
+    # Real quota-cost gate, added the same session after direct owner
+    # pushback: propose_action is a genuine extra LLM call, so this only
+    # fires when the LLM's OWN diagnosed class is ALREADY Dimension-A
+    # can_act -- Dimension C is explicitly documented as "only
+    # meaningful once A=can_act AND B=llm" (llm_trust_state.py's own
+    # docstring), so spending real quota proposing an action for a class
+    # still stuck in report_only would buy data that could never be
+    # used for anything. Checked against the LLM's OWN believed class,
+    # never req.predicted's -- these can legitimately differ when B=stub.
+    proposal = None
+    if req.llm_diagnosis is not None and req.llm_diagnosis in DETERMINISTIC_ACTION_MAP:
+        llm_class_trust_state = get_trust_state(conn, req.llm_diagnosis)
+        if llm_class_trust_state["state"] == "can_act":
+            llm_production_result = {
+                "diagnosis": req.llm_diagnosis, "confidence": req.llm_confidence, "reasoning": req.llm_reasoning,
+            }
+            proposal = propose_action(
+                req.llm_diagnosis, llm_production_result, req.target, req.namespace,
+                req.llm_provider, req.llm_model, tool_output=req.tool_output,
+                episode_id=req.episode_id,
+            )
+            # Raw, pre-veto/pre-dispatch proposal -- p3_scorer.py's
+            # record_llm_trust scores THIS against real ground truth,
+            # regardless of what actually got dispatched below (Kimi
+            # review 23, Gap 4: scoring the post-veto dispatched tool
+            # instead would inflate C's streak with veto overrides it
+            # never actually verified).
+            response["llm_action_proposal"] = proposal
+
+    # Real dispatch -- gated on the AUTHORITATIVE diagnosis's own
+    # mapping/trust_state/safety_hold, unchanged from before this
+    # session's restructuring (only the background comparison above
+    # became independent of it, not real dispatch).
+    mapping = ACTION_MAP.get(req.predicted)
+    if mapping is None:
+        conn.close()
+        return response
+
+    fault_class, action_name, kwargs_fn = mapping
     trust_state = get_trust_state(conn, fault_class)
     action_trust = get_action_trust(conn, fault_class)
     safety_hold = get_safety_hold(conn, fault_class)
@@ -427,33 +486,25 @@ def act(req: ActRequest):
     if trust_state["state"] != "can_act" or safety_hold["active"]:
         return response
 
-    production_result = {"diagnosis": req.predicted, "confidence": req.confidence, "reasoning": req.reasoning}
-
-    # Background comparison for Dimension C too, same "always compute,
-    # only conditionally dispatch" split as diagnosis has -- lets the
-    # action-trust streak accumulate real data even while this class is
-    # still on deterministic_fallback. Only meaningful when the LLM was
-    # the one that diagnosed this episode -- propose_action's own
-    # diagnosis-provider lookup needs a real provider/model to escalate
-    # from.
-    if req.diagnoser_mode_used == LLM and fault_class in DETERMINISTIC_ACTION_MAP:
-        proposal = propose_action(
-            fault_class, production_result, req.target, req.namespace,
-            req.llm_provider, req.llm_model, tool_output=req.tool_output,
-            episode_id=req.episode_id,
-        )
-        response["llm_action_proposal"] = proposal
-
-        if action_trust["state"] == LLM_CAN_ACT and proposal.get("tool_name") is not None:
-            # Dimension C says trust the LLM's own action choice for this
-            # class -- dispatch WHAT IT PROPOSED (which may already be
-            # the deterministic_fallback shape if both LLM attempts
-            # failed validation; propose_action always returns something
-            # dispatchable-or-not, never raises). Gate-checked first
-            # (review 16) -- if req.predicted is wrong and this proposal
-            # would misfire on the real fault, the real dispatch is
-            # redirected; Dimension C's own scoring in p3_scorer.py is
-            # untouched either way (still scores what the LLM proposed).
+    # Dispatch the LLM's own proposal only when production is ACTUALLY
+    # LLM-driven this episode (B=llm, so req.predicted == req.llm_diagnosis
+    # == fault_class already, meaning `proposal` above was computed for
+    # exactly this class) AND Dimension C says trust the LLM's action
+    # choice AND the tool-agreement veto passes (2026-08-05, same Kimi
+    # review): does the LLM's proposed tool match the deterministic tool
+    # for its OWN diagnosis? A mismatch means the LLM chose an
+    # inconsistent tool for what it itself just diagnosed -- fall through
+    # to the deterministic dispatch below instead of trusting it, without
+    # touching Dimension C's own scoring (still scores the raw proposal
+    # above, not this veto's outcome). This is additive to, not a
+    # replacement for, dispatch_gate.py's existing ground-truth-based
+    # redirect below -- that one only works because this lab always
+    # knows real ground truth; this veto works even where it doesn't
+    # (e.g. a genuine unattended live episode), so both stay.
+    if (req.diagnoser_mode_used == LLM and action_trust["state"] == LLM_CAN_ACT
+            and proposal is not None and proposal.get("tool_name") is not None):
+        tool_agreement_ok = proposal["tool_name"] == action_name
+        if tool_agreement_ok:
             action_taken, action_result, action_source, gate_substitution = _dispatch_with_gate(
                 req.predicted, proposal["tool_name"], proposal["params"], proposal["source"], req,
             )
@@ -462,6 +513,8 @@ def act(req: ActRequest):
             response["action_source"] = action_source
             response["gate_substitution"] = gate_substitution
             return response
+        # else: falls through to the deterministic dispatch below --
+        # tool-agreement veto fired, C's scoring above is unaffected.
 
     # Deterministic production dispatch -- still the path for:
     # stub-mode classes, LLM-mode classes not yet Dimension-C-trusted,

@@ -368,17 +368,39 @@ def main():
     diag_resp.raise_for_status()
     result = diag_resp.json()
 
-    # Phase 2: action proposal + real dispatch, ONLY when /diagnose said
-    # it's worth it (an auto-fix class currently can_act) -- skipping the
-    # call entirely for report-only classes avoids a wasted round trip,
-    # same early-return behavior the old combined /handle had.
-    if result.get("eligible_for_action"):
+    # Phase 2: action proposal + real dispatch. Real fix 2026-08-05 (Kimi
+    # review 23 follow-up): USED to call /act only when eligible_for_action
+    # said the AUTHORITATIVE (stub, while B=stub) diagnosis was already an
+    # auto-fix class at can_act -- meaning Dimension C's background
+    # comparison could never see an episode where the stub said "none"/
+    # report-only while the LLM privately believed it was a real auto-fix
+    # fault. Now ALSO calls /act whenever the LLM produced ANY auto-fix-
+    # class diagnosis, even if the stub's own answer wasn't eligible --
+    # /act itself (not this file) is what actually decides whether that's
+    # worth spending real quota on (only proceeds to propose_action if the
+    # LLM's OWN believed class is already Dimension-A can_act; otherwise
+    # it's a cheap local DB check and a no-op, not a real LLM call).
+    llm_diag = (result.get("llm_result") or {}).get("llm_diagnosis")
+    worth_calling_act = result.get("eligible_for_action") or (
+        llm_diag is not None and llm_diag in DETERMINISTIC_ACTION_MAP
+    )
+    if worth_calling_act:
         act_req = {
             "target": target, "namespace": namespace,
             "predicted": result["diagnosis"], "diagnoser_mode_used": result["diagnoser_mode_used"],
             "confidence": result.get("confidence"), "reasoning": result.get("reasoning"),
             "llm_provider": (result.get("llm_result") or {}).get("provider"),
             "llm_model": (result.get("llm_result") or {}).get("model"),
+            # The LLM's OWN raw diagnosis, distinct from "predicted"
+            # above (which is whichever diagnosis is authoritative for
+            # production -- the stub's, while diagnoser_mode_used ==
+            # "stub"). Added 2026-08-05 so /act's Dimension C background
+            # comparison can run off the LLM's own belief even when it
+            # isn't currently driving production -- see p3_agent.py's
+            # ActRequest docstring for the full reasoning.
+            "llm_diagnosis": (result.get("llm_result") or {}).get("llm_diagnosis"),
+            "llm_confidence": (result.get("llm_result") or {}).get("llm_confidence"),
+            "llm_reasoning": (result.get("llm_result") or {}).get("llm_reasoning"),
             "tool_output": result.get("tool_output"),
             # Ground truth, review 16's dispatch gate -- p3_scorer.py is
             # the only piece of this system allowed to know this; /act

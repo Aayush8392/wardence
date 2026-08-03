@@ -120,6 +120,57 @@ _STRONG_SIGNAL_FIELDS = {
     "payment_stuck_not_ready", "session_db_replicas_hit_zero", "front_end_image_pull_failing",
 }
 
+# Real bug found and fixed 2026-08-05 (diag_predicts_none_pattern.py +
+# diag_predicts_none_reasoning.py, run against the live DB): 5 real
+# episodes across under-provisioned-replicas/cpu-throttling/session-
+# cart-failure/network-partition were all misdiagnosed "none" by the
+# SAME provider (nvidia/Nemotron-3-Nano-30B-A3B via DeepInfra), costing
+# 3 real Dimension A demotions (incl. a 29-episode streak on
+# cpu-throttling) and 5 Dimension B demotions. In 4 of the 5, the
+# decisive numeric field was ALREADY PRESENT in the tool result and
+# already past its documented FIELD_GUIDANCE threshold (e.g.
+# catalogue_probe_p95_ms=296.89 vs. the 190ms cutoff,
+# cpu_throttle_periods_increase=602.96 vs. the 100 cutoff) -- the model
+# had the decisive number and still failed to apply the threshold
+# comparison correctly. This is the exact failure shape the numeric
+# fields were deliberately left OUT of _has_strong_signal for (see
+# comment above) on the theory the model's own comparison was reliable
+# enough -- real data now shows it isn't always. Fix: compute the
+# threshold comparison in code (same numbers FIELD_GUIDANCE already
+# states in prose) and, when crossed, tell the model the concluded
+# diagnosis directly instead of leaving the arithmetic to it. Kept
+# deliberately narrow -- only single-threshold, single-diagnosis fields
+# with no other class contending for the same signal. p95_latency_ms/
+# combined_throughput_bps (network-latency vs. network-partition) are
+# NOT included here: that pair already has its own recently-tuned,
+# accepted-limitation logic (2026-08-03 session, Kimi review 20) and
+# touching it again isn't warranted by this specific finding.
+_NUMERIC_THRESHOLD_FIELDS = {
+    # field: (threshold, diagnosis)
+    "cpu_throttle_periods_increase": (100, "cpu-throttling"),
+    "catalogue_probe_p95_ms": (190, "under-provisioned-replicas"),
+    "peak_memory_mib": (380, "memory-leak"),
+    "peak_threads_connected": (100, "connection-pool-exhaustion"),
+}
+
+
+def _numeric_threshold_hit(tool_name: str, observation) -> tuple[str, float, float, str] | None:
+    """
+    Returns (field, value, threshold, diagnosis) if `observation` contains
+    a numeric field from _NUMERIC_THRESHOLD_FIELDS whose value is already
+    >= its documented threshold -- the numeric-field counterpart to
+    _has_strong_signal, added 2026-08-05 (see comment above). Only
+    query_prometheus/probe_catalogue_capacity results are checked (same
+    scope as the tools these fields actually come from).
+    """
+    if not isinstance(observation, dict):
+        return None
+    for field, (threshold, diagnosis) in _NUMERIC_THRESHOLD_FIELDS.items():
+        value = observation.get(field)
+        if isinstance(value, (int, float)) and value >= threshold:
+            return field, value, threshold, diagnosis
+    return None
+
 SYSTEM_TEMPLATE = """You are an SRE agent diagnosing a fault in a Kubernetes cluster running Sock Shop (target={target}, namespace={namespace}).
 You have {turns_left} turn(s) remaining.
 
@@ -239,11 +290,19 @@ def _run_episode_with_provider(
             transcript_lines.append(f"[Turn {turn_num}] Action: call_tool {tool_name}")
             transcript_lines.append(f"Result: {json.dumps(observation, default=str)}")
             called_tools.add(tool_name)
+            numeric_hit = _numeric_threshold_hit(tool_name, observation)
             if _has_strong_signal(tool_name, observation):
                 transcript_lines.append(
                     "System: The result above already contains an unambiguous signal "
                     "(a non-empty list or a true flag on a class-defining field). "
                     "You have enough evidence -- diagnose now."
+                )
+            elif numeric_hit:
+                field, value, threshold, diagnosis = numeric_hit
+                transcript_lines.append(
+                    f"System: {field}={value} is >= the {threshold} threshold in the guidance "
+                    f"above -- this means diagnosis={diagnosis}. You have enough evidence -- "
+                    "diagnose now."
                 )
             elif called_tools == set(tools):
                 transcript_lines.append(

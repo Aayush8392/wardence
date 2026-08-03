@@ -88,8 +88,14 @@ p3_trust_action/restore_after_cb_test_bug.py
 p3_trust_action/diag_network_latency_confusion.py
 p3_trust_action/diag_packet_count_discriminator.py
 p3_trust_action/diag_max_streaks.py
-p3_trust_action/diag_classifier_feature_audit.py
+p5_dl_hardening/diag_classifier_feature_audit.py
+p5_dl_hardening/diag_target_gating_check.py
+p5_dl_hardening/train_fault_classifier.py
 p2_readonly_loop/diag_batch_cross_analysis.py
+p3_trust_action/diag_provider_accuracy_by_class.py
+p3_trust_action/diag_predicts_none_pattern.py
+p3_trust_action/diag_predicts_none_reasoning.py
+p3_trust_action/diag_predicts_none_demotion_check.py
 
 # Phase D run output -- regenerated per run, not source
 p2_readonly_loop/phase_d_batch1.json
