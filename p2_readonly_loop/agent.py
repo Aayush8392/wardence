@@ -649,10 +649,25 @@ def query_prometheus(target: str, namespace: str) -> dict:
     # (100s) plus the settle gap avoids that -- same fix as the latency
     # query above, different root cause (here it's about a genuinely
     # un-sticky signal, not volatility).
-    if target == "shipping":
+    # oom: catalogue's own real peak working-set memory, added 2026-08-03
+    # -- this field used to be populated for `shipping` only (memory-leak's
+    # diagnosis threshold, the field's original and only consumer). oom's
+    # real production auto-fix (patch_memory_limit) always used a fixed
+    # deterministic "400Mi" constant and never needed this value, so the
+    # gap was invisible until action_proposer.py's LLM-driven magnitude
+    # sizing started depending on a real peak_memory_mib for oom too --
+    # oom silently always saw None here, tripping the "metric missing,
+    # fall back to restart_deployment" instruction on every single
+    # episode. [6m] window (vs. shipping's [3m]) because oom's real
+    # verification ceiling is 200s (see injector.py's redesigned
+    # _inject_and_verify_oom), noticeably wider than memory-leak's fixed
+    # 100s duration_s -- same reasoning as cpu-throttling's own 2m->6m
+    # widening for a class whose real fault window can run long.
+    _PEAK_MEMORY_TARGETS = {"shipping": "3m", "catalogue": "6m"}
+    if target in _PEAK_MEMORY_TARGETS:
         memory_query = (
             f'max_over_time(container_memory_working_set_bytes{{namespace="{namespace}", '
-            f'pod=~"{target}-[^-]+-[^-]+$", container="{target}"}}[3m])'
+            f'pod=~"{target}-[^-]+-[^-]+$", container="{target}"}}[{_PEAK_MEMORY_TARGETS[target]}])'
         )
         memory_resp = requests.get(
             f"{PROMETHEUS_URL}/api/v1/query", params={"query": memory_query}, timeout=10
@@ -795,11 +810,11 @@ def query_prometheus(target: str, namespace: str) -> dict:
 def stub_diagnose(tool_output: dict) -> dict:
     """
     Placeholder for the LLM reasoning step. Hardcoded rule standing in
-    for the ReAct loop. OOM and Evicted are checked before crash-loop:
-    both can otherwise get swept up by the broader restart-increase
-    catch-all the crash-loop signal watches. Replace this function's
-    body with the real LLM call; keep the same tool-output-in,
-    diagnosis-out shape.
+    for the ReAct loop. OOM, Evicted, and bad-rollout's own image-pull
+    signal are all checked before crash-loop: each can otherwise get
+    swept up by the broader restart-increase catch-all the crash-loop
+    signal watches. Replace this function's body with the real LLM
+    call; keep the same tool-output-in, diagnosis-out shape.
     """
     oom_pods = tool_output["oom_pods"]
     evicted_pods = tool_output["evicted_pods"]
@@ -824,6 +839,26 @@ def stub_diagnose(tool_output: dict) -> dict:
             "confidence": 0.6,
             "reasoning": f"pods with status reason Evicted: {evicted_pods} (stubbed rule, not LLM)",
         }
+    # Checked BEFORE crashlooping_pods -- real bug found 2026-08-03, same
+    # "broader restart-increase catch-all steals a more specific signal's
+    # episode" shape as OOM/Evicted being checked before crash-loop above,
+    # just never extended to bad-rollout. crash_query's restart-increase
+    # OR-clause fires on ANY restart for ANY reason in the last 3 minutes,
+    # not just genuine crash-looping. Confirmed live (multiple real batch
+    # episodes, predicted='crash-loop' actual='bad-rollout'): bad-rollout's
+    # own reset step (rolling front-end's image back to baseline before
+    # the NEXT injection) is itself a real rollout that can leave residual
+    # restart activity on front-end bleeding into the very next episode's
+    # 3-minute lookback window, even though nothing is actually crash-
+    # looping. front_end_image_pull_failing is the more specific, direct
+    # signal for this target and should win.
+    if tool_output["front_end_image_pull_failing"]:
+        return {
+            "diagnosis": "bad-rollout",
+            "confidence": 0.6,
+            "reasoning": "a front-end pod is stuck in ImagePullBackOff/ErrImagePull -- a bad "
+                         "deploy, not a crash-loop or generic restart (stubbed rule, not LLM)",
+        }
     if crashlooping_pods:
         return {
             "diagnosis": "crash-loop",
@@ -836,13 +871,6 @@ def stub_diagnose(tool_output: dict) -> dict:
             "confidence": 0.6,
             "reasoning": "a payment pod is reporting Ready=false with no restart -- stuck, never "
                          "becoming ready, not crash-looping (stubbed rule, not LLM)",
-        }
-    if tool_output["front_end_image_pull_failing"]:
-        return {
-            "diagnosis": "bad-rollout",
-            "confidence": 0.6,
-            "reasoning": "a front-end pod is stuck in ImagePullBackOff/ErrImagePull -- a bad "
-                         "deploy, not a crash-loop or generic restart (stubbed rule, not LLM)",
         }
     if session_db_replicas_hit_zero:
         return {

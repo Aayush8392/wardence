@@ -97,7 +97,7 @@ FAULT_CLASSES = [
 FIELD_GUIDANCE = """Field meanings and thresholds (a null/false/empty field means that signal did not fire):
 - oom_pods: non-empty -> oom.
 - evicted_pods: non-empty -> disk-full.
-- crashlooping_pods: non-empty (and oom_pods/evicted_pods empty) -> crash-loop.
+- crashlooping_pods: non-empty (and oom_pods/evicted_pods/front_end_image_pull_failing all empty/false) -> crash-loop. Check front_end_image_pull_failing (below) BEFORE concluding crash-loop -- a bad-rollout episode's own image-reset step can leave residual restart activity on front-end that satisfies this signal even when nothing is actually crash-looping; front_end_image_pull_failing is the more specific, direct signal and wins.
 - combined_throughput_bps (orders only): < 200 bytes/s -> network-partition (check before either latency check below).
 - p95_latency_ms (orders only): >= 10000ms -> network-partition, NOT network-latency (a request hanging until client timeout, not organic latency -- the real network-latency mechanism only ever injects 500ms+jitter, so nothing that high can be real latency). Check this BEFORE the network-latency check below.
 - p95_latency_ms (orders only): >= 300ms (and < 10000ms) -> network-latency.

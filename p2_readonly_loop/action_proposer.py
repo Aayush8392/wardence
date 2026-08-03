@@ -72,6 +72,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "p3_trust_action"))
 from model_backend import PROVIDER_CHAIN, _extract_json, call_one, LLMFailure  # noqa: E402
 from tool_call_validator import MAX_CPU_LIMIT_M, MAX_MEMORY_LIMIT_MI, MAX_REPLICAS, validate_tool_call  # noqa: E402
 from trust_engine import DB_PATH  # noqa: E402
+from constraint_checks import _live_replica_count  # noqa: E402
 
 # Real, already-in-production deterministic mapping (p3_trust_action's
 # p3_agent.py's own ACTION_MAP/FIX_PARAMS) -- duplicated by hand here
@@ -134,6 +135,7 @@ ACTION_SCHEMA_TEXT = f"""Available actions and their EXACT real parameter format
 - patch_cpu_limit: {{"tool": "patch_cpu_limit", "params": {{"name": "...", "container": "...", "limit": "<quantity>"}}}}
   Valid limit examples: "300m", "600m", "1" (millicores with "m" suffix, or whole cores as a bare number). Must be <= {MAX_CPU_LIMIT_M}m.
 - scale_deployment: {{"tool": "scale_deployment", "params": {{"name": "...", "replicas": <int, 1-{MAX_REPLICAS}>}}}}
+  Must be STRICTLY GREATER than the real current_replicas value given in the input data below (never equal to or less than it), and <= {MAX_REPLICAS}.
 - rollback_deployment: {{"tool": "rollback_deployment", "params": {{"name": "..."}}}}
 - restore_from_disk_full: {{"tool": "restore_from_disk_full", "params": {{"name": "...", "replicas": <int, 1-{MAX_REPLICAS}>}}}}"""
 
@@ -161,7 +163,10 @@ Input: diagnosis="oom", peak_memory_mib=null
 Output: {{"tool": "restart_deployment", "params": {{"name": "catalogue"}}, "reasoning": "No peak memory data available, magnitude-sensitive fix not possible."}}
 
 Input: diagnosis="cpu-throttling", cpu_throttle_periods_increase=340
-Output: {{"tool": "patch_cpu_limit", "params": {{"name": "user", "container": "user", "limit": "800m"}}, "reasoning": "Limit raised above the observed throttling pressure."}}"""
+Output: {{"tool": "patch_cpu_limit", "params": {{"name": "user", "container": "user", "limit": "800m"}}, "reasoning": "Limit raised above the observed throttling pressure."}}
+
+Input: diagnosis="under-provisioned-replicas", current_replicas=3
+Output: {{"tool": "scale_deployment", "params": {{"name": "catalogue", "replicas": 5}}, "reasoning": "Scaled above the real current count of 3 to add real headroom."}}"""
 
 USER_PROMPT_TEMPLATE = """Diagnosed fault: diagnosis={diagnosis}, target={target}, namespace={namespace}, confidence={confidence}, reasoning="{reasoning}"
 
@@ -239,6 +244,25 @@ def propose_action(fault_class: str, diagnosis: dict, target: str, namespace: st
     """
     if fault_class not in DETERMINISTIC_ACTION_MAP:
         return {"source": "not_auto_fix_class", "fault_class": fault_class}
+
+    # Real bug found 2026-08-03: unlike oom/cpu-throttling, under-
+    # provisioned-replicas' magnitude constraint (scale_deployment must
+    # propose STRICTLY MORE than the real live replica count, per
+    # constraint_checks.py's check_safe) was never surfaced into the
+    # prompt at all -- the model was asked to satisfy a constraint it
+    # had zero visibility into, and had no way to do so reliably.
+    # Confirmed live: every real proposal across multiple batches
+    # guessed 2 or 3 replicas (a plausible-looking small number with no
+    # grounding) against a real current count of 3, failing
+    # constraint-satisfaction every time. Surfaced here the same way
+    # peak_memory_mib/cpu_throttle_periods_increase already ground
+    # oom/cpu-throttling's proposals -- read live (same helper
+    # check_safe itself uses at validation time), merged into the
+    # tool_output dict the model actually sees. If the live read fails
+    # (current_replicas ends up null in the prompt), check_safe already
+    # fails closed on a missing value -- no new unsafe path opened here.
+    if fault_class == "under-provisioned-replicas":
+        tool_output = {**(tool_output or {}), "current_replicas": _live_replica_count(target, namespace)}
 
     diagnosis_entry = _find_chain_entry(diagnosis_provider, diagnosis_model)
     attempts = []
