@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
+import AnimatedNumber from "../shared/AnimatedNumber";
 import { fetchSystemStatus } from "../../api/r2";
+import BarChart from "../charts/bar-chart";
+import Bar from "../charts/bar";
+import { ChartTooltip } from "../charts/tooltip";
+
+const PERCENT_FORMAT = { style: "percent", minimumFractionDigits: 1, maximumFractionDigits: 1 };
 
 // Real computed stats only -- no fabricated numbers (locked rule). Every
 // value is derived from trust_ladder.json/episodes.json/trust_history.json/
@@ -22,33 +28,52 @@ function TrustVector({ rows }) {
         scored.reduce((sum, r) => sum + r.episodes_scored, 0)
       : 0;
 
+  const chartData = sorted.map((r) => ({
+    name: r.fault_class.replaceAll("-", "_"),
+    value: Math.round((r.diagnosis_accuracy ?? 0) * 1000) / 10, // 1 decimal, real %
+  }));
+
   return (
-    <div className="lg:col-span-4 bg-surface-container-low border border-outline-variant p-4 relative overflow-hidden h-24">
-      <div className="relative z-10 flex flex-col justify-between h-full">
-        <div className="flex justify-between items-center">
-          <span className="font-label-caps text-[9px] text-on-surface-variant">TRUST_STATE_VECTOR</span>
-          <span className="font-data-mono text-[10px] text-primary">VECTOR_MAG: {vectorMag.toFixed(2)}</span>
-        </div>
-        <div className="flex items-end gap-1 h-8">
-          {sorted.map((r, i) => (
-            <div
-              key={r.fault_class}
-              title={`${r.fault_class}: ${((r.diagnosis_accuracy ?? 0) * 100).toFixed(0)}%`}
-              className={`w-1 ${i === 0 ? "bg-primary-fixed-dim vector-point" : "bg-primary"}`}
-              style={{ height: `${Math.max((r.diagnosis_accuracy ?? 0) * 100, 8)}%` }}
-            />
-          ))}
-        </div>
+    <div className="lg:col-span-4 bg-surface-container-low border border-outline-variant p-4 relative overflow-hidden h-32 flex flex-col">
+      <div className="flex justify-between items-center mb-1">
+        <span
+          className="font-label-caps text-[9px] text-on-surface-variant"
+          title="Top 9 fault classes by diagnosis accuracy. Bar height = accuracy (0-100%)."
+        >
+          TOP_9_CLASSES_BY_ACCURACY
+        </span>
+        <span
+          className="font-data-mono text-[10px] text-primary"
+          title="Overall diagnosis accuracy across every scored class, weighted by episode count"
+        >
+          OVERALL_ACCURACY: <AnimatedNumber value={vectorMag} format={PERCENT_FORMAT} />
+        </span>
       </div>
+      <BarChart
+        data={chartData}
+        xDataKey="name"
+        className="flex-1"
+        barGap={0.3}
+        margin={{ top: 4, right: 2, bottom: 2, left: 2 }}
+      >
+        <Bar dataKey="value" fill="var(--chart-1)" lineCap={2} />
+        <ChartTooltip showDatePill={false} showCrosshair={false} showDots={false} />
+      </BarChart>
     </div>
   );
 }
 
-function StatTile({ label, value, tone }) {
+// value: a raw number to animate via NumberFlow, or a pre-formatted string
+// (e.g. "—" for no data) to render as-is -- SECURITY_CAGE's Active_Armed/
+// Tripped label has no numeric value at all, so it stays a plain StatTile
+// child rendered outside this component.
+function StatTile({ label, value, format, tone }) {
   return (
     <div className="flex-1 min-w-[150px] p-4 flex flex-col gap-1">
       <span className="font-label-caps text-[10px] text-on-surface-variant">{label}</span>
-      <div className={`font-data-mono text-xl ${tone ?? "text-on-surface"}`}>{value}</div>
+      <div className={`font-data-mono text-xl ${tone ?? "text-on-surface"}`}>
+        {typeof value === "number" ? <AnimatedNumber value={value} format={format} /> : value}
+      </div>
     </div>
   );
 }
@@ -103,9 +128,20 @@ export default function Hero({ rows, episodes, trustHistory }) {
       </header>
 
       <section className="status-ribbon border border-outline-variant flex flex-wrap lg:flex-nowrap divide-x divide-outline-variant">
-        <StatTile label="AVG_EARNED_TRUST" value={avgEarnedTrust != null ? `${(avgEarnedTrust * 100).toFixed(1)}%` : "—"} tone="text-primary" />
-        <StatTile label="AUTONOMOUS_ACTS" value={autonomousActs.toLocaleString()} />
+        <StatTile
+          label="AVG_EARNED_TRUST"
+          value={avgEarnedTrust != null ? avgEarnedTrust : "—"}
+          format={PERCENT_FORMAT}
+          tone="text-primary"
+        />
+        <StatTile label="AUTONOMOUS_ACTS" value={autonomousActs} />
         <StatTile label="DEMOTIONS_LOGGED" value={demotionsLogged} tone={demotionsLogged > 0 ? "text-error" : "text-on-surface"} />
+        <StatTile
+          label="SYSTEM_INTEGRITY"
+          value={systemStatus?.integrity_score_pct != null ? systemStatus.integrity_score_pct / 100 : "—"}
+          format={PERCENT_FORMAT}
+          tone="text-primary"
+        />
         <div className="flex-1 min-w-[150px] p-4 flex flex-col gap-1">
           <span className="font-label-caps text-[10px] text-on-surface-variant">SECURITY_CAGE</span>
           <div className="flex items-center gap-2 mt-1">

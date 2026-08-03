@@ -19,24 +19,37 @@ function colorForLine(line) {
   return null;
 }
 
+// Real, honest formatting for scored_at -- this whole site is a static
+// build reading a periodic R2 snapshot (wardence_context.md's own
+// locked rule: "last updated <ts>", never "live"). This panel used to
+// say LIVE_REASONING_STREAM, which contradicted that rule -- it only
+// ever shows the single most-recently-scored episode as of whenever
+// publish_to_r2.py last ran, not anything actually streaming.
+function formatTimestamp(ts) {
+  if (!ts) return null;
+  return new Date(ts).toLocaleString(undefined, {
+    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+  });
+}
+
 function ReasoningStream({ latestEpisode }) {
   const lines = (latestEpisode?.reasoning ?? "").split(/\n+/).filter(Boolean);
+  const scoredAt = formatTimestamp(latestEpisode?.scored_at);
 
   return (
     <div className="lg:col-span-8 border border-outline-variant bg-surface-container-lowest p-6 font-data-mono text-xs overflow-hidden h-72 flex flex-col">
       <div className="flex justify-between mb-4 border-b border-outline-variant pb-3">
         <div className="flex items-center gap-3">
-          <span className="text-primary font-label-caps text-[11px] tracking-widest">LIVE_REASONING_STREAM</span>
+          <span className="text-primary font-label-caps text-[11px] tracking-widest">MOST_RECENT_REASONING_TRACE</span>
           {latestEpisode && (
             <span className="text-[9px] text-on-surface-variant border border-outline-variant px-1 font-data-mono uppercase">
               TARGET:{latestEpisode.target}
             </span>
           )}
         </div>
-        <div className="flex gap-4">
-          <span className="text-[9px] uppercase text-on-surface-variant">TLS_VERIFIED</span>
-          <span className="text-[9px] uppercase text-primary">NODE:01_STABLE</span>
-        </div>
+        {scoredAt && (
+          <span className="text-[9px] uppercase text-on-surface-variant">Last updated: {scoredAt}</span>
+        )}
       </div>
 
       <div className="flex-1 overflow-y-auto space-y-1 text-on-surface-variant">
