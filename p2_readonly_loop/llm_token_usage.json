@@ -1,25 +1,25 @@
 {
   "network-partition": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 20,
-      "total_tokens": 87532,
+      "count": 45,
+      "total_tokens": 203473,
       "min_tokens": 0,
-      "max_tokens": 5017,
-      "total_neurons": 1415.5999746322632,
+      "max_tokens": 6189,
+      "total_neurons": 3362.9545135498047,
       "min_neurons": 0.0,
-      "max_neurons": 86.24545478820801,
-      "avg_tokens": 4376.6,
-      "avg_neurons": 70.77999873161316
+      "max_neurons": 114.42727279663086,
+      "avg_tokens": 4521.622222222222,
+      "avg_neurons": 74.73232252332899
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
-      "count": 1,
-      "total_tokens": 0,
+      "count": 63,
+      "total_tokens": 243564,
       "min_tokens": 0,
-      "max_tokens": 0,
+      "max_tokens": 6167,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 0.0,
+      "avg_tokens": 3866.095238095238,
       "avg_neurons": 0.0
     },
     "gemini:gemini-3-flash-preview": {
@@ -80,25 +80,25 @@
   },
   "crash-loop": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 6,
-      "total_tokens": 20438,
+      "count": 8,
+      "total_tokens": 27748,
       "min_tokens": 0,
       "max_tokens": 4693,
-      "total_neurons": 319.2727222442627,
+      "total_neurons": 433.14544677734375,
       "min_neurons": 0.0,
       "max_neurons": 76.5545425415039,
-      "avg_tokens": 3406.3333333333335,
-      "avg_neurons": 53.212120374043785
+      "avg_tokens": 3468.5,
+      "avg_neurons": 54.14318084716797
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
-      "count": 2,
-      "total_tokens": 0,
+      "count": 28,
+      "total_tokens": 63228,
       "min_tokens": 0,
-      "max_tokens": 0,
+      "max_tokens": 3729,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 0.0,
+      "avg_tokens": 2258.1428571428573,
       "avg_neurons": 0.0
     },
     "gemini:gemini-3-flash-preview": {
@@ -159,25 +159,25 @@
   },
   "disk-full": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 9,
-      "total_tokens": 28178,
-      "min_tokens": 979,
+      "count": 28,
+      "total_tokens": 108281,
+      "min_tokens": 0,
       "max_tokens": 5224,
-      "total_neurons": 436.34545516967773,
-      "min_neurons": 12.118181228637695,
+      "total_neurons": 1657.6818056106567,
+      "min_neurons": 0.0,
       "max_neurons": 90.21817779541016,
-      "avg_tokens": 3130.8888888888887,
-      "avg_neurons": 48.48282835218642
+      "avg_tokens": 3867.1785714285716,
+      "avg_neurons": 59.202921628952026
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
-      "count": 1,
-      "total_tokens": 886,
+      "count": 41,
+      "total_tokens": 145461,
       "min_tokens": 886,
-      "max_tokens": 886,
+      "max_tokens": 4423,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 886.0,
+      "avg_tokens": 3547.829268292683,
       "avg_neurons": 0.0
     },
     "gemini:gemini-3-flash-preview": {
@@ -216,15 +216,26 @@
   },
   "init-failure": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 14,
-      "total_tokens": 34504,
-      "min_tokens": 2169,
-      "max_tokens": 2575,
-      "total_neurons": 495.56362533569336,
-      "min_neurons": 27.336362838745117,
-      "max_neurons": 38.40909004211426,
-      "avg_tokens": 2464.5714285714284,
-      "avg_neurons": 35.39740180969238
+      "count": 45,
+      "total_tokens": 112903,
+      "min_tokens": 2168,
+      "max_tokens": 2824,
+      "total_neurons": 1588.2999792099,
+      "min_neurons": 27.30908966064453,
+      "max_neurons": 43.16363716125488,
+      "avg_tokens": 2508.9555555555557,
+      "avg_neurons": 35.29555509355333
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 47,
+      "total_tokens": 121598,
+      "min_tokens": 2073,
+      "max_tokens": 3294,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 2587.191489361702,
+      "avg_neurons": 0.0
     }
   },
   "under-provisioned-replicas": {
@@ -238,108 +249,240 @@
       "max_neurons": 155.55454635620117,
       "avg_tokens": 7137.666666666667,
       "avg_neurons": 113.38080628712972
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 32,
+      "total_tokens": 140376,
+      "min_tokens": 3362,
+      "max_tokens": 5276,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 4386.75,
+      "avg_neurons": 0.0
     }
   },
   "bad-rollout": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 18,
-      "total_tokens": 63468,
-      "min_tokens": 1268,
-      "max_tokens": 4387,
-      "total_neurons": 961.9454641342163,
-      "min_neurons": 20.0,
-      "max_neurons": 70.50909423828125,
-      "avg_tokens": 3526.0,
-      "avg_neurons": 53.44141467412313
+      "count": 42,
+      "total_tokens": 137950,
+      "min_tokens": 0,
+      "max_tokens": 5135,
+      "total_neurons": 2056.654550552368,
+      "min_neurons": 0.0,
+      "max_neurons": 105.64545726776123,
+      "avg_tokens": 3284.5238095238096,
+      "avg_neurons": 48.9679654893421
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
-      "count": 1,
-      "total_tokens": 4886,
-      "min_tokens": 4886,
-      "max_tokens": 4886,
+      "count": 72,
+      "total_tokens": 255086,
+      "min_tokens": 2321,
+      "max_tokens": 5214,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 4886.0,
+      "avg_tokens": 3542.8611111111113,
       "avg_neurons": 0.0
     }
   },
   "session-cart-failure": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 12,
-      "total_tokens": 27532,
-      "min_tokens": 2193,
-      "max_tokens": 2548,
-      "total_neurons": 368.18180656433105,
-      "min_neurons": 27.918179512023926,
-      "max_neurons": 37.599998474121094,
-      "avg_tokens": 2294.3333333333335,
-      "avg_neurons": 30.681817213694256
+      "count": 48,
+      "total_tokens": 116801,
+      "min_tokens": 0,
+      "max_tokens": 2789,
+      "total_neurons": 1671.7363510131836,
+      "min_neurons": 0.0,
+      "max_neurons": 42.1363639831543,
+      "avg_tokens": 2433.3541666666665,
+      "avg_neurons": 34.827840646107994
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 40,
+      "total_tokens": 103408,
+      "min_tokens": 2373,
+      "max_tokens": 3166,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 2585.2,
+      "avg_neurons": 0.0
     }
   },
   "network-latency": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 3,
-      "total_tokens": 13919,
-      "min_tokens": 4474,
-      "max_tokens": 4882,
-      "total_neurons": 225.9727258682251,
-      "min_neurons": 70.74545574188232,
-      "max_neurons": 82.05454444885254,
-      "avg_tokens": 4639.666666666667,
-      "avg_neurons": 75.32424195607503
+      "count": 6,
+      "total_tokens": 28941,
+      "min_tokens": 4189,
+      "max_tokens": 5733,
+      "total_neurons": 477.8090887069702,
+      "min_neurons": 63.154544830322266,
+      "max_neurons": 102.20909118652344,
+      "avg_tokens": 4823.5,
+      "avg_neurons": 79.63484811782837
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 19,
+      "total_tokens": 80045,
+      "min_tokens": 1247,
+      "max_tokens": 5568,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 4212.894736842105,
+      "avg_neurons": 0.0
+    },
+    "gemini:gemini-3-flash-preview": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "cloudflare:@cf/moonshotai/kimi-k2.6": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "groq:llama-3.3-70b-versatile": {
+      "count": 1,
+      "total_tokens": 2759,
+      "min_tokens": 2759,
+      "max_tokens": 2759,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 2759.0,
+      "avg_neurons": 0.0
     }
   },
   "memory-leak": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 13,
-      "total_tokens": 36683,
-      "min_tokens": 2581,
-      "max_tokens": 2972,
-      "total_neurons": 586.0636215209961,
-      "min_neurons": 38.51818084716797,
-      "max_neurons": 49.181819915771484,
-      "avg_tokens": 2821.769230769231,
-      "avg_neurons": 45.08181704007662
+      "count": 35,
+      "total_tokens": 90266,
+      "min_tokens": 0,
+      "max_tokens": 3075,
+      "total_neurons": 1437.0363311767578,
+      "min_neurons": 0.0,
+      "max_neurons": 49.95454406738281,
+      "avg_tokens": 2579.0285714285715,
+      "avg_neurons": 41.05818089076451
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 61,
+      "total_tokens": 174677,
+      "min_tokens": 1132,
+      "max_tokens": 3681,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 2863.55737704918,
+      "avg_neurons": 0.0
     }
   },
   "oom": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 1,
-      "total_tokens": 2526,
-      "min_tokens": 2526,
+      "count": 2,
+      "total_tokens": 4963,
+      "min_tokens": 2437,
       "max_tokens": 2526,
-      "total_neurons": 35.94545364379883,
-      "min_neurons": 35.94545364379883,
+      "total_neurons": 69.4636344909668,
+      "min_neurons": 33.51818084716797,
       "max_neurons": 35.94545364379883,
-      "avg_tokens": 2526.0,
-      "avg_neurons": 35.94545364379883
+      "avg_tokens": 2481.5,
+      "avg_neurons": 34.7318172454834
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 6,
+      "total_tokens": 21208,
+      "min_tokens": 3281,
+      "max_tokens": 3891,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 3534.6666666666665,
+      "avg_neurons": 0.0
     }
   },
   "cpu-throttling": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 14,
-      "total_tokens": 73339,
-      "min_tokens": 4130,
-      "max_tokens": 6675,
-      "total_neurons": 1174.0818099975586,
-      "min_neurons": 62.05454635620117,
-      "max_neurons": 111.86363792419434,
-      "avg_tokens": 5238.5,
-      "avg_neurons": 83.86298642839704
+      "count": 38,
+      "total_tokens": 194350,
+      "min_tokens": 0,
+      "max_tokens": 7443,
+      "total_neurons": 3150.6908826828003,
+      "min_neurons": 0.0,
+      "max_neurons": 129.73636054992676,
+      "avg_tokens": 5114.473684210527,
+      "avg_neurons": 82.91291796533685
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 88,
+      "total_tokens": 407742,
+      "min_tokens": 1647,
+      "max_tokens": 6220,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 4633.431818181818,
+      "avg_neurons": 0.0
+    },
+    "gemini:gemini-3-flash-preview": {
+      "count": 1,
+      "total_tokens": 0,
+      "min_tokens": 0,
+      "max_tokens": 0,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 0.0,
+      "avg_neurons": 0.0
+    },
+    "groq:llama-3.3-70b-versatile": {
+      "count": 1,
+      "total_tokens": 3771,
+      "min_tokens": 3771,
+      "max_tokens": 3771,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 3771.0,
+      "avg_neurons": 0.0
     }
   },
   "connection-pool-exhaustion": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 16,
-      "total_tokens": 41518,
-      "min_tokens": 2481,
-      "max_tokens": 2913,
-      "total_neurons": 622.3454532623291,
-      "min_neurons": 35.79090881347656,
-      "max_neurons": 47.57272720336914,
-      "avg_tokens": 2594.875,
-      "avg_neurons": 38.89659082889557
+      "count": 47,
+      "total_tokens": 123220,
+      "min_tokens": 993,
+      "max_tokens": 3182,
+      "total_neurons": 1856.527256011963,
+      "min_neurons": 11.53636360168457,
+      "max_neurons": 52.87272644042969,
+      "avg_tokens": 2621.7021276595747,
+      "avg_neurons": 39.500579915148144
+    },
+    "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
+      "count": 53,
+      "total_tokens": 153543,
+      "min_tokens": 2512,
+      "max_tokens": 3596,
+      "total_neurons": 0.0,
+      "min_neurons": 0.0,
+      "max_neurons": 0.0,
+      "avg_tokens": 2897.0377358490564,
+      "avg_neurons": 0.0
     }
   }
 }

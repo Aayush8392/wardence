@@ -129,7 +129,14 @@ CPU_THROTTLE_INCREASE_THRESHOLD = 100
 K6_IMAGE = "grafana/k6:latest"
 UNDER_PROVISIONED_PROBE_VUS = 20
 UNDER_PROVISIONED_PROBE_DURATION_S = 20
-UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 200
+# Lowered 200 -> 190, 2026-08-01: real root cause found for the one
+# wrong diagnosis in 62 scored episodes -- a real k6 probe measured
+# 199.8ms (0.2ms under the old cutoff) on a genuine under-provisioned-
+# replicas episode, just 6ms below the lowest-ever correctly-diagnosed
+# value (205.83ms) across the full real history. 190 gives real margin
+# over the observed miss while staying comfortably under that real
+# correct-cluster floor.
+UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 190
 # Matches injector.py's own MAX_INJECT_ATTEMPTS pattern for this exact
 # same probe mechanism -- see probe_catalogue_capacity's docstring for
 # the real bug this fixes.

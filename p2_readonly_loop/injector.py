@@ -166,6 +166,16 @@ MAX_INJECT_ATTEMPTS = 3
 EFFECT_VERIFY_TIMEOUT_S = 35  # covers kube-state-metrics' ~30s scrape cycle
 EFFECT_VERIFY_POLL_S = 5
 
+# oom's own verification, 2026-08-01 (Kimi review 19) -- polls the k8s
+# API directly instead of a Prometheus counter, so no scrape-lag
+# margin is needed here the way EFFECT_VERIFY_TIMEOUT_S has to budget
+# for. OOM_VERIFY_CEILING_S is a real backstop against a stressor that
+# never wins, not a guess at "how long a kill takes" -- see
+# _inject_and_verify_oom's docstring for the real 97s/119s data this
+# was sized against.
+OOM_VERIFY_CEILING_S = 200
+OOM_VERIFY_POLL_S = 3
+
 FAULT_CONFIG = {
     "crash-loop": {
         "namespace": "sock-shop",
@@ -178,7 +188,15 @@ FAULT_CONFIG = {
         "namespace": "sock-shop",
         "target": "catalogue",
         "container": "catalogue",
-        "duration_s": 60,
+        # Widened 60s -> 90s, 2026-08-01: real root cause found for 3
+        # consecutive real injection failures in the first LLM overnight
+        # batch -- a real container that DID get OOMKilled took 97s
+        # start-to-kill (confirmed via kubectl's lastState.terminated,
+        # startedAt=00:26:30/finishedAt=00:28:07), but the old 60s hold
+        # + 35s verify-poll budget (EFFECT_VERIFY_TIMEOUT_S) only gave
+        # 95s total -- a razor-thin, effectively negative margin. 90s
+        # gives a 125s total budget, real margin over the observed 97s.
+        "duration_s": 90,
         "chaos_name_prefix": "wardence-oom",
     },
     "disk-full": {
@@ -1385,15 +1403,36 @@ def _ensure_cpu_throttle_baseline(cfg: dict):
     real current resources first rather than hardcoding them. Falls
     back to the original Deployment-patch-and-wait path if the resize
     attempt fails for any reason -- never silently leaves the baseline
-    unreset."""
-    result = subprocess.run(
-        [
-            "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
-            "-o", "jsonpath={.spec.template.spec.containers[0].resources.limits.cpu}",
-        ],
-        capture_output=True, text=True,
-    )
-    current_limit = result.stdout.strip()
+    unreset.
+
+    Real bug fixed 2026-08-01, found via the first live batch to
+    actually earn and apply real patch_cpu_limit fixes at volume: this
+    check used to read the CURRENT limit from the Deployment spec, but
+    patch_cpu_limit's real fix (above) only ever resizes the live POD
+    in place and deliberately never touches the Deployment spec -- so
+    the Deployment spec always still read the original 300m baseline
+    even after a real fix had pushed the live pod to 1000m/800m,
+    silently skipping the reset every time. Confirmed against 3 real
+    episodes this went undetected: injector's own weaker verification
+    bar (CPU_THROTTLE_MIN_PERIODS_INCREASE=50) still called the
+    injection "verified" against the stale, unreset limit, but the
+    stressor barely throttled a 1000m-limited pod, producing a real but
+    much weaker signal (66-76 periods vs. the normal 500-750+) that
+    fell below agent.py's diagnosis threshold -- 3 consecutive real
+    false negatives, one of them costing cpu-throttling a 39-episode
+    trust streak. Fixed by reading the live POD's own resources (the
+    same source patch_cpu_limit itself writes to), not the Deployment's."""
+    pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
+    current_limit = ""
+    if pod_name is not None:
+        result = subprocess.run(
+            [
+                "kubectl", "get", "pod", pod_name, "-n", cfg["namespace"],
+                "-o", f'jsonpath={{.spec.containers[?(@.name=="{cfg["container"]}")].resources.limits.cpu}}',
+            ],
+            capture_output=True, text=True,
+        )
+        current_limit = result.stdout.strip()
     if current_limit == CPU_THROTTLE_BASELINE_CPU_LIMIT:
         return
 
@@ -1401,7 +1440,6 @@ def _ensure_cpu_throttle_baseline(cfg: dict):
           f"{CPU_THROTTLE_BASELINE_CPU_LIMIT} baseline -- resetting before injecting "
           f"(a prior real fix likely raised it)...")
 
-    pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
     if pod_name is not None:
         resources_result = subprocess.run(
             [
@@ -2379,32 +2417,119 @@ def _inject_and_verify_cpu_throttling(cfg: dict) -> str | None:
     return None
 
 
-def _inject_and_verify_chaos_mesh(fault_class: str, cfg: dict, manifest_builder) -> str | None:
-    """Returns the chaos_name of the attempt that got verified, or None
-    if all attempts failed. Only oom uses this now -- crash-loop moved
-    to the exec-based mechanism above, disk-full never used Chaos Mesh
-    at all."""
+def _pod_restart_count_direct(pod_name: str, namespace: str, container: str) -> int | None:
+    """Direct k8s API restartCount, via kubectl -- sub-second, no
+    scrape lag (unlike Prometheus). Returns None if unparseable (pod
+    gone, field missing)."""
+    result = subprocess.run(
+        [
+            "kubectl", "get", "pod", pod_name, "-n", namespace,
+            "-o", f'jsonpath={{.status.containerStatuses[?(@.name=="{container}")].restartCount}}',
+        ],
+        capture_output=True, text=True,
+    )
+    value = result.stdout.strip()
+    return int(value) if value.isdigit() else None
+
+
+def _pod_oom_killed(pod_name: str, namespace: str, container: str, baseline_restart_count: int) -> bool:
+    """Direct k8s API check via kubectl -- sub-second, no scrape lag,
+    unlike polling a Prometheus counter (kube_pod_container_status_restarts_total
+    is only as fresh as kube-state-metrics' own scrape cycle). Checks
+    the SAME field this bug was root-caused with manually, 2026-08-01
+    (kubectl ... lastState.terminated), via Kimi review 19.
+
+    Real bug fixed same day, found live on the very first real test:
+    checking lastState.terminated.reason alone is NOT enough --
+    lastState reflects the PREVIOUS container instance's exit reason
+    and stays populated until the NEXT restart overwrites it, so a
+    stale OOMKilled from an earlier, unrelated kill was read as fresh
+    on the very first poll (elapsed=0s -- physically impossible for a
+    real memory-pressure kill), falsely verifying an episode that
+    hadn't actually landed yet and costing a real 10-episode trust
+    streak. Fixed by requiring restartCount to have genuinely
+    increased past a baseline captured before the stressor was
+    applied, in addition to the reason check -- same delta-not-
+    presence principle the old Prometheus-based _verify_restart_effect
+    already got right, just re-applied here against the direct k8s
+    field instead of losing it in the scrape-lag fix."""
+    current = _pod_restart_count_direct(pod_name, namespace, container)
+    if current is None or current <= baseline_restart_count:
+        return False
+    result = subprocess.run(
+        [
+            "kubectl", "get", "pod", pod_name, "-n", namespace,
+            "-o", f'jsonpath={{.status.containerStatuses[?(@.name=="{container}")].lastState.terminated.reason}}',
+        ],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() == "OOMKilled"
+
+
+def _inject_and_verify_oom(cfg: dict) -> str | None:
+    """Real redesign, 2026-08-01 (Kimi review 19, reviews/19_oom_verification_race_kimi_review.md)
+    -- replaces the old fixed-sleep-then-Prometheus-poll approach
+    (_inject_and_verify_chaos_mesh), which failed 9 real injection
+    attempts across 2 separate live batches. Root cause was two
+    stacked problems, confirmed via real kubectl lastState.terminated
+    data on both failures (97s and 119s real stressor-start-to-kill
+    times): (1) the old code deleted the StressChaos resource after a
+    FIXED sleep, before verification even started -- if the kill
+    hadn't happened yet, tearing down the stressor worked against ever
+    seeing it; (2) even with a longer fixed sleep, polling
+    kube_pod_container_status_restarts_total via Prometheus has real
+    scrape lag on top of the kernel's own non-deterministic OOM-kill
+    timing, so a fixed poll window could still miss a real kill that
+    landed a few seconds late.
+
+    Fixed by merging hold-and-verify into one loop: the stressor stays
+    ACTIVE while polling the k8s API directly (lastState.terminated,
+    sub-second, no scrape lag) every 3s, tearing down only once
+    confirmed OOMKilled or a 200s hard ceiling is hit (real margin over
+    the two observed real kills of 97s/119s -- not a bigger version of
+    the same guess, a backstop for a loop that's actively watching the
+    real signal the whole time). Re-resolves the pod name each
+    iteration in case of pod churn under memory pressure (same
+    old-pod/new-pod bug class already found elsewhere in this file)."""
     chaos_kind = "stresschaos"
-    baseline_restarts = _restart_count(cfg["target"], cfg["namespace"])
+    namespace = cfg["namespace"]
+    target = cfg["target"]
+    container = cfg["container"]
 
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
-        chaos_name = f"{cfg.get('chaos_name_prefix', fault_class)}-{uuid.uuid4().hex[:8]}"
-        manifest = manifest_builder(chaos_name, cfg)
+        pod_name = _current_pod_name(target, namespace)
+        baseline_restart_count = (
+            _pod_restart_count_direct(pod_name, namespace, container) if pod_name is not None else None
+        )
+        chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
+        manifest = build_oom_manifest(chaos_name, cfg)
         apply_manifest(manifest)
-        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: letting it run for {cfg['duration_s']}s...")
-        time.sleep(cfg["duration_s"])
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: stressor active, polling for a real "
+              f"OOM kill (ceiling {OOM_VERIFY_CEILING_S}s, baseline restartCount={baseline_restart_count})...")
+        verified = False
+        elapsed = 0
         try:
-            verified = _verify_restart_effect(cfg["target"], cfg["namespace"], baseline_restarts)
+            while elapsed <= OOM_VERIFY_CEILING_S:
+                current_pod_name = _current_pod_name(target, namespace)
+                if (
+                    current_pod_name is not None
+                    and baseline_restart_count is not None
+                    and _pod_oom_killed(current_pod_name, namespace, container, baseline_restart_count)
+                ):
+                    verified = True
+                    break
+                time.sleep(OOM_VERIFY_POLL_S)
+                elapsed += OOM_VERIFY_POLL_S
         finally:
-            # Cleanup must run even if verification throws -- an active
-            # Schedule left behind on a connection hiccup would keep
-            # killing the target pod indefinitely, corrupting every
-            # future episode on it until someone notices manually.
+            # Cleanup must run even if the poll loop throws -- an
+            # active memory stressor left behind would keep pressuring
+            # (and potentially OOM-killing) the target indefinitely.
             delete_chaos_resource(chaos_kind, chaos_name)
         if verified:
+            print(f"  attempt {attempt}: real OOMKilled confirmed after ~{elapsed}s")
             return chaos_name
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
-        print(f"  attempt {attempt}: no restart detected{suffix}")
+        print(f"  attempt {attempt}: no OOM kill detected within {OOM_VERIFY_CEILING_S}s{suffix}")
     return None
 
 
@@ -2460,9 +2585,11 @@ def main():
         chaos_name = "manual-patch" if verified else None
     elif fault_class == "oom":
         _ensure_oom_baseline(cfg)
-        chaos_name = _inject_and_verify_chaos_mesh(fault_class, cfg, build_oom_manifest)
+        chaos_name = _inject_and_verify_oom(cfg)
     else:
-        chaos_name = _inject_and_verify_chaos_mesh(fault_class, cfg, build_oom_manifest)
+        # Unreachable in practice -- argparse's choices=FAULT_CONFIG.keys()
+        # and every real key above already has its own explicit branch.
+        raise ValueError(f"no injection mechanism wired up for fault_class={fault_class!r}")
 
     if not chaos_name:
         print(

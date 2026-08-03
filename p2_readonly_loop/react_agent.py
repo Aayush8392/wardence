@@ -107,8 +107,8 @@ FIELD_GUIDANCE = """Field meanings and thresholds (a null/false/empty field mean
 - peak_threads_connected (catalogue-db only): >= 100 -> connection-pool-exhaustion.
 - cpu_throttle_periods_increase (user only): >= 100 -> cpu-throttling.
 - front_end_image_pull_failing: true -> bad-rollout.
-- catalogue_probe_p95_ms (from probe_catalogue_capacity): >= 200ms -> under-provisioned-replicas.
-- dl_detector_result.is_anomalous (from call_dl_detector): true, with no other signal above having fired -> "log-anomaly detected (unclassified)" is NOT a valid diagnosis for you to output -- treat it as a hint only; if it's the only thing that fired, diagnose the closest matching class if any field pattern suggests one, otherwise "none".
+- catalogue_probe_p95_ms (from probe_catalogue_capacity): >= 190ms -> under-provisioned-replicas.
+- dl_detector_result.is_anomalous (from call_dl_detector) on catalogue, with no other signal above having fired: this is NOT enough on its own to conclude "none" -- you MUST call probe_catalogue_capacity (if you have not already this episode) before concluding anything, since it is the one signal that can actually confirm or rule out under-provisioned-replicas. Only after probe_catalogue_capacity has been called and its result checked against the threshold above may you fall back to the closest matching class or "none". "log-anomaly detected (unclassified)" is NOT a valid diagnosis for you to output.
 - If NONE of the above are met, diagnosis is "none"."""
 
 # Fields checked for a real, non-subjective "you already have an
