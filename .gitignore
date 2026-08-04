@@ -10,6 +10,10 @@ reviews/
 # export, named for what it's a mockup of.
 p4_frontend/stitch_mockups/
 
+# Standalone throwaway visual prototypes (e.g. dot-sphere), same treatment
+# the earlier stacked-rings prototype got -- reference/scratch, not app code.
+p4_frontend/prototypes/
+
 # Python
 p2_readonly_loop/venv/
 __pycache__/
