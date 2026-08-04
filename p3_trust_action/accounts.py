@@ -28,7 +28,7 @@ import pyotp
 
 DB_PATH = Path.home() / "wardence_p2_data" / "wardence.db"
 
-ROLES = {"admin", "demo-trigger"}
+ROLES = {"admin", "demo-trigger", "viewer"}
 
 # How many recent failed attempts for a given username lock out further
 # tries, and for how long -- defeats brute-force guessing regardless of

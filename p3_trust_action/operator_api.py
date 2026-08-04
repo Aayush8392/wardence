@@ -94,10 +94,40 @@ app.add_middleware(
 # regardless of the account itself being revocable.
 DEFAULT_SESSION_HOURS = 24
 
-IMPLEMENTED_CLASSES = {"crash-loop", "oom", "disk-full"}
-# All 3 locked auto-fix classes -- decided 2026-07-24 (Phase B) to give demo
-# users a real feel for the project's depth, not just the cheapest class.
-SAFE_DEMO_CLASSES = {"crash-loop", "oom", "disk-full"}
+# Real 12-class v1 roster (wardence_context.md), expanded 2026-08-06 --
+# was hardcoded to the original 3-class Phase B set, blocking live-trigger
+# coverage for the 9 classes added since (C1/C2 taxonomy expansion).
+IMPLEMENTED_CLASSES = {
+    "crash-loop", "oom", "disk-full", "cpu-throttling",
+    "under-provisioned-replicas", "bad-rollout",
+    "network-latency", "memory-leak", "connection-pool-exhaustion",
+    "network-partition", "init-failure", "session-cart-failure",
+}
+# The 6 auto-fix classes -- all ops-level, RBAC-caged, reversible actions,
+# a consistent blast-radius bound. Report-only classes stay admin-only:
+# several involve real resource pressure (e.g. connection-pool-exhaustion's
+# DB flood) with no bounded auto-fix to clean up after, unlike the auto-fix
+# set. Decided 2026-08-06, expanding the original 2026-07-24 3-class set
+# (crash-loop/oom/disk-full) to the full auto-fix roster.
+SAFE_DEMO_CLASSES = {
+    "crash-loop", "oom", "disk-full",
+    "cpu-throttling", "under-provisioned-replicas", "bad-rollout",
+}
+# Real worst-case injection time across all 12 classes, checked directly
+# against each class's own injection function (2026-08-06), NOT the
+# FAULT_CONFIG duration_s table alone -- that table proved an unreliable
+# proxy (oom's duration_s=90 comment describes a mechanism the 2026-08-01
+# Kimi-review-19 redesign fully replaced; the real driver for oom is
+# OOM_VERIFY_CEILING_S=200s in injector.py, unrelated to duration_s).
+# Real per-attempt worst case, oom: 200s. MAX_INJECT_ATTEMPTS=3 (injector.py)
+# -> 600s theoretical ceiling + small per-attempt overhead. 400s is below
+# that full theoretical ceiling deliberately -- typical real oom kills land
+# at 97-119s (see injector.py's _inject_and_verify_oom docstring), so
+# burning the full 200s ceiling on 2+ consecutive attempts is a rare,
+# worth-surfacing event, not a case worth padding the UX wait time for.
+# The subprocess call below is wrapped in try/except TimeoutExpired, so
+# even a genuine miss fails with a clean error, not a crash.
+INJECT_SUBPROCESS_TIMEOUT_S = 400
 COOLDOWN_S = 60
 DAILY_CAP = 3  # per-IP cap -- a fairness layer, NOT the real budget protection
 
@@ -464,13 +494,30 @@ def trigger_inject(
         _audit(conn, role, "/trigger/inject", f"fault_class={fault_class}", ip)
         conn.close()
 
-        result = subprocess.run(
-            [sys.executable, str(INJECTOR_PATH), "--class", fault_class],
-            cwd=str(INJECTOR_CWD),
-            capture_output=True,
-            text=True,
-            timeout=90,
-        )
+        try:
+            result = subprocess.run(
+                [sys.executable, str(INJECTOR_PATH), "--class", fault_class],
+                cwd=str(INJECTOR_CWD),
+                capture_output=True,
+                text=True,
+                timeout=INJECT_SUBPROCESS_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            # Real bug, logged 2026-08-03: an uncaught TimeoutExpired used to
+            # surface as a bare unhandled 500 and could kill injector.py
+            # mid-attempt, risking leaked flood/stressor state its own
+            # `finally`-block cleanup never got to run (the exact class of
+            # bug fault-injection-cleanup-discipline exists to catch). Still
+            # not a clean recovery -- a genuinely stuck injector process is a
+            # real infra problem -- but this at least gives the caller an
+            # honest, specific error instead of a crash.
+            raise HTTPException(
+                504,
+                f"injector for '{fault_class}' did not finish within "
+                f"{INJECT_SUBPROCESS_TIMEOUT_S}s -- likely a genuinely stuck "
+                f"cluster/injector process, not a normal retry. Check the "
+                f"cluster directly before retrying.",
+            )
         if result.returncode != 0:
             raise HTTPException(500, f"injector failed: {result.stderr}")
 
