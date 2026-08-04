@@ -68,6 +68,7 @@ from action_proposer import DETERMINISTIC_ACTION_MAP, propose_action  # noqa: E4
 from react_agent import run_react_diagnosis  # noqa: E402
 from misdispatch_guard import ensure_misdispatch_tables, get_safety_hold  # noqa: E402
 import dispatch_gate  # noqa: E402
+from constraint_checks import check_safe  # noqa: E402
 
 # Both P2 and P3 have a file named agent.py -- a plain `from agent import
 # ...` here would resolve to THIS file (already partially loaded) instead
@@ -504,7 +505,31 @@ def act(req: ActRequest):
     if (req.diagnoser_mode_used == LLM and action_trust["state"] == LLM_CAN_ACT
             and proposal is not None and proposal.get("tool_name") is not None):
         tool_agreement_ok = proposal["tool_name"] == action_name
+        # Real gap found and fixed 2026-08-06, live: this veto used to
+        # ONLY check tool-NAME agreement, never the proposed PARAMS --
+        # meaning a correctly-diagnosed episode from an already-trusted
+        # class could dispatch a genuinely unsafe magnitude (confirmed
+        # live twice: oom proposed 8Mi, real dispatch attempted and only
+        # failed because Kubernetes' own admission rules happened to
+        # reject it as invalid -- pure luck, not a real safeguard;
+        # under-provisioned-replicas proposed 2, which DID dispatch for
+        # real with no check at all, since K8s has no equivalent built-in
+        # floor on replica count). dispatch_gate.check() below never
+        # catches this either -- it only fires on a WRONG diagnosis
+        # (predicted != actual), and both these episodes were correctly
+        # diagnosed. check_safe() is the same function Dimension C's
+        # scoring already trusts -- now also gates the REAL dispatch,
+        # not just the score. Uses req.predicted, never actual_class --
+        # this is the real production path, which must stay blinded to
+        # ground truth same as everywhere else (and must work even in a
+        # genuine unattended live episode with no ground truth at all).
+        params_safe = True
+        safety_reason = "tool has no magnitude parameter -- trivially safe"
         if tool_agreement_ok:
+            params_safe, safety_reason = check_safe(
+                proposal["tool_name"], proposal["params"], req.predicted, req.tool_output,
+            )
+        if tool_agreement_ok and params_safe:
             action_taken, action_result, action_source, gate_substitution = _dispatch_with_gate(
                 req.predicted, proposal["tool_name"], proposal["params"], proposal["source"], req,
             )
@@ -514,7 +539,9 @@ def act(req: ActRequest):
             response["gate_substitution"] = gate_substitution
             return response
         # else: falls through to the deterministic dispatch below --
-        # tool-agreement veto fired, C's scoring above is unaffected.
+        # tool-agreement veto and/or the new params-safety veto fired,
+        # C's scoring above is unaffected (still scores the raw
+        # pre-veto proposal, never this veto's outcome).
 
     # Deterministic production dispatch -- still the path for:
     # stub-mode classes, LLM-mode classes not yet Dimension-C-trusted,

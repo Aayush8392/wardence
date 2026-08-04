@@ -120,9 +120,19 @@ TOOL_SCHEMAS = {
     "rollback_deployment": {
         "name": _is_nonempty_str,
     },
+    # Real bug found and fixed 2026-08-06, live: "replicas" required here
+    # went stale the moment action_proposer.py's 2026-08-03 fix removed
+    # replicas from restore_from_disk_full's decision space entirely
+    # (the LLM is never asked for it, never shown it in the prompt
+    # schema -- action_proposer.py injects the real, tested value
+    # server-side, AFTER this validator runs). Requiring it here meant
+    # every real proposal from every provider was rejected before ever
+    # reaching that injection step -- confirmed live: 100% of disk-full's
+    # action proposals across an entire 5-hour, 84-episode batch fell
+    # through to the deterministic fallback for this exact reason, the
+    # same identical rejection on every single attempt.
     "restore_from_disk_full": {
         "name": _is_nonempty_str,
-        "replicas": _is_valid_replicas,
     },
 }
 

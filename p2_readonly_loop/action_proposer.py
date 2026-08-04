@@ -73,6 +73,7 @@ from model_backend import PROVIDER_CHAIN, _extract_json, call_one, LLMFailure  #
 from tool_call_validator import MAX_CPU_LIMIT_M, MAX_MEMORY_LIMIT_MI, MAX_REPLICAS, validate_tool_call  # noqa: E402
 from trust_engine import DB_PATH  # noqa: E402
 from constraint_checks import _live_replica_count  # noqa: E402
+from injector import OOM_BASELINE_MEMORY_LIMIT, UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS  # noqa: E402
 
 # Real, already-in-production deterministic mapping (p3_trust_action's
 # p3_agent.py's own ACTION_MAP/FIX_PARAMS) -- duplicated by hand here
@@ -131,11 +132,11 @@ MAGNITUDE_SENSITIVE_NULL_FALLBACK = {
 ACTION_SCHEMA_TEXT = f"""Available actions and their EXACT real parameter formats:
 - restart_deployment: {{"tool": "restart_deployment", "params": {{"name": "<deployment name>"}}}}
 - patch_memory_limit: {{"tool": "patch_memory_limit", "params": {{"name": "...", "container": "...", "limit": "<quantity>"}}}}
-  Valid limit examples: "256Mi", "512Mi", "1Gi" (Ki/Mi/Gi/Ti suffix only, no "m"). Must be > the real observed peak_memory_mib and <= {MAX_MEMORY_LIMIT_MI}Mi.
+  HARD RULE: the "limit" value MUST be STRICTLY GREATER THAN {OOM_BASELINE_MEMORY_LIMIT} -- ALWAYS, regardless of what peak_memory_mib shows (that field can read misleadingly low for a fast kill, so treating it as the only floor is wrong). {OOM_BASELINE_MEMORY_LIMIT} is the real limit that was already in place and just failed. A value at or below {OOM_BASELINE_MEMORY_LIMIT} is INVALID and will be rejected, no exceptions. Also must be > the real observed peak_memory_mib and <= {MAX_MEMORY_LIMIT_MI}Mi. Valid limit examples: "256Mi", "512Mi", "1Gi" (Ki/Mi/Gi/Ti suffix only, no "m").
 - patch_cpu_limit: {{"tool": "patch_cpu_limit", "params": {{"name": "...", "container": "...", "limit": "<quantity>"}}}}
   Valid limit examples: "300m", "600m", "1" (millicores with "m" suffix, or whole cores as a bare number). Must be <= {MAX_CPU_LIMIT_M}m.
 - scale_deployment: {{"tool": "scale_deployment", "params": {{"name": "...", "replicas": <int, 1-{MAX_REPLICAS}>}}}}
-  Must be STRICTLY GREATER than the real current_replicas value given in the input data below (never equal to or less than it), and <= {MAX_REPLICAS}.
+  HARD RULE: the "replicas" value MUST be AT LEAST {UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS} -- ALWAYS, regardless of the real current_replicas value. {UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS} is the one real, empirically-measured replica count actually confirmed to resolve this fault; a smaller in-between value (e.g. current_replicas+1) is NOT confirmed sufficient and will be rejected, no exceptions. Also must be STRICTLY GREATER than the real current_replicas value and <= {MAX_REPLICAS}.
 - rollback_deployment: {{"tool": "rollback_deployment", "params": {{"name": "..."}}}}
 - restore_from_disk_full: {{"tool": "restore_from_disk_full", "params": {{"name": "..."}}}}"""
 
@@ -162,7 +163,10 @@ If the observed data contains signals that could suggest a different diagnosis t
 
 Examples (illustrative values, not real production defaults -- compute your own answer from the real data given to you, don't copy these numbers):
 Input: diagnosis="oom", peak_memory_mib=290
-Output: {{"tool": "patch_memory_limit", "params": {{"name": "catalogue", "container": "catalogue", "limit": "512Mi"}}, "reasoning": "512Mi provides headroom above the observed 290Mi peak."}}
+Output: {{"tool": "patch_memory_limit", "params": {{"name": "catalogue", "container": "catalogue", "limit": "512Mi"}}, "reasoning": "512Mi provides headroom above both the observed 290Mi peak and the {OOM_BASELINE_MEMORY_LIMIT} baseline that just failed."}}
+
+Input: diagnosis="oom", peak_memory_mib=8 (a suspiciously low reading -- the real container was JUST OOM-killed, so its true peak usage was at or above the {OOM_BASELINE_MEMORY_LIMIT} baseline limit regardless of what this field shows; a very fast kill can leave peak_memory_mib reading misleadingly low because no metric scrape ever caught the real spike)
+Output: {{"tool": "patch_memory_limit", "params": {{"name": "catalogue", "container": "catalogue", "limit": "400Mi"}}, "reasoning": "peak_memory_mib (8Mi) is far below the {OOM_BASELINE_MEMORY_LIMIT} baseline that already failed -- that reading is not trustworthy for a fast kill, so sized well above the known baseline instead, not the unreliable peak."}}
 
 Input: diagnosis="oom", peak_memory_mib=null
 Output: {{"tool": "restart_deployment", "params": {{"name": "catalogue"}}, "reasoning": "No peak memory data available, magnitude-sensitive fix not possible."}}
@@ -170,8 +174,8 @@ Output: {{"tool": "restart_deployment", "params": {{"name": "catalogue"}}, "reas
 Input: diagnosis="cpu-throttling", cpu_throttle_periods_increase=340
 Output: {{"tool": "patch_cpu_limit", "params": {{"name": "user", "container": "user", "limit": "800m"}}, "reasoning": "Limit raised above the observed throttling pressure."}}
 
-Input: diagnosis="under-provisioned-replicas", current_replicas=3
-Output: {{"tool": "scale_deployment", "params": {{"name": "catalogue", "replicas": 5}}, "reasoning": "Scaled above the real current count of 3 to add real headroom."}}
+Input: diagnosis="under-provisioned-replicas", current_replicas=2
+Output: {{"tool": "scale_deployment", "params": {{"name": "catalogue", "replicas": 5}}, "reasoning": "Scaled to well above both the real current count of 2 and the {UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS}-replica empirically-confirmed minimum. Always read current_replicas from the real data below, never from this example -- and never propose only current_replicas+1, since a small in-between value is not confirmed to actually resolve the fault."}}
 
 Input: diagnosis="crash-loop", target="carts"
 Output: {{"tool": "restart_deployment", "params": {{"name": "carts"}}, "reasoning": "Crash-loop is resolved by a clean restart."}}

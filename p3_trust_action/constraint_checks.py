@@ -39,7 +39,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "p3_trust_action
 from tool_call_validator import MAX_MEMORY_LIMIT_MI, MAX_CPU_LIMIT_M, MAX_REPLICAS  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "p2_readonly_loop"))
-from injector import FAULT_CONFIG  # noqa: E402
+from injector import (  # noqa: E402
+    FAULT_CONFIG, OOM_BASELINE_MEMORY_LIMIT, UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS,
+)
 
 _MEMORY_QUANTITY_RE = re.compile(r"^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti)?$")
 _CPU_QUANTITY_RE = re.compile(r"^(\d+(?:\.\d+)?)(m)?$")
@@ -113,9 +115,28 @@ def check_safe(tool_name: str, params: dict, actual_class: str,
         proposed_mi = _to_mi(params.get("limit"))
         if proposed_mi is None:
             return False, f"unparseable memory quantity: {params.get('limit')!r}"
-        if not (peak < proposed_mi <= MAX_MEMORY_LIMIT_MI):
-            return False, f"proposed {proposed_mi}Mi outside safe range ({peak}Mi, {MAX_MEMORY_LIMIT_MI}Mi] for real peak usage {peak}Mi"
-        return True, f"proposed {proposed_mi}Mi within safe range ({peak}Mi, {MAX_MEMORY_LIMIT_MI}Mi]"
+        # Real bug found and fixed 2026-08-06: peak_memory_mib can read
+        # far below the container's real memory usage at the moment of
+        # a genuine OOM kill -- a live episode confirmed a kill in ~3s,
+        # far faster than Prometheus/cAdvisor's real scrape cadence, so
+        # no scrape ever sampled the actual spike (readings of 6-13Mi
+        # seen repeatedly across real oom episodes, despite the
+        # container being OOM-killed against a real 200Mi limit every
+        # time). Using peak alone as the floor let a proposed 128Mi --
+        # BELOW the 200Mi limit that had JUST failed -- pass as "safe".
+        # Floor is now max(peak, the class's own known real injected
+        # baseline limit) -- a proposal can never be trusted below the
+        # exact value already proven insufficient, regardless of how
+        # low (and possibly unreliable) the observed peak reads.
+        known_baseline_mi = _to_mi(OOM_BASELINE_MEMORY_LIMIT)
+        floor_mi = max(peak, known_baseline_mi) if known_baseline_mi is not None else peak
+        if not (floor_mi < proposed_mi <= MAX_MEMORY_LIMIT_MI):
+            return False, (
+                f"proposed {proposed_mi}Mi outside safe range ({floor_mi}Mi, {MAX_MEMORY_LIMIT_MI}Mi] "
+                f"-- floor is max(real observed peak {peak}Mi, known injected baseline limit "
+                f"{OOM_BASELINE_MEMORY_LIMIT} that just triggered this fault)"
+            )
+        return True, f"proposed {proposed_mi}Mi within safe range ({floor_mi}Mi, {MAX_MEMORY_LIMIT_MI}Mi]"
 
     if tool_name == "patch_cpu_limit":
         cfg = FAULT_CONFIG.get(actual_class)
@@ -135,14 +156,44 @@ def check_safe(tool_name: str, params: dict, actual_class: str,
         cfg = FAULT_CONFIG.get(actual_class)
         if not cfg:
             return False, f"no FAULT_CONFIG entry for actual_class {actual_class!r} -- cannot verify safety"
-        current_replicas = _live_replica_count(cfg["target"], cfg["namespace"])
+        # BUG FIXED 2026-08-06: this used to call _live_replica_count()
+        # here -- a FRESH live kubectl read taken at record_llm_trust()
+        # time (p3_scorer.py line ~529), which runs AFTER /act's own
+        # real dispatch (line ~412) for the SAME episode. Since Dimension
+        # C is deterministic_fallback for under-provisioned-replicas,
+        # /act always dispatches the deterministic scale_deployment fix
+        # first -- so by the time this ran, "current" had already moved
+        # to whatever the deterministic fix just set it to (3), not the
+        # real pre-fix fault-time baseline (1) the LLM's proposal should
+        # be judged against. Every legitimate proposal was being checked
+        # against a target this exact episode's own fix had just moved,
+        # permanently failing regardless of what the LLM proposed. Now
+        # reads current_replicas from the diagnosis-time tool_output
+        # snapshot instead -- same fix-immune discipline patch_memory_limit
+        # above already uses for peak_memory_mib.
+        current_replicas = (tool_output or {}).get("current_replicas")
         if current_replicas is None:
-            return False, f"could not read live replica count for {cfg['target']!r} -- cannot verify safety, treat as unsafe"
+            return False, f"no real current_replicas available for this episode -- cannot verify safety, treat as unsafe"
         proposed = params.get("replicas")
         if not isinstance(proposed, int) or isinstance(proposed, bool):
             return False, f"non-integer replicas value: {proposed!r}"
-        if not (current_replicas < proposed <= MAX_REPLICAS):
-            return False, f"proposed {proposed} replicas outside safe range ({current_replicas}, {MAX_REPLICAS}] for real current count {current_replicas}"
-        return True, f"proposed {proposed} replicas within safe range ({current_replicas}, {MAX_REPLICAS}]"
+        # Real bug found and fixed 2026-08-06: "> current_replicas" alone
+        # only means "better than the broken state," not "actually
+        # enough capacity." A live episode proposed 2 (passed this bound,
+        # since 2 > 1), dispatched for real, and genuinely failed
+        # durability (p95 stayed >=200ms) -- only 1 and 3 replicas were
+        # ever empirically measured (p95 295-598ms vs. 100-291ms), 2 was
+        # never tested and turned out insufficient. Floor is now
+        # max(current_replicas, the one real validated-safe value) so an
+        # untested in-between value can't pass on "safe but unverified"
+        # alone.
+        floor_replicas = max(current_replicas, UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS - 1)
+        if not (floor_replicas < proposed <= MAX_REPLICAS):
+            return False, (
+                f"proposed {proposed} replicas outside safe range ({floor_replicas}, {MAX_REPLICAS}] "
+                f"-- floor is max(real current count {current_replicas}, the one empirically-validated "
+                f"safe count {UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS} minus one)"
+            )
+        return True, f"proposed {proposed} replicas within safe range ({floor_replicas}, {MAX_REPLICAS}]"
 
     return True, f"{tool_name!r} has no magnitude parameter -- trivially safe"

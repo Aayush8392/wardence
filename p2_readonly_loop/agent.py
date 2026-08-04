@@ -792,6 +792,25 @@ def query_prometheus(target: str, namespace: str) -> dict:
     evicted_pods_raw = [entry["metric"].get("pod") for entry in evicted_result]
     evicted_pods = evicted_pods_raw if (evicted_pods_raw and has_recent_replacement_pod) else []
     crashlooping_pods = [entry["metric"].get("pod") for entry in crash_result]
+
+    # current_replicas: the real, live desired replica count
+    # (kube_deployment_spec_replicas -- same DESIRED, not READY,
+    # semantics as constraint_checks.py's own kubectl .spec.replicas
+    # read, so the LLM's proposal and the live safety check reason
+    # about the same number). Added 2026-08-06 -- under-provisioned-
+    # replicas' tool_output never carried this field at all, so the LLM
+    # proposing scale_deployment had no real current count to reason
+    # "propose something greater than" from, and kept echoing the
+    # SYSTEM_PROMPT's own few-shot example value (3) instead, which
+    # always failed constraint_checks.check_safe's "> current" bound.
+    replicas_query = f'kube_deployment_spec_replicas{{namespace="{namespace}", deployment="{target}"}}'
+    replicas_resp = requests.get(
+        f"{PROMETHEUS_URL}/api/v1/query", params={"query": replicas_query}, timeout=10
+    )
+    replicas_resp.raise_for_status()
+    replicas_result = replicas_resp.json()["data"]["result"]
+    current_replicas = int(float(replicas_result[0]["value"][1])) if replicas_result else None
+
     return {
         "oom_pods": oom_pods,
         "evicted_pods": evicted_pods,
@@ -804,6 +823,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
         "peak_threads_connected": peak_threads_connected,
         "cpu_throttle_periods_increase": cpu_throttle_periods_increase,
         "front_end_image_pull_failing": front_end_image_pull_failing,
+        "current_replicas": current_replicas,
     }
 
 

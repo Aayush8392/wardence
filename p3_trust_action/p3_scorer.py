@@ -439,7 +439,11 @@ def main():
                 conn, reason="action failed or misdiagnosed", fault_class=actual_class
             )
         else:
-            verdict = verify_durability(actual_class, target, namespace)
+            # action_result passed through 2026-08-06 -- see
+            # verifier.py's verify_durability docstring: under-
+            # provisioned-replicas' durability check needs the REAL
+            # dispatched replica count, not a hardcoded assumption.
+            verdict = verify_durability(actual_class, target, namespace, action_result=action_result)
             durability_verdict = verdict["verdict"]
             durability_elapsed_s = verdict["elapsed_s"]
             trust_correct = durability_verdict == "confirmed"

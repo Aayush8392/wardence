@@ -583,7 +583,7 @@ def _wait_for_catalogue_replicas_ready(namespace: str, target_count: int, timeou
     return False
 
 
-def _verify_under_provisioned_durability(namespace: str, target: str) -> dict:
+def _verify_under_provisioned_durability(namespace: str, target: str, target_replicas: int) -> dict:
     """Custom durability path -- see the module-level constants'
     docstring for why this bypasses the generic poll loop entirely.
     FIRST waits for the fix's new replicas to genuinely become Ready
@@ -594,10 +594,21 @@ def _verify_under_provisioned_durability(namespace: str, target: str) -> dict:
     it's already wrong' discipline as the generic loop), else
     'confirmed' after all probes pass. If the replicas never reach the
     target count within the timeout, that's a real fix failure, not a
-    premature check -- reported as 'flapped' honestly."""
+    premature check -- reported as 'flapped' honestly.
+
+    target_replicas: the REAL replica count the dispatched action
+    actually requested -- BUG FIXED 2026-08-06: this used to always
+    wait for the hardcoded UNDER_PROVISIONED_TARGET_REPLICAS (3),
+    regardless of what was really dispatched. Once Dimension C promotes
+    a class to llm_can_act, the LLM's own raw proposal (which can
+    legitimately be any value > current, e.g. 2) is what actually
+    dispatches -- waiting for a fixed 3 would guarantee a false
+    'flapped' verdict (timeout) any time the real dispatched value
+    wasn't exactly 3, regardless of whether that value would have
+    genuinely fixed the fault. Callers must now pass the real value."""
     wait_start = time.time()
     ready = _wait_for_catalogue_replicas_ready(
-        namespace, UNDER_PROVISIONED_TARGET_REPLICAS, UNDER_PROVISIONED_REPLICA_WAIT_TIMEOUT_S
+        namespace, target_replicas, UNDER_PROVISIONED_REPLICA_WAIT_TIMEOUT_S
     )
     # Real elapsed wall-clock, not the worst-case timeout value -- the
     # wait usually finishes well before the timeout (e.g. ~180-190s in
@@ -626,7 +637,8 @@ def _verify_under_provisioned_durability(namespace: str, target: str) -> dict:
     }
 
 
-def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop") -> dict:
+def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop",
+                       action_result: "dict | None" = None) -> dict:
     """
     Poll until the fault class's durability window closes.
 
@@ -634,6 +646,15 @@ def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop
     "fault_class": ..., "target": ...}. "flapped" is returned the
     moment the fault reappears -- no need to wait out the rest of
     the window once it's already wrong.
+
+    action_result: the REAL dispatched action's own return value
+    (p3_scorer.py already has this in scope at the call site) -- only
+    consulted for under-provisioned-replicas, to durability-check
+    against the replica count that was ACTUALLY requested rather than
+    a hardcoded assumption. None-safe: falls back to
+    UNDER_PROVISIONED_TARGET_REPLICAS (matches the deterministic fix's
+    own value) when unavailable -- same behavior as before this fix,
+    for the stub-dispatched path where that's still exactly correct.
     """
     if fault_class not in DURABILITY_WINDOWS:
         raise ValueError(f"no durability window defined for fault class '{fault_class}'")
@@ -642,7 +663,8 @@ def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop
         # Bypasses the generic poll loop entirely -- see the module-
         # level constants' docstring for why (active real probes, not
         # a cheap passive query).
-        return _verify_under_provisioned_durability(namespace, target)
+        target_replicas = (action_result or {}).get("replicas") or UNDER_PROVISIONED_TARGET_REPLICAS
+        return _verify_under_provisioned_durability(namespace, target, target_replicas)
 
     if fault_class == "crash-loop":
         # Live API (exact `name={target}` label selector), not the

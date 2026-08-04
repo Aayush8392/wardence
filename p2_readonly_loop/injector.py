@@ -375,6 +375,17 @@ UNDER_PROVISIONED_VUS = 20
 UNDER_PROVISIONED_DURATION_S = 20
 UNDER_PROVISIONED_MIN_P95_MS = 190
 UNDER_PROVISIONED_BASELINE_REPLICAS = 1
+# Real bug found and fixed 2026-08-06: check_safe()'s scale_deployment
+# bound used to only require proposed > current_replicas (1) -- "safe"
+# by that bar alone, but never checked against the ONE real measured
+# data point above (3 replicas -> p95 100-291ms, safely below the
+# 190/200ms threshold). A real live episode proposed 2 replicas,
+# passed the old bound, dispatched for real, and genuinely failed
+# durability (p95 stayed >=200ms) -- 2 was never empirically tested,
+# only 1 and 3 were. Named here so constraint_checks.py can floor its
+# safety bound at this real, measured-safe value, not just "better
+# than broken."
+UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS = 3
 
 # bad-rollout: NOT Chaos Mesh, NOT exec-based -- a direct kubectl patch
 # of front-end's image to a nonexistent tag, simulating a real bad
@@ -1535,8 +1546,19 @@ def _inject_and_verify_under_provisioned(cfg: dict) -> str | None:
     active probe, not Chaos Mesh, not Prometheus. No persistent chaos
     resource to hold/delete -- see the constants' docstring above for
     why (the fault is a standing config state, not a transient
-    condition)."""
+    condition).
+
+    Real bug found 2026-08-06, live: also resets oom's own baseline
+    (memory limit) here, symmetric to the fix in main()'s oom branch --
+    oom and under-provisioned-replicas share catalogue as their target,
+    and a real prior oom fix leaves the memory limit raised with
+    nothing else to revert it, same "prior real fix, nothing reverts
+    it" reasoning _ensure_oom_baseline's own docstring already states.
+    Passes FAULT_CONFIG["oom"] explicitly, not this function's own cfg
+    -- under-provisioned-replicas' FAULT_CONFIG entry has no
+    "container" key, which _ensure_oom_baseline requires."""
     _ensure_catalogue_replica_baseline(cfg)
+    _ensure_oom_baseline(FAULT_CONFIG["oom"])
     namespace = cfg["namespace"]
 
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
@@ -2615,6 +2637,19 @@ def main():
         verified = _inject_and_verify_bad_rollout(cfg)
         chaos_name = "manual-patch" if verified else None
     elif fault_class == "oom":
+        # Real bug found 2026-08-06, live: oom and under-provisioned-
+        # replicas share the same target (catalogue), but each class's
+        # own baseline-reset function only ever touched ITS OWN
+        # dimension (memory limit here, replica count in
+        # _ensure_catalogue_replica_baseline) -- neither reset the
+        # OTHER'S. A real UPR fix that scaled catalogue to 3 replicas
+        # left it there for the next oom episode, and Chaos Mesh's
+        # `mode: one` StressChaos selector can then pick a DIFFERENT
+        # one of the 3 pods than the one _current_pod_name()/the
+        # verification poll is watching -- 3 consecutive real injection
+        # failures, confirmed live (kubectl showed replicas=3 mid-batch).
+        # Resetting both dimensions before injecting either class now.
+        _ensure_catalogue_replica_baseline(cfg)
         _ensure_oom_baseline(cfg)
         chaos_name = _inject_and_verify_oom(cfg)
     else:

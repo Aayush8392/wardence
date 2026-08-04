@@ -115,24 +115,53 @@ TARGET_RECENCY_WINDOW_S = {
     "session-cart-failure": 150,        # agent.py session_db_replicas_hit_zero: min_over_time(...[2m])
     "memory-leak": 210,                 # agent.py peak_memory_mib: max_over_time(...[3m])
     "connection-pool-exhaustion": 210,  # agent.py peak_threads_connected: max_over_time(...[3m])
-    # Auto-fix classes: real fix+durability cycle -- unchanged from the
-    # original flat 300s where it was already correctly derived.
-    "crash-loop": 300,
-    "oom": 300,
-    "disk-full": 300,
-    "bad-rollout": 300,
-    # under-provisioned-replicas' own real observed worst-case
-    # (durability_elapsed_s=278s, per wardence_buildlog.md) left only
-    # ~22s real margin against the old flat 300s -- widened for genuine
-    # safety, not because 300 was ever shown to actually fail.
-    "under-provisioned-replicas": 350,
-    # REAL CORRECTION, found during this recalibration: cpu-throttling's
-    # own diagnosis query uses a [6m]=360s lookback (agent.py, widened
-    # from [2m] on 2026-07-26 to fix a real reset-rollout timing bug) --
-    # genuinely LONGER than the old flat 300s guard, meaning repeated
-    # cpu-throttling runs were never actually safe against this exact
-    # contamination risk. Fixed to 360 + 30s buffer = 390.
-    "cpu-throttling": 390,
+    # Auto-fix classes: RECALIBRATED 2026-08-06, real 3-round Kimi review
+    # (reviews/24_recency_window_kimi_review.md-equivalent thread) plus
+    # direct verification against every class's own real source before
+    # applying. The old flat 300s/350s/390s values were sized as a
+    # blanket "fix+durability cycle" margin -- redundant double-counting
+    # once actually traced through: the anchor (last_fault_time[target]
+    # in run_batch_plan.py) is stamped right after injection, BEFORE
+    # settle+scorer/durability run, so under this project's serial
+    # (blocking) runner, that whole cycle's real elapsed time already
+    # accrues as free credit against the window before the NEXT episode
+    # even reaches its recency check -- moving the anchor would have been
+    # a regression (discards that credit), so it stays exactly where it
+    # is; only the window VALUES needed to drop.
+    #
+    # Every auto-fix class's own injector already runs a real, SYNCHRONOUS
+    # pre-injection reset/cleanup, live-verified before the next injection
+    # starts -- not a "should probably be enough time" guess:
+    #   oom: _clear_stale_oom_sticky_flag (runs for every class, not just
+    #        oom) + _ensure_oom_baseline
+    #   under-provisioned-replicas: _ensure_catalogue_replica_baseline
+    #   crash-loop: _wait_for_deployment_rollout (verifier.py, during this
+    #        episode's own durability check, before the episode even ends)
+    #   disk-full: _ensure_queue_master_pod_cleanup
+    #   bad-rollout: _ensure_front_end_image_baseline
+    #   cpu-throttling: _ensure_cpu_throttle_baseline
+    # Each class's own injector ALSO independently verifies a genuinely
+    # FRESH, live effect (a new baseline captured at the start of THIS
+    # attempt, real delta required above it) before an episode is ever
+    # recorded at all -- confirmed for all six, not assumed -- so a stale
+    # diagnosis-time signal can never manufacture a false "correct" for a
+    # fault that didn't really recur; it can at most reinforce an
+    # already-genuine same-class diagnosis (harmless) on a target no OTHER
+    # class ever touches (confirmed: user/front-end/carts/queue-master are
+    # each exclusive to one class; catalogue, shared by oom+under-
+    # provisioned-replicas, is the one real exception, already closed by
+    # the 2026-08-06 cross-baseline-reset fix in injector.py's main()).
+    # 60s = 2 real Prometheus/kube-state-metrics scrape cycles (30s each,
+    # same basis as SETTLE_SECONDS=35s's "one cycle + margin"), covering
+    # the only real remaining gap: scrape-lag visibility of the reset
+    # state, not a historical-window staleness risk (that risk no longer
+    # exists once the above resets are accounted for).
+    "crash-loop": 60,
+    "oom": 60,
+    "disk-full": 60,
+    "bad-rollout": 60,
+    "under-provisioned-replicas": 60,
+    "cpu-throttling": 60,
 }
 DEFAULT_TARGET_RECENCY_WINDOW_S = 300  # any class not yet in the dict above
 

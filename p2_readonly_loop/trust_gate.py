@@ -120,7 +120,15 @@ def action_is_correct(fault_class: str, tool_name: str, params: dict,
     if tool_name not in MAGNITUDE_SENSITIVE_ACTIONS:
         return True, f"tool-only match required for {tool_name!r} -- tool name matches, no magnitude parameter to check"
 
-    tool_output = ground_truth_params.get("_tool_output") if isinstance(ground_truth_params, dict) else None
+    # BUG FIXED 2026-08-06: this used to overwrite the real `tool_output`
+    # parameter (passed in explicitly by every caller, per the docstring
+    # above) with `ground_truth_params.get("_tool_output")` -- a key
+    # DETERMINISTIC_ACTION_MAP's params-builder lambdas never set, so it
+    # was always None. check_safe() therefore always saw tool_output=None
+    # for patch_memory_limit and failed closed on every single oom
+    # episode ("no real peak_memory_mib available"), even when the real
+    # tool_output the caller passed in had a genuine, non-null peak
+    # reading. Just use the real parameter directly.
     safe, reason = check_safe(tool_name, params, fault_class, tool_output)
     if not safe:
         return False, f"constraint-satisfaction failed for {tool_name!r}: {reason}"
@@ -134,18 +142,38 @@ if __name__ == "__main__":
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).parent.parent / "p3_trust_action"))
 
+    # tool_output passed explicitly for the two patch_memory_limit cases
+    # below -- required since the 2026-08-06 fix (see the comment above
+    # action_is_correct's check_safe() call): omitting it now correctly
+    # fails closed (no real peak_memory_mib to verify safety against),
+    # so a self-test claiming a magnitude proposal is "safe" must supply
+    # the real peak reading it's safe relative to, same as every real
+    # caller (p3_scorer.py) already does.
     cases = [
         ("oom", "patch_memory_limit", {"name": "catalogue", "namespace": "sock-shop", "container": "catalogue", "limit": "400Mi"},
-         "patch_memory_limit", {"name": "catalogue", "namespace": "sock-shop", "container": "catalogue", "limit": "400Mi"}, True),
+         "patch_memory_limit", {"name": "catalogue", "namespace": "sock-shop", "container": "catalogue", "limit": "400Mi"}, True,
+         {"peak_memory_mib": 50}),
         ("oom", "patch_memory_limit", {"name": "catalogue", "namespace": "sock-shop", "container": "catalogue", "limit": "4Gi"},
-         "patch_memory_limit", {"name": "catalogue", "namespace": "sock-shop", "container": "catalogue", "limit": "400Mi"}, False),
+         "patch_memory_limit", {"name": "catalogue", "namespace": "sock-shop", "container": "catalogue", "limit": "400Mi"}, False,
+         {"peak_memory_mib": 50}),
         ("crash-loop", "restart_deployment", {"name": "front-end", "namespace": "sock-shop"},
-         "restart_deployment", {"name": "front-end", "namespace": "sock-shop"}, True),
-        ("under-provisioned-replicas", "scale_deployment", {"name": "catalogue", "namespace": "sock-shop", "replicas": 20},
-         "scale_deployment", {"name": "catalogue", "namespace": "sock-shop", "replicas": 3}, False),
+         "restart_deployment", {"name": "front-end", "namespace": "sock-shop"}, True, None),
+        # Real bounds check, not just fail-closed-on-missing-data: current=3
+        # (real diagnosis-time baseline), proposed=2 is NOT > current -- the
+        # exact real shape of the UPR bug fixed 2026-08-06 (constraint_checks.py
+        # used to compare against a live-re-read POST-dispatch value instead
+        # of this snapshot).
+        ("under-provisioned-replicas", "scale_deployment", {"name": "catalogue", "namespace": "sock-shop", "replicas": 2},
+         "scale_deployment", {"name": "catalogue", "namespace": "sock-shop", "replicas": 3}, False,
+         {"current_replicas": 3}),
+        # And the genuine safe case: current=1 (real fault-time baseline),
+        # proposed=3 IS > current and <= MAX_REPLICAS(20).
+        ("under-provisioned-replicas", "scale_deployment", {"name": "catalogue", "namespace": "sock-shop", "replicas": 3},
+         "scale_deployment", {"name": "catalogue", "namespace": "sock-shop", "replicas": 3}, True,
+         {"current_replicas": 1}),
     ]
-    for fault_class, tool, params, gt_tool, gt_params, expected in cases:
-        ok, reason = action_is_correct(fault_class, tool, params, gt_tool, gt_params)
+    for fault_class, tool, params, gt_tool, gt_params, expected, tool_output in cases:
+        ok, reason = action_is_correct(fault_class, tool, params, gt_tool, gt_params, tool_output=tool_output)
         status = "PASS" if ok == expected else "FAIL"
         print(f"[{status}] {fault_class:30s} expected={expected!s:5s} got={ok!s:5s}  {reason}")
 
