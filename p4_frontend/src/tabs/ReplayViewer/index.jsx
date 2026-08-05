@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { useParams, useNavigate } from "react-router-dom";
 import { fetchEpisodes } from "../../api/r2";
 import { fetchLiveTrust } from "../../api/operator";
 import { useNavHistory } from "../../context/NavHistoryContext";
@@ -18,6 +18,7 @@ const SPHERE_HEIGHT = 480;
 export default function ReplayViewer() {
   const { episodeId } = useParams();
   const { currentContext, navigateTo } = useNavHistory();
+  const navigate = useNavigate();
   const { token, role } = useAuth();
   const [episodes, setEpisodes] = useState(null);
   const [error, setError] = useState(null);
@@ -25,6 +26,12 @@ export default function ReplayViewer() {
   const [search, setSearch] = useState("");
   const [manualClass, setManualClass] = useState("all");
   const [contextCleared, setContextCleared] = useState(false);
+
+  // Stable reference -- EpisodeList's rows are memoized (React.memo) so a
+  // click only re-renders the 1-2 rows whose selection state actually
+  // changed, not all ~2000+ rows; that memoization is defeated if the
+  // onSelect callback passed down is a new function every render.
+  const selectEpisode = useCallback((id) => navigate(`/replay/${id}`), [navigate]);
 
   useEffect(() => {
     let cancelled = false;
@@ -121,7 +128,7 @@ export default function ReplayViewer() {
         <EpisodeList
           episodes={visible}
           selectedId={selected?.episode_id}
-          onSelect={(id) => navigateTo(`/replay/${id}`, null, "Replay Viewer")}
+          onSelect={selectEpisode}
           maxHeight={SPHERE_HEIGHT}
         />
 
@@ -134,7 +141,7 @@ export default function ReplayViewer() {
           <DotSphere
             episodes={episodes}
             selectedId={selected?.episode_id}
-            onSelect={(id) => navigateTo(id ? `/replay/${id}` : "/replay", null, "Replay Viewer")}
+            onSelect={(id) => navigate(id ? `/replay/${id}` : "/replay")}
             filterClass={filterClass}
             onFilterClass={(cls) => { setManualClass(cls ?? "all"); setContextCleared(true); }}
             height={SPHERE_HEIGHT}
