@@ -122,6 +122,10 @@ p2_readonly_loop/batch_plan_progress_*.json
 
 # Phase E run output -- regenerated per run, not source
 p2_readonly_loop/phase_e_sanity_check.json
+p2_readonly_loop/check_comparison_sampling_table.py
+p2_readonly_loop/check_provider_limits.py
+p2_readonly_loop/check_groq_openrouter_raw_full.py
+p2_readonly_loop/diag_batch_model_comparison.py
 
 # log_sequence_pipeline.py's real, generated state -- watermarks, drain3
 # binary snapshots, and per-service JSONL event streams. Real accumulated
