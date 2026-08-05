@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { fetchEpisodes } from "../../api/r2";
+import { fetchEpisodes, fetchTrustLadder } from "../../api/r2";
 import { fetchLiveTrust } from "../../api/operator";
 import { useNavHistory } from "../../context/NavHistoryContext";
 import { useAuth } from "../../context/AuthContext";
@@ -23,6 +23,7 @@ export default function ReplayViewer() {
   const [episodes, setEpisodes] = useState(null);
   const [error, setError] = useState(null);
   const [trustMap, setTrustMap] = useState({});
+  const [trustLadder, setTrustLadder] = useState(null);
   const [search, setSearch] = useState("");
   const [manualClass, setManualClass] = useState("all");
   const [contextCleared, setContextCleared] = useState(false);
@@ -38,6 +39,17 @@ export default function ReplayViewer() {
     fetchEpisodes()
       .then((data) => { if (!cancelled) setEpisodes(data); })
       .catch((e) => { if (!cancelled) setError(e.message); });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Public R2 snapshot, no auth needed -- same data the Trust Ladder tab
+  // reads, used here for CaseFile's "why this outcome" real trust-state
+  // context. Best-effort: if it fails, CaseFile just skips that card.
+  useEffect(() => {
+    let cancelled = false;
+    fetchTrustLadder()
+      .then((rows) => { if (!cancelled) setTrustLadder(rows); })
+      .catch(() => {});
     return () => { cancelled = true; };
   }, []);
 
@@ -153,6 +165,7 @@ export default function ReplayViewer() {
         {selected ? (
           <CaseFile
             episode={selected}
+            trustEntry={trustLadder?.find((r) => r.fault_class === selected.fault_class) ?? null}
             canPromote={
               role === "admin" &&
               trustMap[selected.fault_class] === "report_only" &&

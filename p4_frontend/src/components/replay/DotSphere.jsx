@@ -516,8 +516,33 @@ export default function DotSphere({ episodes, selectedId, onSelect, filterClass,
     resizeObserver.observe(container);
 
     let raf;
+    let isVisible = true;
+    const visibilityObserver = new IntersectionObserver(
+      ([entry]) => {
+        const wasVisible = isVisible;
+        isVisible = entry.isIntersecting;
+        // Real bug: clock.getDelta() is only read below when visible, so
+        // time keeps accumulating internally while off-screen and un-read.
+        // Without this, the first frame back in view gets handed the ENTIRE
+        // off-screen duration as one delta -- a real rotation snap/jump, not
+        // a smooth resume. Drain it on the visible transition so the very
+        // next real delta starts clean.
+        if (isVisible && !wasVisible) clock.getDelta();
+      },
+      { threshold: 0 }
+    );
+    visibilityObserver.observe(container);
     function animate() {
       raf = requestAnimationFrame(animate);
+      // Real perf fix: the sphere is a permanent fixture (see SPHERE_HEIGHT
+      // comment in ReplayViewer/index.jsx), so it stays mounted -- and
+      // therefore kept rendering every frame, unconditionally -- the whole
+      // time a user is scrolled down reading CaseFile below it, completely
+      // off-screen. Skip the real work (label DOM writes, controls damping,
+      // full scene redraw) whenever the container isn't intersecting the
+      // viewport; still schedule the next rAF cheaply so it resumes the
+      // instant it scrolls back into view, no restart logic needed.
+      if (!isVisible) return;
       const delta = clock.getDelta();
       if (!isInteracting && !hasSelection && pinnedLegendClass === null && performance.now() - lastInteractionTime > IDLE_RESUME_MS) {
         const axis = camera.up.clone().normalize();
@@ -552,6 +577,7 @@ export default function DotSphere({ episodes, selectedId, onSelect, filterClass,
     return () => {
       cancelAnimationFrame(raf);
       resizeObserver.disconnect();
+      visibilityObserver.disconnect();
       window.removeEventListener("scroll", updateCanvasRect, { capture: true });
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
       window.removeEventListener("pointerup", onPointerUpGlobal);

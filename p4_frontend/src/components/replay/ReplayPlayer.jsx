@@ -1,143 +1,168 @@
-import { useEffect, useMemo, useState } from "react";
-import ReasoningSequence from "./ReasoningSequence";
-import ExecutionPhaseTrack from "./ExecutionPhaseTrack";
+import { useMemo } from "react";
+import { buildReplaySchedule, fadeProgress, typedText } from "./replaySchedule";
+import useReplayEngine from "../../hooks/useReplayEngine";
+import ReplaySeekbar from "./ReplaySeekbar";
+import { HeaderStrip, ServiceContext } from "./CaseFile";
+import { HighlightedSentence, ActionProgress } from "./ReasoningStream";
 import EvidenceGrid from "./EvidenceGrid";
+import ExecutionPhaseTrack from "./ExecutionPhaseTrack";
+import GateSubstitution from "./GateSubstitution";
+import TrustContext from "./TrustContext";
 import DurabilityVerdict from "./DurabilityVerdict";
+import SecurityCage from "../shared/SecurityCage";
 
-const BEAT_MS = 2600;
-
-// The locked 5-beat "lite story" skeleton (wardence_frontend.md, Replay
-// Viewer episode-breakdown design), applied identically to lite AND
-// enriched episodes -- same fixed pacing for both, per explicit call to
-// keep this simple rather than giving enriched episodes a richer replay
-// pace. The "Action Taken" beat is skipped entirely (not shown empty)
-// when no action was taken, matching the locked spec.
-function buildBeats(episode) {
-  const beats = [
-    { key: "incident", label: "INCIDENT DECLARED" },
-    { key: "evidence", label: "EVIDENCE GATHERED" },
-    { key: "diagnosis", label: "DIAGNOSIS REACHED" },
-  ];
-  if (episode.scores_action_taken) beats.push({ key: "action", label: "ACTION TAKEN" });
-  beats.push({ key: "verdict", label: "SYSTEM VERDICT" });
-  return beats;
+function findUnit(units, section) {
+  return units.find((u) => u.section === section);
+}
+function findUnits(units, section) {
+  return units.filter((u) => u.section === section);
 }
 
-function IncidentBeat({ episode }) {
-  return (
-    <div className="font-data-mono text-sm space-y-1">
-      <div>FAULT_CLASS: <span className="text-primary">{episode.fault_class}</span></div>
-      <div>TARGET: <span className="text-on-surface">{episode.target}</span></div>
-      <div className="text-on-surface-variant text-xs">{episode.t0}</div>
-    </div>
-  );
-}
+// Fixed content-shape rules (locked, not decided per class/episode):
+//   instant          -- header only, always full opacity.
+//   fade              -- a fact/tile-batch: fades in as a whole.
+//   fade-typewriter   -- real prose: container fades in, text types beneath.
+// Every section below is ALWAYS mounted in its real Snapshot position --
+// only opacity/text change over time, so the layout never shifts, and
+// scrubbing backward un-fades/un-types for free (pure functions of elapsed).
+export default function ReplayPlayer({ episode, trustEntry }) {
+  const { units, totalDuration } = useMemo(() => buildReplaySchedule(episode, trustEntry), [episode, trustEntry]);
+  const engine = useReplayEngine(totalDuration);
+  const { elapsed } = engine;
+  const milestones = useMemo(() => units.map((u) => u.start), [units]);
 
-function DiagnosisBeat({ episode }) {
-  return (
-    <div className="flex items-center gap-6">
-      <div className="flex flex-col items-center">
-        <span className="font-data-mono text-3xl text-primary">{episode.score_confidence?.toFixed(2) ?? "n/a"}</span>
-        <span className="font-label-caps text-[9px] text-on-surface-variant">CONFIDENCE</span>
-      </div>
-      <div className="font-data-mono text-sm space-y-1">
-        <div>PREDICTED: <span className="text-on-surface">{episode.predicted_class ?? "n/a"}</span></div>
-        <div>ACTUAL: <span className="text-on-surface">{episode.fault_class}</span></div>
-        <span className={`inline-block mt-1 px-2 py-0.5 font-label-caps text-[9px] ${episode.correct ? "bg-correct-green/20 text-correct-green" : "bg-error-red/20 text-error-red"}`}>
-          {episode.correct ? "CORRECT" : "INCORRECT"}
-        </span>
-      </div>
-    </div>
-  );
-}
+  const contextUnit = findUnit(units, "context");
+  const sentenceUnits = findUnits(units, "reasoning-sentence");
+  const turnUnits = findUnits(units, "reasoning-turn");
+  const decisionUnit = findUnit(units, "reasoning-decision");
+  const evidencePrimaryUnit = findUnit(units, "evidence-primary");
+  const evidenceSecondaryUnit = findUnit(units, "evidence-secondary");
+  const actionStepUnits = findUnits(units, "action-step");
+  const gateUnit = findUnit(units, "gate-substitution");
+  const trustUnit = findUnit(units, "trust-context");
+  const durabilityUnit = findUnit(units, "durability");
 
-function VerdictBeat({ episode }) {
-  return (
-    <div className="flex items-center gap-3">
-      <span className={`material-symbols-outlined text-3xl ${episode.correct ? "text-correct-green" : "text-error-red"}`}>
-        {episode.correct ? "check_circle" : "cancel"}
-      </span>
-      <span className={`font-headline-md text-xl tracking-widest ${episode.correct ? "text-correct-green" : "text-error-red"}`}>
-        {episode.correct ? "CORRECT RESOLUTION" : "INCORRECT DIAGNOSIS"}
-      </span>
-    </div>
-  );
-}
+  const reachedActionSteps = actionStepUnits.filter((u) => elapsed >= u.start);
+  const actionRevealCount = reachedActionSteps.length;
+  const activeActionStep = reachedActionSteps[reachedActionSteps.length - 1];
+  const activeDetailOverride = activeActionStep?.text != null ? typedText(activeActionStep, elapsed) : undefined;
 
-// Keyed by episode_id from CaseFile (see below) so a fresh episode
-// selection remounts this component entirely -- a clean reset of
-// beatIndex/playing without needing an effect that syncs state to a
-// changing prop (which React's own effect-linting flags as the sign of
-// state that should just be derived/remounted instead).
-export default function ReplayPlayer({ episode }) {
-  const beats = useMemo(() => buildBeats(episode), [episode]);
-  const [beatIndex, setBeatIndex] = useState(0);
-  const [playing, setPlaying] = useState(false);
-  const isLastBeat = beatIndex >= beats.length - 1;
+  const evidenceLeadUnit = evidencePrimaryUnit ?? evidenceSecondaryUnit;
+  const evidenceOpacity = fadeProgress(evidenceLeadUnit, elapsed);
 
-  useEffect(() => {
-    if (!playing || isLastBeat) return undefined;
-    const t = setTimeout(() => setBeatIndex((i) => Math.min(i + 1, beats.length - 1)), BEAT_MS);
-    return () => clearTimeout(t);
-  }, [playing, isLastBeat, beats.length]);
-
-  const activeKey = beats[beatIndex]?.key;
+  const hasReasoning = sentenceUnits.length > 0 || turnUnits.length > 0 || decisionUnit || actionStepUnits.length > 0;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center gap-3">
-        <button
-          onClick={() => (isLastBeat ? (setBeatIndex(0), setPlaying(true)) : setPlaying((p) => !p))}
-          className="w-8 h-8 flex items-center justify-center border border-primary text-primary hover:bg-primary/10"
-        >
-          <span className="material-symbols-outlined text-lg">
-            {isLastBeat ? "replay" : playing ? "pause" : "play_arrow"}
-          </span>
-        </button>
-        <button
-          onClick={() => setBeatIndex((i) => Math.max(0, i - 1))}
-          disabled={beatIndex === 0}
-          className="w-8 h-8 flex items-center justify-center border border-outline-variant text-on-surface-variant hover:border-primary hover:text-primary disabled:opacity-30"
-        >
-          <span className="material-symbols-outlined text-lg">skip_previous</span>
-        </button>
-        <button
-          onClick={() => setBeatIndex((i) => Math.min(beats.length - 1, i + 1))}
-          disabled={beatIndex === beats.length - 1}
-          className="w-8 h-8 flex items-center justify-center border border-outline-variant text-on-surface-variant hover:border-primary hover:text-primary disabled:opacity-30"
-        >
-          <span className="material-symbols-outlined text-lg">skip_next</span>
-        </button>
+      <ReplaySeekbar engine={engine} milestones={milestones} />
 
-        <div className="flex-1 flex items-center gap-1">
-          {beats.map((b, i) => (
-            <div key={b.key} className="flex-1 flex flex-col items-center gap-1">
-              <div className={`w-full h-1 ${i <= beatIndex ? "bg-primary" : "bg-outline-variant/30"}`} />
-              <span className={`font-label-caps text-[8px] ${i <= beatIndex ? "text-primary" : "text-outline"}`}>{b.label}</span>
+      {/* Header: the one fixed exception -- always full, instant opacity. */}
+      <HeaderStrip episode={episode} canPromote={false} onPromote={() => {}} />
+
+      {/* Same 12-col left/right placement as CaseFile's static Snapshot
+          layout, locked -- every section below is always mounted here,
+          nothing conditionally added/removed as the replay progresses. */}
+      <div className="grid grid-cols-12 gap-4">
+        <div className="col-span-12 lg:col-span-7 space-y-4">
+          <ServiceContext episode={episode} opacity={fadeProgress(contextUnit, elapsed)} />
+
+          {hasReasoning && (
+            <div className="space-y-6">
+              <h2 className="font-label-caps text-xs text-on-surface-variant flex items-center gap-2">
+                <span className="material-symbols-outlined text-sm">psychology</span> REASONING
+              </h2>
+              <div className="relative pl-6 space-y-4">
+                <div className="absolute left-[7px] top-0 bottom-0 w-px bg-outline-variant" />
+
+                {sentenceUnits.map((u) => (
+                  <div key={u.id} className="relative" style={{ opacity: fadeProgress(u, elapsed) }}>
+                    <div className="absolute -left-[23px] top-1.5 w-2 h-2 rounded-full bg-primary border-2 border-surface-container" />
+                    <div className="bg-surface-container-high border border-outline-variant p-5">
+                      <span className="font-label-caps text-[10px] text-primary uppercase">{u.label}</span>
+                      <p className="font-data-mono text-sm leading-relaxed mt-2.5">
+                        <HighlightedSentence text={typedText(u, elapsed)} />
+                      </p>
+                    </div>
+                  </div>
+                ))}
+
+                {turnUnits.map((u) => (
+                  <div key={u.id} className="relative" style={{ opacity: fadeProgress(u, elapsed) }}>
+                    <div className="absolute -left-[23px] top-1.5 w-2 h-2 rounded-full bg-primary border-2 border-surface-container" />
+                    <div className="bg-surface-container-high border border-outline-variant p-4">
+                      <div className="font-data-mono text-xs text-on-surface-variant">
+                        <span className="text-primary">[Turn {u.data.turn}]</span> {u.data.action}
+                      </div>
+                      {u.text != null && (
+                        <p className="font-data-mono text-xs text-on-surface-variant mt-2 break-all">
+                          {typedText(u, elapsed)}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                ))}
+
+                {decisionUnit && (
+                  <div className="relative" style={{ opacity: fadeProgress(decisionUnit, elapsed) }}>
+                    <div className="absolute -left-[23px] top-1.5 w-2 h-2 rounded-full bg-primary border-2 border-surface-container" />
+                    <div className="bg-surface-container-high border border-outline-variant p-5">
+                      <span className="font-label-caps text-[10px] text-primary uppercase">DECISION</span>
+                      <p className="font-data-mono text-sm leading-relaxed mt-2.5">
+                        <HighlightedSentence text={typedText(decisionUnit, elapsed)} />
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {actionStepUnits.length > 0 && (
+                  <div className="relative" style={{ opacity: fadeProgress(actionStepUnits[0], elapsed) }}>
+                    <div className="absolute -left-[23px] top-1.5 w-2 h-2 rounded-full bg-[#238636] border-2 border-surface-container" />
+                    <div className="bg-surface-container-high border border-outline-variant p-4">
+                      <span className="font-label-caps text-[10px] text-[#238636] uppercase">Action taken</span>
+                      <ActionProgress episode={episode} revealCount={actionRevealCount} activeDetailOverride={activeDetailOverride} />
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
-          ))}
-        </div>
-      </div>
+          )}
 
-      <div className="min-h-[220px] border border-outline-variant bg-surface-container-low p-4">
-        {activeKey === "incident" && <IncidentBeat episode={episode} />}
-        {activeKey === "evidence" && (
-          <div className="space-y-4">
-            <ReasoningSequence episode={episode} revealCount={999} />
-            <EvidenceGrid toolOutput={episode.tool_output} />
-          </div>
-        )}
-        {activeKey === "diagnosis" && <DiagnosisBeat episode={episode} />}
-        {activeKey === "action" && (
-          <div className="space-y-3">
-            <ExecutionPhaseTrack episode={episode} />
-            <DurabilityVerdict
-              verdict={episode.snapshot_durability_verdict ?? episode.scores_durability_verdict}
-              elapsedS={episode.durability_elapsed_s}
-            />
-          </div>
-        )}
-        {activeKey === "verdict" && <VerdictBeat episode={episode} />}
+          <TrustContext
+            entry={trustEntry}
+            bodyText={trustUnit?.text != null ? typedText(trustUnit, elapsed) : undefined}
+            opacity={fadeProgress(trustUnit, elapsed)}
+          />
+        </div>
+
+        <div className="col-span-12 lg:col-span-5 space-y-4">
+          <EvidenceGrid
+            toolOutput={episode.tool_output}
+            predictedClass={episode.predicted_class}
+            opacity={evidenceOpacity}
+            primaryOpacity={fadeProgress(evidencePrimaryUnit, elapsed)}
+            secondaryOpacity={fadeProgress(evidenceSecondaryUnit, elapsed)}
+          />
+
+          <ExecutionPhaseTrack
+            episode={episode}
+            revealCount={actionRevealCount}
+            opacity={fadeProgress(actionStepUnits[0], elapsed)}
+          />
+
+          <GateSubstitution
+            substitution={episode.gate_substitution}
+            reasonText={gateUnit?.text != null ? typedText(gateUnit, elapsed) : undefined}
+            opacity={fadeProgress(gateUnit, elapsed)}
+          />
+
+          <DurabilityVerdict
+            verdict={episode.snapshot_durability_verdict ?? episode.scores_durability_verdict}
+            elapsedS={episode.durability_elapsed_s}
+            opacity={fadeProgress(durabilityUnit, elapsed)}
+          />
+
+          <SecurityCage />
+        </div>
       </div>
     </div>
   );

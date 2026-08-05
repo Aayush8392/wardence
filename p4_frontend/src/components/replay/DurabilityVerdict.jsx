@@ -3,14 +3,15 @@ const VERDICT_STYLE = {
   flapped: { border: "#93000a", color: "text-error", icon: "warning" },
 };
 
-export default function DurabilityVerdict({ verdict, elapsedS }) {
+// opacity optional (default 1, Snapshot's own call site is unaffected).
+export default function DurabilityVerdict({ verdict, elapsedS, opacity = 1 }) {
   if (!verdict) return null;
   const style = VERDICT_STYLE[verdict] ?? { border: "#8b919d", color: "text-on-surface-variant", icon: "help" };
 
   return (
     <div
       className="bg-surface-container-high border-l-4 p-4 flex justify-between items-center"
-      style={{ borderLeftColor: style.border }}
+      style={{ borderLeftColor: style.border, opacity }}
     >
       <div>
         <div className={`font-label-caps text-[10px] font-bold ${style.color}`}>DURABILITY VERDICT</div>
