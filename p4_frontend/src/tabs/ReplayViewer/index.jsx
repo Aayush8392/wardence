@@ -1,78 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
 import { fetchEpisodes } from "../../api/r2";
 import { fetchLiveTrust } from "../../api/operator";
 import { useNavHistory } from "../../context/NavHistoryContext";
 import { useAuth } from "../../context/AuthContext";
 import EpisodeList from "../../components/replay/EpisodeList";
-import ReasoningStream from "../../components/replay/ReasoningStream";
-import ToolOutputSnapshot from "../../components/replay/ToolOutputSnapshot";
-import DurabilityVerdict from "../../components/replay/DurabilityVerdict";
-import SecurityCage from "../../components/shared/SecurityCage";
+import DotSphere from "../../components/replay/DotSphere";
+import CaseFile from "../../components/replay/CaseFile";
 
-function EpisodeDetail({ episode, canPromote, onPromote }) {
-  return (
-    <section className="p-6">
-      <div className="flex justify-between items-end mb-8 border-b border-outline-variant pb-4">
-        <div className="space-y-1">
-          <div className="flex items-center gap-3">
-            <h1 className="font-display-lg text-2xl">{episode.episode_id.slice(0, 8)}</h1>
-            <span
-              className={`px-3 py-1 font-label-caps text-xs font-bold ${
-                episode.correct ? "bg-[#238636] text-white" : "bg-error-container text-white"
-              }`}
-            >
-              {episode.correct ? "CORRECT RESOLUTION" : "INCORRECT DIAGNOSIS"}
-            </span>
-          </div>
-          <div className="flex gap-4 mt-1">
-            <span className="font-data-mono text-xs text-on-surface-variant">
-              TARGET: <span className="text-on-surface">{episode.target}</span>
-            </span>
-            <span className="font-data-mono text-xs text-on-surface-variant">
-              CLASS: <span className="text-on-surface">{episode.fault_class}</span>
-            </span>
-            <span className="font-data-mono text-xs text-on-surface-variant">
-              PREDICTED: <span className="text-on-surface">{episode.predicted_class ?? "n/a"}</span>
-            </span>
-          </div>
-        </div>
-        <div className="flex flex-col items-end">
-          <span className="font-label-caps text-[10px] text-on-surface-variant uppercase">Confidence</span>
-          <span className="font-data-mono text-2xl text-primary font-bold">
-            {episode.score_confidence?.toFixed(2) ?? "n/a"}
-          </span>
-        </div>
-      </div>
-
-      {canPromote && (
-        <div className="bg-primary/10 border border-primary/30 px-4 py-2 mb-6">
-          <p className="text-primary text-sm">
-            Correctly diagnosed while report-only —{" "}
-            <button onClick={onPromote} className="font-label-caps text-xs hover:underline">
-              PROMOTE CLASS →
-            </button>
-          </p>
-        </div>
-      )}
-
-      <div className="grid grid-cols-12 gap-6">
-        <div className="col-span-12 lg:col-span-7">
-          <ReasoningStream episode={episode} />
-        </div>
-
-        <div className="col-span-12 lg:col-span-5 space-y-6">
-          <ToolOutputSnapshot toolOutput={episode.tool_output} />
-          <DurabilityVerdict
-            verdict={episode.snapshot_durability_verdict ?? episode.scores_durability_verdict}
-            elapsedS={episode.durability_elapsed_s}
-          />
-          <SecurityCage />
-        </div>
-      </div>
-    </section>
-  );
-}
+// The sphere (2026-08-07 prototype) is now a PERMANENT fixture, not a
+// variable-height detail panel -- so both side-by-side columns just use
+// this one fixed constant instead of the old ResizeObserver-driven
+// height-sync (removed; there's nothing dynamic left to measure once
+// both sides have a known, fixed height to begin with).
+const SPHERE_HEIGHT = 480;
 
 export default function ReplayViewer() {
   const { episodeId } = useParams();
@@ -84,36 +25,6 @@ export default function ReplayViewer() {
   const [search, setSearch] = useState("");
   const [manualClass, setManualClass] = useState("all");
   const [contextCleared, setContextCleared] = useState(false);
-  const [detailHeight, setDetailHeight] = useState(null);
-  const resizeObserverRef = useRef(null);
-
-  // Measure the detail panel's REAL rendered height and cap the episode
-  // list to it (with internal scroll) -- plain CSS stretch/h-full doesn't
-  // work here since both panels are content-sized (no fixed height
-  // anywhere), so the browser just let both grow to fit their own content
-  // instead of syncing. This keeps the list always matching the detail
-  // panel's actual height, live, as its content changes.
-  //
-  // A callback ref, not useRef+useLayoutEffect([]) -- this component has
-  // early returns for loading/error state ABOVE where this div renders.
-  // On first mount `episodes` is still null, so the div with the ref
-  // doesn't exist yet; a plain effect with empty deps fires once against
-  // that first render, finds nothing to observe, and never runs again
-  // once the real content mounts later. A callback ref instead fires
-  // correctly every time the node actually attaches, whenever that is.
-  const detailCallbackRef = useCallback((node) => {
-    if (resizeObserverRef.current) {
-      resizeObserverRef.current.disconnect();
-      resizeObserverRef.current = null;
-    }
-    if (node) {
-      const observer = new ResizeObserver((entries) => {
-        setDetailHeight(entries[0].contentRect.height);
-      });
-      observer.observe(node);
-      resizeObserverRef.current = observer;
-    }
-  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -211,29 +122,45 @@ export default function ReplayViewer() {
           episodes={visible}
           selectedId={selected?.episode_id}
           onSelect={(id) => navigateTo(`/replay/${id}`, null, "Replay Viewer")}
-          maxHeight={detailHeight}
+          maxHeight={SPHERE_HEIGHT}
         />
 
-        <div ref={detailCallbackRef} className="flex-1">
-          {selected ? (
-            <EpisodeDetail
-              episode={selected}
-              canPromote={
-                role === "admin" &&
-                trustMap[selected.fault_class] === "report_only" &&
-                selected.correct &&
-                !selected.scores_action_taken
-              }
-              onPromote={() =>
-                navigateTo("/operator", { type: "promoteClass", faultClass: selected.fault_class }, "Replay Viewer")
-              }
-            />
-          ) : (
-            <div className="min-h-[420px] flex items-center justify-center text-on-surface-variant text-sm p-6">
-              Select an episode to view its full replay.
-            </div>
-          )}
+        {/* The sphere always plots the FULL episode set (real global topology),
+            never the search-narrowed list -- only the fault-class filter (shared
+            with the dropdown above) dims/pins it, since "search for episode
+            abc123" narrowing the sphere to one dot would defeat its point as
+            an overview. */}
+        <div className="flex-1">
+          <DotSphere
+            episodes={episodes}
+            selectedId={selected?.episode_id}
+            onSelect={(id) => navigateTo(id ? `/replay/${id}` : "/replay", null, "Replay Viewer")}
+            filterClass={filterClass}
+            onFilterClass={(cls) => { setManualClass(cls ?? "all"); setContextCleared(true); }}
+            height={SPHERE_HEIGHT}
+          />
         </div>
+      </div>
+
+      <div className="mt-4">
+        {selected ? (
+          <CaseFile
+            episode={selected}
+            canPromote={
+              role === "admin" &&
+              trustMap[selected.fault_class] === "report_only" &&
+              selected.correct &&
+              !selected.scores_action_taken
+            }
+            onPromote={() =>
+              navigateTo("/operator", { type: "promoteClass", faultClass: selected.fault_class }, "Replay Viewer")
+            }
+          />
+        ) : (
+          <div className="border border-outline-variant bg-surface-container-low flex items-center justify-center text-on-surface-variant text-sm p-10">
+            Select an episode — from the list or the sphere — to view its full replay.
+          </div>
+        )}
       </div>
     </div>
   );
