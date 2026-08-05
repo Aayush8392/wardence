@@ -47,10 +47,14 @@ Usage:
     Then: POST http://localhost:8001/diagnose {"target": "carts", "namespace": "sock-shop"}
 """
 
+import concurrent.futures
 import importlib.util
+import json
+import logging
 import os
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -65,10 +69,209 @@ from llm_trust_state import (  # noqa: E402
     LLM, STUB, LLM_CAN_ACT, ensure_llm_trust_tables, get_action_trust, get_diagnoser_mode,
 )
 from action_proposer import DETERMINISTIC_ACTION_MAP, propose_action  # noqa: E402
-from react_agent import run_react_diagnosis  # noqa: E402
+from react_agent import run_react_diagnosis, FAULT_CLASSES  # noqa: E402
+from model_backend import PROVIDER_CHAIN, call_one, LLMFailure  # noqa: E402
+from llm_replay_test import build_prompt  # noqa: E402
 from misdispatch_guard import ensure_misdispatch_tables, get_safety_hold  # noqa: E402
 import dispatch_gate  # noqa: E402
 from constraint_checks import check_safe  # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# Comparison-sampling addition, 2026-08-05 (design reviewed by Kimi,
+# reviews/24_comparison_sampling_background_dispatch_kimi_review.md --
+# this is Kimi's recommended architecture, not the original callback/
+# Future-based draft that review replaced). Every /diagnose call, in
+# addition to the real primary chain below, ALSO fires these two
+# fallback-tier models purely to log their diagnosis for comparison --
+# never drives production behavior, same "comparison-only" discipline
+# as the existing background LLM call. Filtered from PROVIDER_CHAIN by
+# provider+model, not hardcoded, so this can never silently drift from
+# the real chain's own entries if either ever changes.
+COMPARISON_ENTRIES = [
+    e for e in PROVIDER_CHAIN
+    if (e["provider"], e["model"]) in {
+        ("groq", "openai/gpt-oss-120b"),
+        ("openrouter", "openai/gpt-oss-20b:free"),
+    }
+]
+
+# Bounded and module-level -- never created per-request (Kimi review 24,
+# point 6: unbounded thread growth). Sized for a handful of concurrent
+# episodes' worth of comparison calls, not unlimited. If episodes come
+# in faster than this can drain, newer comparison calls queue behind
+# older ones rather than spawning more threads -- never blocks the real
+# diagnosis either way.
+_comparison_executor = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="comparison"
+)
+
+
+def ensure_comparison_sampling_table(conn: sqlite3.Connection):
+    """
+    Dedicated table for comparison-sampling data (2026-08-05), replacing
+    an earlier draft that tried to reuse llm_diagnosis_log -- that
+    table's actual_class column is NOT NULL, which would have silently
+    failed every single comparison-sampling write (this endpoint never
+    sees ground truth, same discipline as the rest of p3_agent.py; only
+    p3_scorer.py does). Ground truth stays joinable later via episode_id
+    -> episodes.fault_class, same as any other real analysis.
+
+    Single-shot by design, NOT the multi-turn ReAct loop the primary
+    chain uses -- real accuracy testing (2026-08-05, 39 real episodes)
+    found the short single-shot prompt (same shape as
+    llm_replay_test.py's PROMPT_TEMPLATE, fed the SAME tool_output the
+    primary chain already gathered) outperforms the long multi-turn
+    production prompt for both comparison models, and needs no
+    reasoning_effort tuning to do it -- see wardence_context.md's
+    session notes for the full real numbers. Deliberately never reuses
+    or modifies react_agent.py's SYSTEM_TEMPLATE/run_react_diagnosis --
+    the primary/production path is completely untouched by any of this.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS comparison_sampling_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            episode_id TEXT,
+            provider TEXT,
+            model TEXT,
+            diagnosis TEXT,
+            confidence REAL,
+            confidence_source TEXT,
+            reasoning TEXT,
+            response_time_ms REAL,
+            completed_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY (episode_id) REFERENCES episodes(episode_id)
+        )
+        """
+    )
+    conn.commit()
+
+
+def _compare_and_log(entry: dict, tool_output: dict, episode_id: str | None):
+    """
+    Fire-and-forget comparison task -- runs in _comparison_executor,
+    entirely decoupled from the /diagnose request/response cycle that
+    queued it. Single-shot (call_one, not the multi-turn loop): builds
+    the same short prompt llm_replay_test.py uses, fed the SAME
+    tool_output the primary chain already gathered this episode (no
+    redundant real Prometheus query).
+    """
+    prompt = build_prompt(tool_output)
+    t0 = time.perf_counter()
+    # Real retry-on-429, 2026-08-05 -- OpenRouter's free gpt-oss-20b:free
+    # route has a documented, confirmed-live shared-pool rate-limit
+    # flakiness (see reviews/session notes); the accuracy-testing scripts
+    # that proved this route's real 100%-of-successful-calls accuracy
+    # all retried up to 3x on a 429 -- a bare single attempt here was
+    # found live to silently drop data on both real test episodes.
+    result = call_one(entry, prompt, timeout=30, episode_id=episode_id)
+    retries = 0
+    while (
+        isinstance(result, LLMFailure)
+        and result.failure_type == "rate_limited"
+        # Real correction, found live 2026-08-05: a "free-models-per-day"
+        # rejection is a DAILY cap (OpenRouter, 50/day, account-wide) --
+        # retrying within the same day can NEVER succeed until the real
+        # UTC reset, so retrying just burns ~5s/attempt for nothing on
+        # every episode once the daily quota is spent. Only retry a
+        # genuine short-burst rate limit (no daily-cap signature in the
+        # error body), which IS worth a short wait.
+        and "free-models-per-day" not in result.detail
+        and retries < 3
+    ):
+        retries += 1
+        time.sleep(5)
+        result = call_one(entry, prompt, timeout=30, episode_id=episode_id)
+    response_time_ms = (time.perf_counter() - t0) * 1000
+
+    if isinstance(result, LLMFailure):
+        # NOTE: logger.warning(msg, extra={...}) does NOT print those
+        # extra fields under Python's default logging config (a real gap
+        # found live, 2026-08-05 -- the terminal only ever showed the
+        # bare "comparison call failed" string, no detail). Interpolate
+        # directly into the message instead so a real failure is always
+        # visible without needing a DB query to diagnose it.
+        logger.warning(
+            "comparison call failed for %s %s episode=%s (after %d retries): %s",
+            entry["provider"], entry["model"], episode_id, retries, result,
+        )
+        return
+
+    parsed = result.parsed  # call_one() guarantees a valid parsed dict on success, never None here
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        ensure_comparison_sampling_table(conn)
+        conn.execute(
+            """
+            INSERT INTO comparison_sampling_log (
+                episode_id, provider, model, diagnosis, confidence,
+                confidence_source, reasoning, response_time_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                episode_id, result.provider, result.model,
+                parsed.get("diagnosis"), result.confidence, result.confidence_source,
+                parsed.get("reasoning"), response_time_ms,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        logger.exception("comparison DB write failed", extra={"episode_id": episode_id})
+
+
+def _openrouter_should_fire(episode_id: str) -> bool:
+    """
+    Coverage-first gating for OpenRouter's REAL 50 free-model-requests/
+    day cap (found live 2026-08-05 -- 'free-models-per-day', account-
+    wide, not per-model). Groq isn't gated at all -- its real 1,000/day
+    headroom makes this unnecessary there.
+
+    Rule: fire for this episode's real fault class UNLESS (a) that
+    class already has >=1 real OpenRouter comparison row logged TODAY
+    (UTC, matching the real reset boundary) AND (b) at least one other
+    real class still has zero samples today -- i.e. spend the scarce
+    daily budget guaranteeing full-roster coverage first (13 real
+    classes incl. "none"), then stop gating once every class has been
+    sampled at least once, letting the remaining ~37 real slots/day go
+    to whichever episodes come up next.
+
+    Reads episodes.fault_class directly -- a real, deliberate, narrow
+    exception to this endpoint's usual ground-truth blindness. This
+    value is used ONLY to decide whether to fire a comparison-only
+    background call; it is never passed into any prompt or allowed to
+    influence the real diagnosis/dispatch path, same category of use as
+    dispatch_gate.py/misdispatch_guard.py already reading ground truth
+    for backend decisions without it ever reaching the model.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    try:
+        row = conn.execute(
+            "SELECT fault_class FROM episodes WHERE episode_id = ?", (episode_id,)
+        ).fetchone()
+        if row is None:
+            return True  # no ground truth on record yet -- fail open, don't block on a lookup gap
+        actual_class = row[0]
+
+        covered_today = {
+            r[0] for r in conn.execute(
+                """
+                SELECT DISTINCT e.fault_class
+                FROM comparison_sampling_log c
+                JOIN episodes e ON e.episode_id = c.episode_id
+                WHERE c.provider = 'openrouter' AND date(c.completed_at) = date('now')
+                """
+            ).fetchall()
+        }
+    finally:
+        conn.close()
+
+    if len(covered_today) >= len(FAULT_CLASSES):
+        return True  # full roster already covered today -- no more gating, spend freely
+    return actual_class not in covered_today
 
 # Both P2 and P3 have a file named agent.py -- a plain `from agent import
 # ...` here would resolve to THIS file (already partially loaded) instead
@@ -281,7 +484,42 @@ def diagnose(req: HandleRequest):
                        "failed_attempts": [], "detail": "WARDENCE_STUB_ONLY set -- LLM call skipped"}
     else:
         llm_tools = _build_llm_tools(req.target, req.namespace)
+        _t0 = time.perf_counter()
         llm_result = run_react_diagnosis(req.target, req.namespace, llm_tools, episode_id=req.episode_id)
+        # Real wall-clock duration of the primary chain's own call
+        # (2026-08-05, paired with the same field on comparison-sampling
+        # rows below) -- lets all 4 models be compared on speed, not
+        # just accuracy. Covers the full multi-turn loop for whichever
+        # provider actually answered, not a single-turn number.
+        llm_result["response_time_ms"] = (time.perf_counter() - _t0) * 1000
+
+        # Comparison-sampling addition, 2026-08-05 -- fire-and-forget,
+        # queued on the bounded module-level executor and returns
+        # immediately; /diagnose's own response time is unaffected
+        # (Kimi review 24's recommended design, reviews/24_..., mechanism
+        # since simplified from that review's sketch to a single-shot
+        # call reusing tool_output -- see ensure_comparison_sampling_
+        # table's docstring for why). Gated behind the same env-var
+        # pattern as WARDENCE_STUB_ONLY above -- flip off in .env to
+        # fully revert with no code change.
+        if os.environ.get("SAMPLE_COMPARISON_MODELS"):
+            for entry in COMPARISON_ENTRIES:
+                # OpenRouter's real 50/day cap needs coverage-first
+                # gating (see _openrouter_should_fire's docstring); Groq
+                # has ample headroom and is never gated.
+                if entry["provider"] == "openrouter" and not _openrouter_should_fire(req.episode_id):
+                    # NOTE: logger.info() is silently swallowed under
+                    # Python's default logging config (root level
+                    # WARNING) -- same real gap found earlier in this
+                    # file. logger.warning() used here so a skip is
+                    # always visible, not because this is actually a
+                    # warning-severity event.
+                    logger.warning(
+                        "skipping OpenRouter comparison call for episode=%s -- class already covered today",
+                        req.episode_id,
+                    )
+                    continue
+                _comparison_executor.submit(_compare_and_log, entry, tool_output, req.episode_id)
 
     conn = sqlite3.connect(DB_PATH)
     ensure_trust_tables(conn)

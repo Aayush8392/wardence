@@ -171,6 +171,21 @@ def ensure_episode_snapshots_table(conn: sqlite3.Connection):
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(episode_snapshots)")}
     if "gate_substitution" not in existing_cols:
         conn.execute("ALTER TABLE episode_snapshots ADD COLUMN gate_substitution TEXT")
+    # provider/model/tier/transcript/observations/failed_attempts added
+    # 2026-08-05 for the Replay Viewer's real turn-by-turn story -- all
+    # six already computed by run_react_diagnosis() on every episode
+    # (the background LLM comparison runs regardless of diagnoser_mode),
+    # just never persisted before now. Only ever populated going
+    # forward; episodes scored before this column existed keep these
+    # NULL -- the Replay Viewer must treat that as "no enriched trace
+    # available", never backfill or fabricate one.
+    new_cols = {
+        "provider": "TEXT", "model": "TEXT", "tier": "TEXT",
+        "transcript_json": "TEXT", "observations_json": "TEXT", "failed_attempts_json": "TEXT",
+    }
+    for col, col_type in new_cols.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE episode_snapshots ADD COLUMN {col} {col_type}")
     conn.commit()
 
 
@@ -280,8 +295,9 @@ def record_llm_trust(conn: sqlite3.Connection, episode_id: str, actual_class: st
         INSERT INTO llm_diagnosis_log (
             episode_id, actual_class, stub_predicted_class, stub_correct,
             llm_diagnosis, llm_confidence, llm_confidence_source, llm_reasoning,
-            provider, model, tier, matches_ground_truth, matches_stub, failed_attempts_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            provider, model, tier, matches_ground_truth, matches_stub, failed_attempts_json,
+            response_time_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             episode_id, actual_class, stub_predicted,
@@ -292,6 +308,7 @@ def record_llm_trust(conn: sqlite3.Connection, episode_id: str, actual_class: st
             int(llm_diagnosis == actual_class) if llm_diagnosis else None,
             int(_same_diagnosis(llm_diagnosis, stub_predicted)) if llm_diagnosis and stub_predicted else None,
             json.dumps(llm_result.get("failed_attempts", []), default=lambda o: getattr(o, "__dict__", str(o))),
+            llm_result.get("response_time_ms"),
         ),
     )
     conn.commit()
@@ -343,7 +360,14 @@ def main():
     )
     args = parser.parse_args()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    # WAL mode, added 2026-08-05 (Kimi review 24) alongside the new
+    # comparison-sampling background writes in p3_agent.py -- without
+    # it, this connection's writes and the background executor's own
+    # fresh connections can collide ("database is locked") under real
+    # concurrent load. Readers/writers no longer block each other; the
+    # remaining single-writer lock is held for microseconds per INSERT.
+    conn.execute("PRAGMA journal_mode=WAL")
     ensure_scores_table(conn)
     ensure_episode_snapshots_table(conn)
     ensure_trust_tables(conn)
@@ -478,13 +502,21 @@ def main():
             None if trust_correct is None else int(trust_correct),
         ),
     )
+    # Real per-episode LLM trace, same dict record_llm_comparison already
+    # reads from (see above) -- present whenever the background LLM
+    # comparison actually produced a result this episode, None otherwise
+    # (e.g. llm_unavailable). Stored raw here so the Replay Viewer can
+    # show the real turn-by-turn evidence sequence, not just the final
+    # collapsed reasoning sentence.
+    llm_result = result.get("llm_result") or {}
     conn.execute(
         """
         INSERT INTO episode_snapshots
             (episode_id, tool_output, reasoning, confidence,
              action_taken, action_result, durability_verdict, durability_elapsed_s,
-             gate_substitution)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+             gate_substitution, provider, model, tier,
+             transcript_json, observations_json, failed_attempts_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             episode_id,
@@ -496,6 +528,13 @@ def main():
             durability_verdict,
             durability_elapsed_s,
             json.dumps(result.get("gate_substitution")) if result.get("gate_substitution") else None,
+            llm_result.get("provider"),
+            llm_result.get("model"),
+            llm_result.get("tier"),
+            json.dumps(llm_result.get("transcript")) if llm_result.get("transcript") else None,
+            json.dumps(llm_result.get("observations")) if llm_result.get("observations") else None,
+            json.dumps(llm_result.get("failed_attempts"), default=lambda o: getattr(o, "__dict__", str(o)))
+            if llm_result.get("failed_attempts") else None,
         ),
     )
     conn.commit()

@@ -374,7 +374,9 @@ def build_episodes(conn: sqlite3.Connection) -> list[dict]:
             s.trust_correct, s.phase_e_status, s.phase_e_note,
             snap.tool_output, snap.reasoning, snap.confidence AS snapshot_confidence,
             snap.action_result, snap.durability_verdict AS snapshot_durability_verdict,
-            snap.durability_elapsed_s, snap.gate_substitution
+            snap.durability_elapsed_s, snap.gate_substitution,
+            snap.provider, snap.model, snap.tier,
+            snap.transcript_json, snap.observations_json, snap.failed_attempts_json
         FROM episodes e
         JOIN scores s ON e.episode_id = s.episode_id
         LEFT JOIN episode_snapshots snap ON e.episode_id = snap.episode_id
@@ -395,6 +397,26 @@ def build_episodes(conn: sqlite3.Connection) -> list[dict]:
             d["action_result"] = json.loads(d["action_result"])
         if d.get("gate_substitution"):
             d["gate_substitution"] = json.loads(d["gate_substitution"])
+        # Real turn-by-turn trace (2026-08-05 addition) -- None on every
+        # episode scored before this shipped, never backfilled/faked.
+        # The frontend must check for these before rendering the
+        # enriched (multi-turn) Replay Viewer story, falling back to the
+        # lite (flat tool_output + final reasoning) story otherwise.
+        if d.get("transcript_json"):
+            d["transcript"] = json.loads(d.pop("transcript_json"))
+        else:
+            d["transcript"] = None
+            d.pop("transcript_json", None)
+        if d.get("observations_json"):
+            d["observations"] = json.loads(d.pop("observations_json"))
+        else:
+            d["observations"] = None
+            d.pop("observations_json", None)
+        if d.get("failed_attempts_json"):
+            d["failed_attempts"] = json.loads(d.pop("failed_attempts_json"))
+        else:
+            d["failed_attempts"] = None
+            d.pop("failed_attempts_json", None)
         episodes.append(d)
     return episodes
 

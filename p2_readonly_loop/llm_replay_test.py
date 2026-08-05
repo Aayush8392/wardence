@@ -72,7 +72,7 @@ Field meanings, WITH the real thresholds used to interpret each one (a null/fals
 - catalogue_probe_p95_ms (only present when every other check found nothing): >= 200ms -> under-provisioned-replicas.
 - If NONE of the above thresholds are met, diagnosis is "none".
 
-Respond with ONLY a JSON object, no other text: {{"diagnosis": "<one of the classes above>", "confidence": <0-1>, "reasoning": "<one sentence>"}}"""
+Respond with ONLY a JSON object, no other text: {{"diagnosis": "<one of the classes above>", "confidence": <your genuine self-assessed probability that this diagnosis is correct, a real number between 0 and 1 to EXACTLY 4 decimal places, e.g. 0.8734 -- reflect real uncertainty in the digits, do not default to a round or repeated-digit value like 0.9000, 0.9500, or 0.9999>, "reasoning": "<one sentence>"}}"""
 
 
 def build_prompt(tool_output: dict) -> str:
@@ -106,6 +106,14 @@ def ensure_llm_diagnosis_log_table(conn: sqlite3.Connection):
         )
         """
     )
+    # response_time_ms added 2026-08-05 -- real wall-clock duration of
+    # the actual API call (not including any DB/dispatch overhead), so
+    # different providers/models become comparable on speed, not just
+    # accuracy. Nullable/additive -- existing rows keep NULL, never
+    # backfilled.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_diagnosis_log)")}
+    if "response_time_ms" not in existing_cols:
+        conn.execute("ALTER TABLE llm_diagnosis_log ADD COLUMN response_time_ms REAL")
     conn.commit()
 
 
