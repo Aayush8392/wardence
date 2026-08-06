@@ -31,6 +31,20 @@ Produces four objects in the bucket:
   - system_status.json   -- global circuit-breaker state (read-only mirror
                              of circuit_breaker.py's own trip check, for the
                              landing page's "System Guard" indicator).
+  - model_scorecard.json -- per-(provider,model) data for the Calibration/
+                             Model Scorecard redesign (Kimi review 27,
+                             2026-08-1x): confusion matrix, overall
+                             accuracy, per-tier (primary/fallback)
+                             resolution share + accuracy, report-only-class
+                             overreach events, confidence stdev + mean-
+                             deviation calibration error (both split
+                             logprob-vs-self-reported), cross-class
+                             token/Neuron efficiency (with a real zero-
+                             token-entry exclusion fix -- see
+                             build_model_efficiency's docstring), real
+                             cost-per-correct-diagnosis, real avg response
+                             time, and real auto-fix-class action
+                             durability rate.
 
 Rewritten 2026-08-06 for the new Trust Ladder frontend (mission-control
 table, all 3 dimensions, max-streak, provider badge, recent-outcome bit
@@ -311,6 +325,458 @@ def _distance_to_peak(current: "int | None", peak: "int | None") -> "int | None"
     return current - peak
 
 
+def _is_correct(predicted: "str | None", actual: str) -> bool:
+    """Same equivalence rule used everywhere else in this project
+    (calibration_refit.py, diag_4way_provider_accuracy_by_class.py) --
+    "none" (ground truth) and the diagnoser's own "no anomaly detected"
+    string are the same real outcome."""
+    if predicted == actual:
+        return True
+    return predicted in ("none", "no anomaly detected") and actual in ("none", "no anomaly detected")
+
+
+def _model_rows(conn: sqlite3.Connection) -> list[dict]:
+    """Real per-episode (provider, model, actual_class, predicted,
+    confidence, confidence_source, response_time_ms) rows from BOTH real
+    sources, unioned -- same join pattern as
+    diag_4way_provider_accuracy_by_class.py (verified directly against
+    that script before reuse here): llm_diagnosis_log already carries
+    ground truth inline; comparison_sampling_log is deliberately
+    blinded at write time and needs a join to episodes.fault_class for
+    the real answer. response_time_ms confirmed present on both tables
+    (llm_replay_test.py / p3_agent.py, both added 2026-08-05) before
+    being read here."""
+    rows = []
+    for actual, provider, model, predicted, confidence, conf_source, rt_ms in conn.execute(
+        """
+        SELECT actual_class, provider, model, llm_diagnosis, llm_confidence, llm_confidence_source,
+               response_time_ms
+        FROM llm_diagnosis_log
+        WHERE provider IS NOT NULL AND model IS NOT NULL AND llm_diagnosis IS NOT NULL
+        """
+    ).fetchall():
+        rows.append({
+            "actual_class": actual, "provider": provider, "model": model,
+            "predicted": predicted, "confidence": confidence, "confidence_source": conf_source,
+            "response_time_ms": rt_ms,
+        })
+
+    for actual, provider, model, predicted, confidence, conf_source, rt_ms in conn.execute(
+        """
+        SELECT e.fault_class AS actual_class, c.provider, c.model, c.diagnosis,
+               c.confidence, c.confidence_source, c.response_time_ms
+        FROM comparison_sampling_log c
+        JOIN episodes e ON e.episode_id = c.episode_id
+        WHERE c.provider IS NOT NULL AND c.model IS NOT NULL AND c.diagnosis IS NOT NULL
+        """
+    ).fetchall():
+        rows.append({
+            "actual_class": actual, "provider": provider, "model": model,
+            "predicted": predicted, "confidence": confidence, "confidence_source": conf_source,
+            "response_time_ms": rt_ms,
+        })
+
+    return rows
+
+
+def build_confusion_matrix(conn: sqlite3.Connection) -> dict:
+    """Real predicted-vs-actual counts per (provider, model), from
+    diagnosis-only data (no action outcome involved) -- Kimi review 27
+    item A. Source tables/join verified directly against
+    diag_4way_provider_accuracy_by_class.py before building (no source
+    table was pinned in the original review). Keyed by "provider:model"
+    -> {actual_class: {predicted_class: count}}, sparse (only real
+    observed pairs are present, no zero-filled grid) since the frontend
+    already knows the full class roster and can zero-fill for display."""
+    matrix: dict[str, dict[str, dict[str, int]]] = {}
+    for r in _model_rows(conn):
+        key = f"{r['provider']}:{r['model']}"
+        matrix.setdefault(key, {}).setdefault(r["actual_class"], {})
+        row = matrix[key][r["actual_class"]]
+        row[r["predicted"]] = row.get(r["predicted"], 0) + 1
+    return matrix
+
+
+def build_tier_accuracy(conn: sqlite3.Connection) -> dict:
+    """Real % of episodes resolved per tier (primary/fallback) + real
+    accuracy within each tier, from episode_snapshots.tier (shipped
+    2026-08-05) -- Kimi review 27 item D. Only episodes with a real,
+    non-NULL tier are counted (pre-2026-08-05 episodes never got this
+    column populated; NULL is excluded, never treated as a real tier).
+    Also broken down per (tier, provider) since two providers can share
+    a tier (Gemma/Nemotron are both tier=primary)."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT snap.tier, snap.provider, s.predicted_class, s.actual_class
+        FROM episode_snapshots snap
+        JOIN scores s ON s.episode_id = snap.episode_id
+        WHERE snap.tier IS NOT NULL AND snap.provider IS NOT NULL
+        """
+    ).fetchall()
+    conn.row_factory = None
+
+    by_tier: dict[str, dict] = {}
+    by_tier_provider: dict[str, dict] = {}
+    total_resolved = len(rows)
+
+    for row in rows:
+        tier, provider = row["tier"], row["provider"]
+        correct = _is_correct(row["predicted_class"], row["actual_class"])
+
+        t = by_tier.setdefault(tier, {"resolved": 0, "correct": 0})
+        t["resolved"] += 1
+        t["correct"] += 1 if correct else 0
+
+        tp_key = f"{tier}:{provider}"
+        tp = by_tier_provider.setdefault(tp_key, {"tier": tier, "provider": provider, "resolved": 0, "correct": 0})
+        tp["resolved"] += 1
+        tp["correct"] += 1 if correct else 0
+
+    return {
+        "total_resolved_with_tier": total_resolved,
+        "by_tier": {
+            tier: {
+                "resolved": v["resolved"],
+                "pct_of_total": round(100 * v["resolved"] / total_resolved, 1) if total_resolved else None,
+                "accuracy": round(v["correct"] / v["resolved"], 4) if v["resolved"] else None,
+            }
+            for tier, v in by_tier.items()
+        },
+        "by_tier_provider": {
+            k: {
+                "tier": v["tier"], "provider": v["provider"], "resolved": v["resolved"],
+                "pct_of_total": round(100 * v["resolved"] / total_resolved, 1) if total_resolved else None,
+                "accuracy": round(v["correct"] / v["resolved"], 4) if v["resolved"] else None,
+            }
+            for k, v in by_tier_provider.items()
+        },
+    }
+
+
+def build_overreach_flags(conn: sqlite3.Connection, report_only_classes: set) -> dict:
+    """Real overreach events per (provider, model) -- Kimi review 27
+    item F, exact wording "report-only classes where action_result !=
+    'none'". Checked directly against real schema: there is no literal
+    string "none" written anywhere -- a no-action episode has
+    action_result IS NULL (p3_agent.py's response dict default,
+    p3_scorer.py's INSERT). The real, equivalent check is: for a
+    report-only-class episode, action_result IS NOT NULL at all --
+    since eligibility for dispatch (p3_agent.py's
+    eligible_for_action = trust_state=="can_act" and not safety_hold)
+    is gated on Dimension A, and report-only classes never reach
+    can_act, any non-NULL action_result there is a genuine overreach,
+    not a labeling quirk."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT snap.provider, snap.model, e.fault_class, snap.action_result
+        FROM episode_snapshots snap
+        JOIN episodes e ON e.episode_id = snap.episode_id
+        WHERE snap.provider IS NOT NULL AND snap.model IS NOT NULL
+        """
+    ).fetchall()
+    conn.row_factory = None
+
+    tally: dict[str, dict] = {}
+    for row in rows:
+        if row["fault_class"] not in report_only_classes:
+            continue
+        key = f"{row['provider']}:{row['model']}"
+        t = tally.setdefault(key, {"report_only_episodes": 0, "overreach_events": 0})
+        t["report_only_episodes"] += 1
+        if row["action_result"] is not None:
+            t["overreach_events"] += 1
+
+    return {
+        key: {
+            "report_only_episodes": v["report_only_episodes"],
+            "overreach_events": v["overreach_events"],
+            "overreach_rate": round(v["overreach_events"] / v["report_only_episodes"], 4) if v["report_only_episodes"] else None,
+        }
+        for key, v in tally.items()
+    }
+
+
+def build_confidence_variance(conn: sqlite3.Connection) -> dict:
+    """Real stdev(confidence) per (provider, model), split logprob vs.
+    self-reported (never blended -- same rule already locked for
+    ECE/Brier elsewhere in this project) -- Kimi review 27 item H.
+    Population stdev (not sample), consistent with this project not
+    treating these episodes as a sample of a larger unobserved
+    population -- they ARE the full observed set for this cohort so
+    far. None (not 0.0) for a group with <2 real observations, since a
+    variance computed on 0-1 points is not a real signal."""
+    import statistics
+
+    groups: dict[str, dict[str, list[float]]] = {}
+    for r in _model_rows(conn):
+        if r["confidence"] is None or r["confidence_source"] not in ("logprob", "self_reported"):
+            continue
+        key = f"{r['provider']}:{r['model']}"
+        groups.setdefault(key, {"logprob": [], "self_reported": []})
+        groups[key][r["confidence_source"]].append(r["confidence"])
+
+    out = {}
+    for key, by_source in groups.items():
+        out[key] = {}
+        for source, values in by_source.items():
+            out[key][source] = {
+                "n": len(values),
+                "mean": round(statistics.mean(values), 4) if values else None,
+                "stdev": round(statistics.pstdev(values), 4) if len(values) >= 2 else None,
+            }
+    return out
+
+
+def build_model_efficiency(conn: sqlite3.Connection) -> dict:
+    """Real cross-provider token/Neuron efficiency, all classes
+    combined per (provider, model) -- distinct from the existing
+    per-class _efficiency_index (which only ever resolves one class's
+    single primary provider). Reads the same llm_token_usage.json file,
+    but aggregates across every class a (provider, model) appears in.
+
+    Real bug fix (found live, 2026-08-1x session): several
+    provider:model entries in llm_token_usage.json have count > 0 but
+    total_tokens == 0 (confirmed instance: network-partition's
+    groq:openai/gpt-oss-120b, 9 real attempts, all logged tokens=0) --
+    these are calls whose response never carried a usage field (almost
+    always a failed/quota-exhausted call, per quota_tracker.py's
+    record_call docstring), NOT a genuine zero-cost diagnosis. Any such
+    entry is excluded from the average entirely, not counted as free."""
+    token_usage = _load_token_usage()
+
+    totals: dict[str, dict] = {}
+    for fault_class, models in token_usage.items():
+        for key, stats in models.items():
+            count = stats.get("count", 0)
+            total_tokens = stats.get("total_tokens", 0)
+            total_neurons = stats.get("avg_neurons", 0) * count
+            if count <= 0:
+                continue
+            if total_tokens == 0 and total_neurons == 0:
+                # No real cost data for this cohort -- excluded, not zero.
+                continue
+            t = totals.setdefault(key, {"count": 0, "total_tokens": 0, "total_neurons": 0.0})
+            t["count"] += count
+            t["total_tokens"] += total_tokens
+            t["total_neurons"] += total_neurons
+
+    return {
+        key: {
+            "sample_count": v["count"],
+            "avg_tokens": round(v["total_tokens"] / v["count"], 1) if v["total_tokens"] else None,
+            "avg_neurons": round(v["total_neurons"] / v["count"], 2) if v["total_neurons"] else None,
+        }
+        for key, v in totals.items()
+    }
+
+
+def build_overall_accuracy(confusion_matrix: dict) -> dict:
+    """Real accuracy per (provider, model), diagonal-sum over the real
+    confusion matrix already built above (no new query needed -- pure
+    arithmetic over data this file already computed). "Diagonal" here
+    uses the same _is_correct equivalence as everywhere else (a
+    predicted "none"/"no anomaly detected" against an actual "none"
+    counts as correct), not literal predicted==actual string match."""
+    out = {}
+    for key, by_actual in confusion_matrix.items():
+        total = 0
+        correct = 0
+        for actual_class, by_predicted in by_actual.items():
+            for predicted_class, count in by_predicted.items():
+                total += count
+                if _is_correct(predicted_class, actual_class):
+                    correct += count
+        out[key] = {
+            "total_episodes": total,
+            "correct": correct,
+            "accuracy": round(correct / total, 4) if total else None,
+        }
+    return out
+
+
+def build_calibration_error(conn: sqlite3.Connection, overall_accuracy: dict) -> dict:
+    """Real Kimi review 27 item 27's "ranked deviation from zero"
+    metric: |mean(self-reported confidence) - accuracy| per (provider,
+    model), split logprob vs. self-reported (never blended, same rule
+    already used for confidence_variance/ECE elsewhere). accuracy here
+    is the model's OVERALL accuracy (from build_overall_accuracy), not
+    a per-source accuracy -- Kimi's own definition compares confidence
+    against real outcome accuracy, not against a confidence-source
+    subgroup's own accuracy (which would be circular for a
+    single-source model)."""
+    import statistics
+
+    groups: dict[str, dict[str, list[float]]] = {}
+    for r in _model_rows(conn):
+        if r["confidence"] is None or r["confidence_source"] not in ("logprob", "self_reported"):
+            continue
+        key = f"{r['provider']}:{r['model']}"
+        groups.setdefault(key, {"logprob": [], "self_reported": []})
+        groups[key][r["confidence_source"]].append(r["confidence"])
+
+    out = {}
+    for key, by_source in groups.items():
+        acc = overall_accuracy.get(key, {}).get("accuracy")
+        out[key] = {}
+        for source, values in by_source.items():
+            if not values or acc is None:
+                out[key][source] = {"n": len(values), "mean_confidence": None, "deviation": None}
+                continue
+            mean_conf = statistics.mean(values)
+            out[key][source] = {
+                "n": len(values),
+                "mean_confidence": round(mean_conf, 4),
+                "deviation": round(abs(mean_conf - acc), 4),
+            }
+    return out
+
+
+def build_avg_response_time(conn: sqlite3.Connection) -> dict:
+    """Real avg wall-clock response_time_ms per (provider, model),
+    across all classes -- powers a real accuracy-vs-latency efficiency
+    scatter instead of the mockups' fabricated dollar-cost axis."""
+    times: dict[str, list[float]] = {}
+    for r in _model_rows(conn):
+        if r["response_time_ms"] is None:
+            continue
+        key = f"{r['provider']}:{r['model']}"
+        times.setdefault(key, []).append(r["response_time_ms"])
+
+    return {
+        key: {"n": len(values), "avg_response_time_ms": round(sum(values) / len(values), 1)}
+        for key, values in times.items()
+    }
+
+
+def build_avg_response_time_by_class(conn: sqlite3.Connection) -> dict:
+    """Real avg wall-clock response_time_ms per (provider, model, class)
+    -- powers the real 48-cohort (class x model) Efficiency Frontier
+    scatter Kimi review 27 recommended over the thin 4-5-point
+    model-level aggregate (build_avg_response_time above, kept as-is
+    for the model card table's single summary number -- this is an
+    addition, not a replacement). Keyed the same way as
+    confusion_matrix (model -> actual_class -> ...) so the frontend can
+    pair a real per-class accuracy (already derivable from
+    confusion_matrix's own per-row diagonal) with a real per-class
+    latency without a second new field for accuracy."""
+    times: dict[str, dict[str, list[float]]] = {}
+    for r in _model_rows(conn):
+        if r["response_time_ms"] is None:
+            continue
+        key = f"{r['provider']}:{r['model']}"
+        times.setdefault(key, {}).setdefault(r["actual_class"], []).append(r["response_time_ms"])
+
+    return {
+        key: {
+            cls: {"n": len(values), "avg_response_time_ms": round(sum(values) / len(values), 1)}
+            for cls, values in by_class.items()
+        }
+        for key, by_class in times.items()
+    }
+
+
+def build_durability_rate(conn: sqlite3.Connection, auto_fix_classes: set) -> dict:
+    """Real % of dispatched actions that HELD (not flapped/failed) per
+    (provider, model) -- auto-fix classes only, since report-only
+    classes never dispatch a real action to have a durability verdict
+    in the first place. Kimi review 27 item E ("Action durability
+    rate") -- paired with build_overall_accuracy's diagnostic accuracy
+    at render time (two real columns) rather than collapsed into a
+    single fabricated "Action Bias" scalar, per Kimi's own explicit
+    recommendation against building that as one number."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT snap.provider, snap.model, e.fault_class, snap.durability_verdict
+        FROM episode_snapshots snap
+        JOIN episodes e ON e.episode_id = snap.episode_id
+        WHERE snap.provider IS NOT NULL AND snap.model IS NOT NULL
+          AND snap.durability_verdict IS NOT NULL
+        """
+    ).fetchall()
+    conn.row_factory = None
+
+    tally: dict[str, dict] = {}
+    for row in rows:
+        if row["fault_class"] not in auto_fix_classes:
+            continue
+        key = f"{row['provider']}:{row['model']}"
+        t = tally.setdefault(key, {"total": 0, "held": 0})
+        t["total"] += 1
+        if row["durability_verdict"] not in ("flapped",):
+            t["held"] += 1
+
+    return {
+        key: {
+            "total_actions": v["total"],
+            "held": v["held"],
+            "durability_rate": round(v["held"] / v["total"], 4) if v["total"] else None,
+        }
+        for key, v in tally.items()
+    }
+
+
+def build_cost_per_correct(overall_accuracy: dict, efficiency: dict) -> dict:
+    """Real Kimi review 27 item B: cost-per-correct-diagnosis, derived
+    from fields already built above (no new query) -- avg_tokens (or
+    avg_neurons) divided by accuracy, i.e. "how much a real correct
+    diagnosis actually costs once wrong/wasted attempts are accounted
+    for," not just the flat avg-per-call cost efficiency already
+    published. Approximate, not an exact per-episode join (llm_token_
+    usage.json is pre-aggregated per class-provider, not per episode)
+    -- documented as such, not presented as exact."""
+    out = {}
+    for key, acc_entry in overall_accuracy.items():
+        acc = acc_entry.get("accuracy")
+        eff = efficiency.get(key)
+        if acc is None or acc <= 0 or eff is None:
+            out[key] = {"tokens_per_correct": None, "neurons_per_correct": None}
+            continue
+        avg_tokens = eff.get("avg_tokens")
+        avg_neurons = eff.get("avg_neurons")
+        out[key] = {
+            "tokens_per_correct": round(avg_tokens / acc, 1) if avg_tokens else None,
+            "neurons_per_correct": round(avg_neurons / acc, 2) if avg_neurons else None,
+        }
+    return out
+
+
+def build_model_scorecard(conn: sqlite3.Connection) -> dict:
+    """Real Kimi review 27 (Calibration/Model Scorecard redesign) data,
+    published as its own file since it's per-model, not per-class like
+    trust_ladder.json. Nothing here is fabricated to fit a mockup --
+    every field traces to a real table/column, verified before writing.
+    Deliberately NOT built (per Kimi's own explicit advice, see review
+    27): a radar/spider chart (normalization-crime trap across
+    incompatible axes), a single composite "Action Bias" scalar
+    (replaced by the raw diagnostic-accuracy/durability-rate pair), and
+    any live "calibration drift" banner (that thread stays deferred
+    indefinitely per wardence_context.md's temporal-drift section --
+    real reason: calendar span too short to distinguish drift from
+    noise, not a data-availability gap this file can close)."""
+    report_only_classes = set(REAL_FAULT_CLASSES) - AUTO_FIX_CLASSES
+
+    confusion_matrix = build_confusion_matrix(conn)
+    overall_accuracy = build_overall_accuracy(confusion_matrix)
+    efficiency = build_model_efficiency(conn)
+
+    return {
+        "confusion_matrix": confusion_matrix,
+        "overall_accuracy": overall_accuracy,
+        "tier_accuracy": build_tier_accuracy(conn),
+        "overreach": build_overreach_flags(conn, report_only_classes),
+        "confidence_variance": build_confidence_variance(conn),
+        "calibration_error": build_calibration_error(conn, overall_accuracy),
+        "efficiency": efficiency,
+        "avg_response_time": build_avg_response_time(conn),
+        "avg_response_time_by_class": build_avg_response_time_by_class(conn),
+        "durability_rate": build_durability_rate(conn, AUTO_FIX_CLASSES),
+        "cost_per_correct": build_cost_per_correct(overall_accuracy, efficiency),
+    }
+
+
 def build_trust_ladder(conn: sqlite3.Connection) -> list[dict]:
     ladder = []
     token_usage = _load_token_usage()
@@ -520,6 +986,7 @@ def main():
     episodes = build_episodes(conn)
     system_status = build_system_status(conn)
     calibration_curves = _load_calibration_curves()
+    model_scorecard = build_model_scorecard(conn)
 
     conn.close()
 
@@ -527,6 +994,7 @@ def main():
     upload_json(client, bucket, "trust_history.json", trust_history)
     upload_json(client, bucket, "episodes.json", episodes)
     upload_json(client, bucket, "system_status.json", system_status)
+    upload_json(client, bucket, "model_scorecard.json", model_scorecard)
     if calibration_curves:
         upload_json(client, bucket, "calibration_curves.json", calibration_curves)
     else:

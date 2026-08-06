@@ -80,15 +80,15 @@
   },
   "crash-loop": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 37,
-      "total_tokens": 177847,
+      "count": 41,
+      "total_tokens": 199658,
       "min_tokens": 0,
       "max_tokens": 5875,
-      "total_neurons": 2526.172674179077,
+      "total_neurons": 2824.1453971862793,
       "min_neurons": 0.0,
       "max_neurons": 86.42727088928223,
-      "avg_tokens": 4806.675675675676,
-      "avg_neurons": 68.27493713997505
+      "avg_tokens": 4869.707317073171,
+      "avg_neurons": 68.88159505332389
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 73,
@@ -135,14 +135,14 @@
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 43,
-      "total_tokens": 18344,
+      "count": 47,
+      "total_tokens": 20227,
       "min_tokens": 0,
-      "max_tokens": 900,
+      "max_tokens": 991,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 426.6046511627907,
+      "avg_tokens": 430.36170212765956,
       "avg_neurons": 0.0
     },
     "openrouter:openai/gpt-oss-20b:free": {
@@ -238,29 +238,29 @@
   },
   "init-failure": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 69,
+      "count": 70,
       "total_tokens": 189121,
-      "min_tokens": 2168,
+      "min_tokens": 0,
       "max_tokens": 3437,
       "total_neurons": 2661.154517173767,
-      "min_neurons": 27.30908966064453,
+      "min_neurons": 0.0,
       "max_neurons": 51.8272705078125,
-      "avg_tokens": 2740.8840579710145,
-      "avg_neurons": 38.56745677063431
+      "avg_tokens": 2701.7285714285713,
+      "avg_neurons": 38.016493102482386
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
-      "count": 82,
-      "total_tokens": 216357,
+      "count": 83,
+      "total_tokens": 219057,
       "min_tokens": 2073,
       "max_tokens": 3294,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 2638.5,
+      "avg_tokens": 2639.240963855422,
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 9,
+      "count": 10,
       "total_tokens": 0,
       "min_tokens": 0,
       "max_tokens": 0,
@@ -273,15 +273,15 @@
   },
   "under-provisioned-replicas": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 38,
-      "total_tokens": 337835,
+      "count": 43,
+      "total_tokens": 387914,
       "min_tokens": 2951,
       "max_tokens": 11067,
-      "total_neurons": 4866.663588523865,
+      "total_neurons": 5560.509030342102,
       "min_neurons": 38.55454444885254,
       "max_neurons": 167.53636169433594,
-      "avg_tokens": 8890.394736842105,
-      "avg_neurons": 128.07009443483855
+      "avg_tokens": 9021.255813953489,
+      "avg_neurons": 129.31416349632795
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 70,
@@ -306,28 +306,28 @@
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 33,
-      "total_tokens": 30439,
+      "count": 38,
+      "total_tokens": 31627,
       "min_tokens": 0,
-      "max_tokens": 1184,
+      "max_tokens": 1188,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 922.3939393939394,
+      "avg_tokens": 832.2894736842105,
       "avg_neurons": 0.0
     }
   },
   "bad-rollout": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 65,
-      "total_tokens": 242991,
+      "count": 69,
+      "total_tokens": 263385,
       "min_tokens": 0,
       "max_tokens": 5265,
-      "total_neurons": 3409.6090784072876,
+      "total_neurons": 3671.681800842285,
       "min_neurons": 0.0,
       "max_neurons": 105.64545726776123,
-      "avg_tokens": 3738.3230769230768,
-      "avg_neurons": 52.45552428318904
+      "avg_tokens": 3817.1739130434785,
+      "avg_neurons": 53.21277972235196
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 124,
@@ -374,14 +374,14 @@
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 36,
-      "total_tokens": 28029,
+      "count": 40,
+      "total_tokens": 30003,
       "min_tokens": 0,
       "max_tokens": 1460,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 778.5833333333334,
+      "avg_tokens": 750.075,
       "avg_neurons": 0.0
     },
     "openrouter:openai/gpt-oss-20b:free": {
@@ -398,25 +398,25 @@
   },
   "session-cart-failure": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 78,
-      "total_tokens": 215227,
+      "count": 80,
+      "total_tokens": 220360,
       "min_tokens": 0,
       "max_tokens": 3704,
-      "total_neurons": 3138.6090545654297,
+      "total_neurons": 3217.1454162597656,
       "min_neurons": 0.0,
       "max_neurons": 59.0363655090332,
-      "avg_tokens": 2759.3205128205127,
-      "avg_neurons": 40.23857762263371
+      "avg_tokens": 2754.5,
+      "avg_neurons": 40.21431770324707
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
-      "count": 82,
-      "total_tokens": 220932,
+      "count": 83,
+      "total_tokens": 224045,
       "min_tokens": 2373,
       "max_tokens": 3688,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 2694.2926829268295,
+      "avg_tokens": 2699.3373493975905,
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
@@ -433,15 +433,15 @@
   },
   "network-latency": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 29,
-      "total_tokens": 143572,
+      "count": 31,
+      "total_tokens": 154120,
       "min_tokens": 0,
       "max_tokens": 5755,
-      "total_neurons": 2193.799988746643,
+      "total_neurons": 2348.890898704529,
       "min_neurons": 0.0,
       "max_neurons": 102.20909118652344,
-      "avg_tokens": 4950.758620689655,
-      "avg_neurons": 75.64827547402217
+      "avg_tokens": 4971.612903225807,
+      "avg_neurons": 75.770674151759
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 67,
@@ -488,7 +488,7 @@
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 8,
+      "count": 9,
       "total_tokens": 0,
       "min_tokens": 0,
       "max_tokens": 0,
@@ -501,15 +501,15 @@
   },
   "memory-leak": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 66,
-      "total_tokens": 187426,
+      "count": 68,
+      "total_tokens": 193900,
       "min_tokens": 0,
       "max_tokens": 3451,
-      "total_neurons": 2839.654499053955,
+      "total_neurons": 2931.4545001983643,
       "min_neurons": 0.0,
       "max_neurons": 51.77272605895996,
-      "avg_tokens": 2839.787878787879,
-      "avg_neurons": 43.025068167484164
+      "avg_tokens": 2851.470588235294,
+      "avg_neurons": 43.10962500291712
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 89,
@@ -523,7 +523,7 @@
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 4,
+      "count": 5,
       "total_tokens": 0,
       "min_tokens": 0,
       "max_tokens": 0,
@@ -582,15 +582,15 @@
   },
   "cpu-throttling": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 63,
-      "total_tokens": 340240,
+      "count": 66,
+      "total_tokens": 357834,
       "min_tokens": 0,
       "max_tokens": 7443,
-      "total_neurons": 5263.036305427551,
+      "total_neurons": 5518.763575553894,
       "min_neurons": 0.0,
       "max_neurons": 129.73636054992676,
-      "avg_tokens": 5400.6349206349205,
-      "avg_neurons": 83.54025881631034
+      "avg_tokens": 5421.727272727273,
+      "avg_neurons": 83.61762993263476
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 122,
@@ -637,28 +637,28 @@
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 35,
-      "total_tokens": 23105,
+      "count": 38,
+      "total_tokens": 24103,
       "min_tokens": 0,
       "max_tokens": 1037,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 660.1428571428571,
+      "avg_tokens": 634.2894736842105,
       "avg_neurons": 0.0
     }
   },
   "connection-pool-exhaustion": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 76,
-      "total_tokens": 223469,
+      "count": 78,
+      "total_tokens": 230302,
       "min_tokens": 993,
       "max_tokens": 3771,
-      "total_neurons": 3364.1545009613037,
+      "total_neurons": 3465.9272270202637,
       "min_neurons": 11.53636360168457,
       "max_neurons": 60.554542541503906,
-      "avg_tokens": 2940.3815789473683,
-      "avg_neurons": 44.26519080212242
+      "avg_tokens": 2952.5897435897436,
+      "avg_neurons": 44.43496444897774
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 87,

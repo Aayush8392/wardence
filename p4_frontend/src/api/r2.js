@@ -43,3 +43,7 @@ export async function fetchEpisodes() {
 export async function fetchSystemStatus() {
   return fetchJson("system_status.json");
 }
+
+export async function fetchModelScorecard() {
+  return fetchJson("model_scorecard.json");
+}

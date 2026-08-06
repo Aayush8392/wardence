@@ -109,6 +109,7 @@ p3_trust_action/diag_predicts_none_reasoning.py
 p3_trust_action/diag_predicts_none_demotion_check.py
 p3_trust_action/diag_oom_upr_dimc_check.py
 p3_trust_action/diag_disk_full_proposal_failures.py
+p3_trust_action/diag_groq_fallback_episodes.py
 
 # Phase D run output -- regenerated per run, not source
 p2_readonly_loop/phase_d_batch1.json

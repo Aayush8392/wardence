@@ -1,85 +1,77 @@
-import { useEffect, useMemo, useState } from "react";
-import { fetchEpisodes } from "../../api/r2";
-import { useNavHistory } from "../../context/NavHistoryContext";
-import { computeCalibrationStats } from "../../utils/calibration";
-import ScatterPlot from "../../components/calibration/ScatterPlot";
-import EpisodeDetail from "../../components/calibration/EpisodeDetail";
-import CalibrationMetrics from "../../components/calibration/CalibrationMetrics";
+import { useEffect, useState } from "react";
+import { fetchModelScorecard, fetchEpisodes } from "../../api/r2";
+import ModelCardTable from "../../components/scorecard/ModelCardTable";
+import ConfusionMatrixHeatmap from "../../components/scorecard/ConfusionMatrixHeatmap";
+import FallbackFunnel from "../../components/scorecard/FallbackFunnel";
+import ActionDurabilityChart from "../../components/scorecard/ActionDurabilityChart";
+import EfficiencyFrontier from "../../components/scorecard/EfficiencyFrontier";
+import CalibrationSection from "../../components/scorecard/CalibrationSection";
 
+// Real rebuild of the old per-episode-scatter Calibration page into the
+// Model Scorecard (Kimi review 27) -- per-MODEL comparison, not just
+// per-episode confidence. Route/component name kept as "Calibration"
+// (App.jsx's /calibration route, this folder's own name) to avoid an
+// unrelated routing churn -- only the nav label and page content
+// actually changed. Synthesized from 3 real Stitch mockups
+// (stitch_wardence_casefile_incident_detail_5/6/7.zip, all really
+// titled "Model Scorecard" internally) with every fabricated element
+// found during review corrected or dropped before building -- see the
+// session notes for the full list (fake fault-class names, fake dollar
+// costs, a fake live "Calibration Drift Detected" banner, an undefined
+// "Action Bias" scalar, a redundant per-class panel already covered by
+// the confusion matrix). Explicitly NOT built: a radar/spider chart
+// (Kimi review 27 argues against it directly, normalization crimes
+// across incompatible axes).
 export default function Calibration() {
+  const [scorecard, setScorecard] = useState(null);
   const [episodes, setEpisodes] = useState(null);
   const [error, setError] = useState(null);
-  const [filterClass, setFilterClass] = useState("all");
-  const [selected, setSelected] = useState(null);
-  const { navigateTo } = useNavHistory();
 
   useEffect(() => {
     let cancelled = false;
-    fetchEpisodes()
-      .then((data) => { if (!cancelled) setEpisodes(data); })
+    Promise.all([fetchModelScorecard(), fetchEpisodes()])
+      .then(([sc, eps]) => {
+        if (cancelled) return;
+        setScorecard(sc);
+        setEpisodes(eps);
+      })
       .catch((e) => { if (!cancelled) setError(e.message); });
     return () => { cancelled = true; };
   }, []);
 
-  const classes = useMemo(() => {
-    if (!episodes) return [];
-    return [...new Set(episodes.map((e) => e.fault_class))].sort();
-  }, [episodes]);
-
-  const visible = useMemo(() => {
-    if (!episodes) return [];
-    return episodes.filter(
-      (e) => e.score_confidence != null && (filterClass === "all" || e.fault_class === filterClass)
-    );
-  }, [episodes, filterClass]);
-
-  const stats = useMemo(() => computeCalibrationStats(visible), [visible]);
-
-  if (error) return <p className="text-error">Failed to load episodes: {error}</p>;
-  if (!episodes) return <p className="text-on-surface-variant">Loading…</p>;
+  if (error) return <p className="text-error-red">Failed to load model scorecard: {error}</p>;
+  if (!scorecard || !episodes) return <p className="text-on-surface-variant">Loading…</p>;
 
   return (
     <div className="max-w-[1600px] mx-auto">
-      <div className="flex justify-between items-end mb-8 flex-wrap gap-4">
-        <div>
-          <h1 className="font-display-lg text-3xl">Confidence Calibration</h1>
-          <p className="text-on-surface-variant text-sm mt-1 max-w-lg">
-            Self-reported confidence vs. whether the diagnosis was actually correct. Miscalibration — high
-            confidence paired with a wrong answer — is the thing worth catching.
-          </p>
-        </div>
-
-        <div className="flex items-center gap-3">
-          <span className="font-label-caps text-[11px] text-on-surface-variant uppercase">Fault Class Filter:</span>
-          <select
-            value={filterClass}
-            onChange={(e) => { setFilterClass(e.target.value); setSelected(null); }}
-            className="bg-surface-container-low border border-outline-variant px-3 py-2 text-sm font-data-mono"
-          >
-            <option value="all">All Classes</option>
-            {classes.map((c) => (
-              <option key={c} value={c}>{c}</option>
-            ))}
-          </select>
-        </div>
+      <div className="mb-8">
+        <h1 className="font-display-lg text-3xl">Model Scorecard</h1>
+        <p className="text-on-surface-variant text-sm mt-1 max-w-2xl">
+          Real per-model comparison across the full provider fallback chain — accuracy, efficiency, calibration,
+          and action durability. Every number here is measured, not modeled.
+        </p>
       </div>
 
-      {/* items-start, not the grid default of stretch -- otherwise the
-          scatter plot's real height gets squeezed to match the right
-          column's height (short when nothing's selected, tall once a
-          detail panel renders), so the beeswarm layout has less room to
-          spread dots into and more of them visually stack on top of each
-          other. Same bug class as the Replay Viewer height-sync fix. */}
-      <div className="grid grid-cols-12 gap-6 items-start">
-        <ScatterPlot episodes={visible} selectedId={selected?.episode_id} onSelect={setSelected} />
+      <div className="flex flex-col gap-6">
+        <ModelCardTable scorecard={scorecard} />
 
-        <div className="col-span-12 lg:col-span-4 flex flex-col gap-6">
-          <EpisodeDetail
-            episode={selected}
-            onViewReplay={() => selected && navigateTo(`/replay/${selected.episode_id}`, null, "Calibration")}
-          />
-          <CalibrationMetrics stats={stats} />
+        <ConfusionMatrixHeatmap confusionMatrix={scorecard.confusion_matrix} />
+
+        {/* items-stretch (grid default) -- the right column's
+            EfficiencyFrontier fills 100% height via its own h-full, so
+            it naturally matches the left column's real stacked height
+            (Funnel + Action/Durability) without any measurement. */}
+        <div className="grid grid-cols-12 gap-6">
+          <div className="col-span-12 lg:col-span-5 flex flex-col gap-6">
+            <FallbackFunnel tierAccuracy={scorecard.tier_accuracy} />
+            <ActionDurabilityChart scorecard={scorecard} />
+          </div>
+          <div className="col-span-12 lg:col-span-7">
+            <EfficiencyFrontier scorecard={scorecard} />
+          </div>
         </div>
+
+        <CalibrationSection scorecard={scorecard} episodes={episodes} />
       </div>
     </div>
   );

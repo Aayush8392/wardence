@@ -8,7 +8,7 @@ import { NavLink } from "react-router-dom";
 const SCOPE_LINKS = [
   { path: "/", label: "TRUST LADDER", icon: "analytics" },
   { path: "/replay", label: "REPLAY VIEWER", icon: "history" },
-  { path: "/calibration", label: "CALIBRATION", icon: "insights" },
+  { path: "/calibration", label: "MODEL SCORECARD", icon: "insights" },
   { path: "/operator", label: "OPERATOR", icon: "security" },
 ];
 

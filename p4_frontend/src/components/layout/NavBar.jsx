@@ -8,7 +8,7 @@ import LoginModal from "../auth/LoginModal";
 const TABS = [
   { path: "/", label: "TRUST LADDER" },
   { path: "/replay", label: "REPLAY VIEWER" },
-  { path: "/calibration", label: "CALIBRATION" },
+  { path: "/calibration", label: "MODEL SCORECARD" },
   { path: "/operator", label: "OPERATOR" },
 ];
 
