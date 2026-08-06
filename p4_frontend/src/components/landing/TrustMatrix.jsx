@@ -344,7 +344,17 @@ function HeadlineStrip({ row }) {
         <span className="font-label-caps text-[9px] text-on-surface-variant uppercase mb-1">
           Dimension A streak: {row.dimension_a.streak ?? 0}
         </span>
-        <div className="w-64 h-8 bg-surface-container-lowest border border-outline-variant/40 relative">
+        {/* Real fix, found on a fresh full-tab sweep (not the stale
+            2026-07-24 audit list, which never caught this one -- built
+            later): w-64 was a flat 256px regardless of screen size, while
+            its own parent is `flex-1` (real available room that grows on
+            wider screens) -- the sparkline stayed stranded small on large
+            monitors instead of using it. w-full fills the real available
+            width; height stays a small fixed h-8 deliberately (a
+            decorative sparkline strip, not a primary content panel --
+            same class of exception as a line's stroke-width or a font-size
+            token, not the anti-pattern). */}
+        <div className="w-full h-8 bg-surface-container-lowest border border-outline-variant/40 relative">
           <svg className="w-full h-full" preserveAspectRatio="none" viewBox="0 0 100 20">
             <polyline fill="none" points={pts.join(" ")} stroke="var(--color-primary)" strokeWidth="1.5" />
           </svg>

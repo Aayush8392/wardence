@@ -69,7 +69,11 @@ function TrustVector({ rows }) {
 // child rendered outside this component.
 function StatTile({ label, value, format, tone }) {
   return (
-    <div className="flex-1 min-w-[150px] p-4 flex flex-col gap-1">
+    // Real fix (2026-07-24 hardcoded-value audit, parked -- picked back up
+    // here): min-w-[150px] was a flat px floor regardless of screen size --
+    // switched to a real percentage of this 5-tile row instead, so the
+    // wrap threshold scales consistently across different monitor widths.
+    <div className="flex-1 min-w-[18%] p-4 flex flex-col gap-1">
       <span className="font-label-caps text-[10px] text-on-surface-variant">{label}</span>
       <div className={`font-data-mono text-xl ${tone ?? "text-on-surface"}`}>
         {typeof value === "number" ? <AnimatedNumber value={value} format={format} /> : value}
@@ -142,7 +146,11 @@ export default function Hero({ rows, episodes, trustHistory }) {
           format={PERCENT_FORMAT}
           tone="text-primary"
         />
-        <div className="flex-1 min-w-[150px] p-4 flex flex-col gap-1">
+        // Real fix (2026-07-24 hardcoded-value audit, parked -- picked back up
+    // here): min-w-[150px] was a flat px floor regardless of screen size --
+    // switched to a real percentage of this 5-tile row instead, so the
+    // wrap threshold scales consistently across different monitor widths.
+    <div className="flex-1 min-w-[18%] p-4 flex flex-col gap-1">
           <span className="font-label-caps text-[10px] text-on-surface-variant">SECURITY_CAGE</span>
           <div className="flex items-center gap-2 mt-1">
             <span className={`w-2 h-2 ${systemStatus?.tripped ? "bg-red-500" : "bg-primary"}`} />

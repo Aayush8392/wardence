@@ -23,6 +23,15 @@ const FADE_RAMP_S = 0.9; // how long the opacity ramp itself takes (slowed down,
 const GAP_S = 0.7; // real settle/pause AFTER a unit visually finishes, before the next one starts
 const FADE_ONLY_S = FADE_RAMP_S + GAP_S; // plain fade unit: ramp, then hold, then next section begins
 
+// Real pacing fix: the Telemetry Snapshot (evidence-primary/secondary) is
+// a real tile GRID meant to be read, not a single fact -- FADE_ONLY_S
+// (1.6s) was tuned for a quick single-block fade and made it (plus the two
+// instant SEMANTIC_VAL/RBAC_CHECK gates right after it) blow past in a
+// visible "rush" once the slower typewriter-paced reasoning above it
+// finished. Evidence units get their own longer dwell time instead of
+// sharing the generic fade constant.
+const EVIDENCE_FADE_S = FADE_RAMP_S + 2.6;
+
 function typewriterDuration(text) {
   return Math.max(MIN_TYPEWRITER_S, text.length / CHARS_PER_SECOND);
 }
@@ -126,21 +135,26 @@ export function buildReplaySchedule(episode, trustEntry) {
     const presentKeys = Object.keys(toolOutput).filter((k) => toolOutput[k] !== null && toolOutput[k] !== undefined);
     const hasPrimary = presentKeys.some((k) => relevantKeys.has(k));
     const hasSecondary = presentKeys.some((k) => !relevantKeys.has(k));
-    if (hasPrimary) push({ id: "evidence-primary", kind: "fade", duration: FADE_ONLY_S, section: "evidence-primary" });
-    if (hasSecondary) push({ id: "evidence-secondary", kind: "fade", duration: FADE_ONLY_S, section: "evidence-secondary" });
+    if (hasPrimary) push({ id: "evidence-primary", kind: "fade", duration: EVIDENCE_FADE_S, section: "evidence-primary" });
+    if (hasSecondary) push({ id: "evidence-secondary", kind: "fade", duration: EVIDENCE_FADE_S, section: "evidence-secondary" });
   }
 
   // Action Taken -- real progress_log steps if present, one unit each
-  // (mirrors ExecutionPhaseTrack's own existing revealCount granularity),
-  // each step's own real `detail` text (when present) types in beneath it.
-  // Skipped entirely if no action was taken, never shown empty.
+  // (mirrors ExecutionPhaseTrack's own existing revealCount granularity).
+  // Real fix: `text` used to be JUST step.detail, which most status lines
+  // (e.g. "scaling_down: in_progress") don't have -- those lines were only
+  // ever fading in as a whole block, reading as an instant "blink" rather
+  // than a typewriter reveal. `text` is now the FULL real line (step name +
+  // status, plus the real detail in parens when present), so every line
+  // always has something real to type, not just the ones with a detail.
   if (episode.scores_action_taken) {
     const steps = episode.action_result?.progress_log;
     if (steps && steps.length > 0) {
       steps.forEach((step, i) => {
+        const lineText = `${step.step}: ${step.status}` + (step.detail ? ` (${step.detail})` : "");
         push({
-          id: `action-step-${i}`, kind: "fade-typewriter", duration: fadeTypewriterDuration(step.detail),
-          textStart: FADE_RAMP_S, section: "action-step", text: step.detail ?? null,
+          id: `action-step-${i}`, kind: "fade-typewriter", duration: fadeTypewriterDuration(lineText),
+          textStart: FADE_RAMP_S, section: "action-step", text: lineText,
           data: { revealCount: i + 1 },
         });
       });
@@ -158,7 +172,7 @@ export function buildReplaySchedule(episode, trustEntry) {
   }
 
   if (trustEntry) {
-    const computed = computeTrustContext(trustEntry);
+    const computed = computeTrustContext(trustEntry, episode);
     const body = computed?.body ?? "";
     push({
       id: "trust-context", kind: "fade-typewriter", duration: fadeTypewriterDuration(body),

@@ -15,7 +15,19 @@ Produces four objects in the bucket:
                              time (unchanged from before this rewrite).
   - episodes.json        -- full per-episode data (scores + episode_snapshots
                              joined), feeds both the case list and the
-                             Replay Viewer.
+                             Replay Viewer. Also carries each episode's own
+                             real dimension_{a,b,c}_before/after (2026-08-XX
+                             addition) -- the exact trust_history/
+                             diagnoser_mode_history/action_trust_history row
+                             for THIS episode_id (each history table already
+                             records episode_id directly, no timestamp
+                             nearest-match needed), so the Replay Viewer can
+                             show what a dimension's state genuinely was at
+                             the moment this specific episode ran, not just
+                             the class's current live state. NULL on any
+                             dimension that never recorded a row for this
+                             episode (e.g. report-only classes have no
+                             Dimension A/C history at all).
   - system_status.json   -- global circuit-breaker state (read-only mirror
                              of circuit_breaker.py's own trip check, for the
                              landing page's "System Guard" indicator).
@@ -376,7 +388,13 @@ def build_episodes(conn: sqlite3.Connection) -> list[dict]:
             snap.action_result, snap.durability_verdict AS snapshot_durability_verdict,
             snap.durability_elapsed_s, snap.gate_substitution,
             snap.provider, snap.model, snap.tier,
-            snap.transcript_json, snap.observations_json, snap.failed_attempts_json
+            snap.transcript_json, snap.observations_json, snap.failed_attempts_json,
+            (SELECT state_before FROM trust_history WHERE episode_id = e.episode_id ORDER BY id DESC LIMIT 1) AS dimension_a_before,
+            (SELECT state_after  FROM trust_history WHERE episode_id = e.episode_id ORDER BY id DESC LIMIT 1) AS dimension_a_after,
+            (SELECT mode_before FROM diagnoser_mode_history WHERE episode_id = e.episode_id ORDER BY id DESC LIMIT 1) AS dimension_b_before,
+            (SELECT mode_after  FROM diagnoser_mode_history WHERE episode_id = e.episode_id ORDER BY id DESC LIMIT 1) AS dimension_b_after,
+            (SELECT state_before FROM action_trust_history WHERE episode_id = e.episode_id ORDER BY id DESC LIMIT 1) AS dimension_c_before,
+            (SELECT state_after  FROM action_trust_history WHERE episode_id = e.episode_id ORDER BY id DESC LIMIT 1) AS dimension_c_after
         FROM episodes e
         JOIN scores s ON e.episode_id = s.episode_id
         LEFT JOIN episode_snapshots snap ON e.episode_id = snap.episode_id

@@ -296,7 +296,10 @@ function SecondaryStrip({ entries, toolOutput }) {
 // the whole section (and its two tiers separately) can fade in without ever
 // being removed from the DOM -- removing/re-adding is what caused layout
 // shift before; opacity alone on an always-mounted element can't.
-export default function EvidenceGrid({ toolOutput, predictedClass, opacity = 1, primaryOpacity = 1, secondaryOpacity = 1 }) {
+export default function EvidenceGrid({
+  toolOutput, predictedClass, dispatchedField, dispatchedOpacity = 1,
+  opacity = 1, primaryOpacity = 1, secondaryOpacity = 1, active = false,
+}) {
   if (!toolOutput) return null;
 
   const gaugeFields = Object.entries(GAUGE_FIELDS).filter(([k]) => typeof toolOutput[k] === "number");
@@ -336,10 +339,23 @@ export default function EvidenceGrid({ toolOutput, predictedClass, opacity = 1, 
   ];
 
   return (
-    <div className="border border-outline-variant bg-surface-container-low p-4 pt-5 relative" style={{ opacity }}>
+    <div className={`border border-outline-variant bg-surface-container-low p-4 pt-5 relative ${active ? "content-live-glow" : ""}`} style={{ opacity }}>
       <div className="absolute top-0 left-3 -translate-y-1/2 px-2 py-0.5 bg-surface-variant font-label-caps text-[9px] text-on-surface-variant">
         TELEMETRY_SNAPSHOT
       </div>
+
+      {dispatchedField && (
+        <div
+          className="flex items-center gap-2 mb-3 pb-3 border-b border-dashed border-primary/30"
+          style={{ opacity: dispatchedOpacity }}
+        >
+          <span className="material-symbols-outlined text-primary text-base">bolt</span>
+          <span className="font-label-caps text-[9px] text-primary">{dispatchedField.label}</span>
+          <span className="font-data-mono text-lg text-primary ml-auto">
+            {dispatchedField.value}{dispatchedField.unit}
+          </span>
+        </div>
+      )}
 
       {hasPrimary && (
         <div className="grid grid-cols-2 gap-2" style={{ opacity: primaryOpacity }}>

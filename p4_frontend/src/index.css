@@ -220,6 +220,60 @@ body {
   width: 1px; height: 40px;
 }
 
+/* Execution-phase-track milestone tick: pops in once, the moment the green
+   line reaches it (re-keyed on the caller side so it replays on transition,
+   not a looping animation). */
+@keyframes phase-tick-light-up {
+  0% { transform: scale(0.3); opacity: 0; }
+  60% { transform: scale(1.35); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.phase-tick-light-up { animation: phase-tick-light-up 0.45s cubic-bezier(0.34, 1.56, 0.64, 1); }
+
+/* The single node the green line is currently passing through -- a
+   continuous pulse on the tick mark itself, distinct from the one-shot
+   light-up pop above (which fires once per node, this loops while active). */
+@keyframes phase-node-active-pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.18); }
+}
+.phase-node-active .phase-node-icon { animation: phase-node-active-pulse 1.1s ease-in-out infinite; }
+.phase-node-active .phase-node-ring { animation: bit-pip-pulse 1.1s ease-in-out infinite; }
+
+/* Real "sync" (⟳) icons on the active node get the zoom pulse AND a
+   continuous rotation in one combined keyframe -- can't just add a second
+   `animation` rule on the same element (the `transform` property doesn't
+   merge across separate animation rules, the later one simply wins), so
+   scale + a full 0->360 rotation are baked into a single cycle instead.
+   Higher specificity (.phase-node-icon.phase-icon-sync) correctly wins
+   over the scale-only rule above for sync icons specifically. */
+@keyframes phase-icon-active-spin-pulse {
+  0%   { transform: scale(1) rotate(0deg); }
+  50%  { transform: scale(1.18) rotate(180deg); }
+  100% { transform: scale(1) rotate(360deg); }
+}
+.phase-node-active .phase-node-icon.phase-icon-sync { animation: phase-icon-active-spin-pulse 1.4s ease-in-out infinite; }
+
+/* Replay's "currently being built" indicator -- a pulsating blue ring
+   (box-shadow, so it never fights a component's own border color, e.g.
+   GateSubstitution's amber or DurabilityVerdict's dynamic left-border) on
+   whichever real content card is actively fading/typing in right now. */
+@keyframes content-live-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.9), 0 0 16px 2px rgba(88, 166, 255, 0.35); }
+  50% { box-shadow: 0 0 0 2px rgba(88, 166, 255, 0.5), 0 0 8px 1px rgba(88, 166, 255, 0.15); }
+}
+.content-live-glow { animation: content-live-pulse 1.6s ease-in-out infinite; }
+
+/* Episode list row entrance -- staggered via each row's own inline
+   animation-delay (set per visible index, capped), same scale+fade shape
+   as the bit-pip stagger elsewhere in this project. Purely visual, no
+   interaction tied to it. */
+@keyframes episode-row-enter {
+  0% { opacity: 0; transform: scale(0.97) translateY(4px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+.episode-row-enter { animation: episode-row-enter 0.32s ease-out backwards; }
+
 .scatter-grid {
   background-image:
     linear-gradient(to right, #30363D 1px, transparent 1px),

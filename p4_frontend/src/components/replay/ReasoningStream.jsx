@@ -38,13 +38,16 @@ export function HighlightedSentence({ text }) {
 // summary for single-step actions (restart_deployment, patch_memory_limit)
 // or episodes recorded before progress_log existed -- never fabricates
 // intermediate steps that weren't actually recorded.
-// `revealCount`/`activeDetailOverride` are optional -- omitted (Snapshot's
+// `revealCount`/`activeLineOverride` are optional -- omitted (Snapshot's
 // own unchanged call site), every step shows in full immediately. Replay
 // passes a real revealCount (steps beyond it stay reserved-but-invisible,
 // never removed -- no layout shift) and a partially-typed slice of the
-// CURRENTLY revealing step's own real `detail` text, satisfying the
-// "sequence items with their own nested prose typewriter" rule.
-export function ActionProgress({ episode, revealCount, activeDetailOverride }) {
+// CURRENTLY revealing step's own real, FULL line text (step name + status
+// + detail, from replaySchedule.js) -- the whole line types out character
+// by character, not just an optional detail suffix, so a status line with
+// no `detail` field still gets a real typewriter reveal instead of just
+// popping in as a finished block.
+export function ActionProgress({ episode, revealCount, activeLineOverride }) {
   const progressLog = episode.action_result?.progress_log;
 
   if (progressLog && progressLog.length > 0) {
@@ -55,14 +58,12 @@ export function ActionProgress({ episode, revealCount, activeDetailOverride }) {
           const style = STEP_STATUS_ICON[step.status] ?? STEP_STATUS_ICON.done;
           const isRevealed = i < count;
           const isActive = i === count - 1;
-          const detail = isActive && activeDetailOverride !== undefined ? activeDetailOverride : step.detail;
+          const fullLine = `${step.step}: ${step.status}` + (step.detail ? ` (${step.detail})` : "");
+          const line = isActive && activeLineOverride !== undefined ? activeLineOverride : fullLine;
           return (
             <div key={i} className={`flex items-center gap-3 ${isRevealed ? "" : "invisible"}`}>
               <span className={`material-symbols-outlined text-[16px] ${style.color}`}>{style.icon}</span>
-              <span className="font-data-mono text-xs">
-                {step.step}: {step.status}
-                {detail && <span className="text-on-surface-variant"> ({detail})</span>}
-              </span>
+              <span className="font-data-mono text-xs">{line}</span>
               <span className="font-data-mono text-[10px] text-on-surface-variant ml-auto">
                 {formatStepTime(step.at)}
               </span>

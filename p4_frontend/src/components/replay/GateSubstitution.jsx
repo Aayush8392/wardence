@@ -8,13 +8,13 @@
 // (Replay passes a partially-typed slice of it) -- the fixed instructional
 // sentence above it is static UI copy, not per-episode data, so it isn't
 // typewritten, same distinction already used for header/section labels.
-export default function GateSubstitution({ substitution, reasonText, opacity = 1 }) {
+export default function GateSubstitution({ substitution, reasonText, opacity = 1, active = false }) {
   if (!substitution) return null;
 
   const { proposed_tool, proposed_params, substituted_tool, substituted_params, reason } = substitution;
 
   return (
-    <div className="border border-warning-amber/50 bg-warning-amber/5 p-4 relative" style={{ opacity }}>
+    <div className={`border border-warning-amber/50 bg-warning-amber/5 p-4 relative ${active ? "content-live-glow" : ""}`} style={{ opacity }}>
       <div className="absolute top-0 left-3 -translate-y-1/2 px-2 py-0.5 bg-surface-variant font-label-caps text-[9px] text-warning-amber">
         SAFETY OVERRIDE
       </div>

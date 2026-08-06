@@ -27,12 +27,20 @@ export default function ReplayViewer() {
   const [search, setSearch] = useState("");
   const [manualClass, setManualClass] = useState("all");
   const [contextCleared, setContextCleared] = useState(false);
+  const [sortOrder, setSortOrder] = useState("desc"); // "desc" (newest first, real current default) | "asc"
+  const [dateFrom, setDateFrom] = useState(""); // "YYYY-MM-DD", empty = unbounded
+  const [dateTo, setDateTo] = useState("");
 
   // Stable reference -- EpisodeList's rows are memoized (React.memo) so a
   // click only re-renders the 1-2 rows whose selection state actually
   // changed, not all ~2000+ rows; that memoization is defeated if the
   // onSelect callback passed down is a new function every render.
-  const selectEpisode = useCallback((id) => navigate(`/replay/${id}`), [navigate]);
+  // Real deselect support: EpisodeRow now passes `null` when clicking the
+  // already-selected row (same convention DotSphere's own click handler
+  // already uses) -- this stays a stable reference (still only depends on
+  // `navigate`) rather than needing the current selection to decide,
+  // which would defeat EpisodeList's row memoization.
+  const selectEpisode = useCallback((id) => navigate(id ? `/replay/${id}` : "/replay"), [navigate]);
 
   useEffect(() => {
     let cancelled = false;
@@ -78,6 +86,20 @@ export default function ReplayViewer() {
     return [...new Set(episodes.map((e) => e.fault_class))].sort();
   }, [episodes]);
 
+  // Real date bounds for the range filter -- episodes.json is published
+  // `ORDER BY t0 DESC` (build_episodes(), publish_to_r2.py), so episodes[0]
+  // is the real newest and the last entry is the real oldest. Anything
+  // outside this range genuinely has no data, so the date inputs' own
+  // min/max block it at the OS picker level rather than accepting a
+  // selection that could only ever return zero results.
+  const { minDate, maxDate } = useMemo(() => {
+    if (!episodes || episodes.length === 0) return { minDate: undefined, maxDate: undefined };
+    return {
+      minDate: episodes[episodes.length - 1].t0.slice(0, 10),
+      maxDate: episodes[0].t0.slice(0, 10),
+    };
+  }, [episodes]);
+
   const visible = useMemo(() => {
     if (!episodes) return [];
     let list = filterClass ? episodes.filter((e) => e.fault_class === filterClass) : episodes;
@@ -90,8 +112,14 @@ export default function ReplayViewer() {
           e.target.toLowerCase().includes(q)
       );
     }
+    if (dateFrom) list = list.filter((e) => e.t0.slice(0, 10) >= dateFrom);
+    if (dateTo) list = list.filter((e) => e.t0.slice(0, 10) <= dateTo);
+    // Base data already arrives newest-first (real DB order) -- only pay
+    // the cost of a reverse when the user actually asks for ascending,
+    // never re-sort for the default/common case.
+    if (sortOrder === "asc") list = [...list].reverse();
     return list;
-  }, [episodes, filterClass, search]);
+  }, [episodes, filterClass, search, dateFrom, dateTo, sortOrder]);
 
   if (error) return <p className="text-error">Failed to load episodes: {error}</p>;
   if (!episodes) return <p className="text-on-surface-variant">Loading…</p>;
@@ -121,6 +149,53 @@ export default function ReplayViewer() {
             placeholder="FILTER EPISODES…"
             className="bg-surface-container-low border border-outline-variant px-3 py-2 text-sm font-data-mono w-64 focus:outline-none focus:border-primary"
           />
+          {/* Real bounded date-range filter -- min/max are the actual
+              oldest/newest episode dates in the data, so the browser's own
+              date picker blocks any selection that could only ever return
+              zero results. */}
+          <div className="flex items-center gap-1.5">
+            <input
+              type="date"
+              value={dateFrom}
+              min={minDate}
+              max={dateTo || maxDate}
+              onChange={(e) => setDateFrom(e.target.value)}
+              className="bg-surface-container-low border border-outline-variant px-2 py-2 text-sm font-data-mono focus:outline-none focus:border-primary"
+              title="From date"
+            />
+            <span className="text-on-surface-variant text-xs">–</span>
+            <input
+              type="date"
+              value={dateTo}
+              min={dateFrom || minDate}
+              max={maxDate}
+              onChange={(e) => setDateTo(e.target.value)}
+              className="bg-surface-container-low border border-outline-variant px-2 py-2 text-sm font-data-mono focus:outline-none focus:border-primary"
+              title="To date"
+            />
+            {(dateFrom || dateTo) && (
+              <button
+                onClick={() => { setDateFrom(""); setDateTo(""); }}
+                className="text-primary text-xs hover:underline"
+                title="Clear date range"
+              >
+                clear
+              </button>
+            )}
+          </div>
+          {/* Sort order toggle -- base data is real DB order (newest
+              first); flipping to ascending only reverses the already-
+              filtered list, never re-sorts. */}
+          <button
+            onClick={() => setSortOrder((o) => (o === "desc" ? "asc" : "desc"))}
+            className="flex items-center gap-1.5 bg-surface-container-low border border-outline-variant px-3 py-2 text-sm font-data-mono hover:border-primary"
+            title={sortOrder === "desc" ? "Newest first — click for oldest first" : "Oldest first — click for newest first"}
+          >
+            <span className="material-symbols-outlined text-base">
+              {sortOrder === "desc" ? "arrow_downward" : "arrow_upward"}
+            </span>
+            {sortOrder === "desc" ? "NEWEST" : "OLDEST"}
+          </button>
         </div>
       </div>
 
@@ -149,7 +224,15 @@ export default function ReplayViewer() {
             with the dropdown above) dims/pins it, since "search for episode
             abc123" narrowing the sphere to one dot would defeat its point as
             an overview. */}
-        <div className="flex-1">
+        {/* Real fix: min-w-0 -- a flex child defaults to min-width:auto
+            (its content's natural width), so the canvas's own intrinsic
+            size was preventing this column from actually shrinking when
+            EpisodeList's w-1/4 change left it less room on some screens --
+            the row overflowed horizontally instead of the sphere resizing
+            to fit. min-w-0 lets the flex layout actually shrink it, which
+            is what DotSphere's own ResizeObserver then correctly redraws
+            the canvas to match. */}
+        <div className="flex-1 min-w-0">
           <DotSphere
             episodes={episodes}
             selectedId={selected?.episode_id}

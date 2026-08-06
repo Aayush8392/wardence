@@ -37,7 +37,12 @@ function ReasoningStream({ latestEpisode }) {
   const scoredAt = formatTimestamp(latestEpisode?.scored_at);
 
   return (
-    <div className="lg:col-span-8 border border-outline-variant bg-surface-container-lowest p-6 font-data-mono text-xs overflow-hidden h-72 flex flex-col">
+    // Real fix (2026-07-24 hardcoded-value audit, parked -- picked back up
+    // here): h-72 was a flat 288px regardless of screen size -- cramped on
+    // a small laptop, disproportionately small on 4K/ultrawide. `32vh`
+    // keeps this panel a consistent ~third of the actual viewport height
+    // across different real monitor resolutions instead of a fixed number.
+    <div className="lg:col-span-8 border border-outline-variant bg-surface-container-lowest p-6 font-data-mono text-xs overflow-hidden h-[32vh] flex flex-col">
       <div className="flex justify-between mb-4 border-b border-outline-variant pb-3">
         <div className="flex items-center gap-3">
           <span className="text-primary font-label-caps text-[11px] tracking-widest">MOST_RECENT_REASONING_TRACE</span>
