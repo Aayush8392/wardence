@@ -78,6 +78,7 @@ from react_agent import FAULT_CLASSES  # noqa: E402
 DB_PATH = Path.home() / "wardence_p2_data" / "wardence.db"
 ENV_PATH = Path(__file__).parent / ".env"
 TOKEN_USAGE_PATH = Path(__file__).parent.parent / "p2_readonly_loop" / "llm_token_usage.json"
+CALIBRATION_CURVES_PATH = Path(__file__).parent.parent / "p2_readonly_loop" / "calibration_curves.json"
 
 # "none" is a control class (no real fault), filtered out of every
 # other published view (episodes.json, trust_ladder.json) -- same
@@ -210,6 +211,18 @@ def _load_token_usage() -> dict:
     if not TOKEN_USAGE_PATH.exists():
         return {}
     return json.loads(TOKEN_USAGE_PATH.read_text())
+
+
+def _load_calibration_curves() -> dict:
+    """Real empirical calibration curves for self-reported-confidence
+    providers (Groq/OpenRouter), written by a separate offline process
+    (p2_readonly_loop/calibration_refit.py, run manually, not on every
+    publish) -- read-only here, same convention as _load_token_usage.
+    Empty dict (not an error) if the refit script hasn't been run yet on
+    this machine, or hasn't found any real self-reported data."""
+    if not CALIBRATION_CURVES_PATH.exists():
+        return {}
+    return json.loads(CALIBRATION_CURVES_PATH.read_text())
 
 
 def _efficiency_index(token_usage: dict, fault_class: str, primary_provider: "str | None") -> "dict | None":
@@ -506,6 +519,7 @@ def main():
     trust_history = build_trust_history(conn)
     episodes = build_episodes(conn)
     system_status = build_system_status(conn)
+    calibration_curves = _load_calibration_curves()
 
     conn.close()
 
@@ -513,6 +527,11 @@ def main():
     upload_json(client, bucket, "trust_history.json", trust_history)
     upload_json(client, bucket, "episodes.json", episodes)
     upload_json(client, bucket, "system_status.json", system_status)
+    if calibration_curves:
+        upload_json(client, bucket, "calibration_curves.json", calibration_curves)
+    else:
+        print("calibration_curves.json not found locally -- skipping upload "
+              "(run p2_readonly_loop/calibration_refit.py first if this is unexpected).")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,659 @@
+{
+  "groq:openai/gpt-oss-120b": {
+    "total_episodes": 303,
+    "tag": "self_reported_calibrated",
+    "smoothing": [
+      1,
+      2
+    ],
+    "per_model_bins": [
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 303,
+        "correct": 297
+      }
+    ],
+    "per_class_pairs": {
+      "crash-loop": {
+        "total": 22,
+        "correct": 22,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 22,
+            "correct": 22
+          }
+        ]
+      },
+      "oom": {
+        "total": 24,
+        "correct": 24,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 24,
+            "correct": 24
+          }
+        ]
+      },
+      "bad-rollout": {
+        "total": 27,
+        "correct": 25,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 27,
+            "correct": 25
+          }
+        ]
+      },
+      "network-latency": {
+        "total": 24,
+        "correct": 21,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 24,
+            "correct": 21
+          }
+        ]
+      },
+      "network-partition": {
+        "total": 26,
+        "correct": 25,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 26,
+            "correct": 25
+          }
+        ]
+      },
+      "init-failure": {
+        "total": 23,
+        "correct": 23,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 23,
+            "correct": 23
+          }
+        ]
+      },
+      "under-provisioned-replicas": {
+        "total": 27,
+        "correct": 27,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 27,
+            "correct": 27
+          }
+        ]
+      },
+      "session-cart-failure": {
+        "total": 19,
+        "correct": 19,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 19,
+            "correct": 19
+          }
+        ]
+      },
+      "memory-leak": {
+        "total": 32,
+        "correct": 32,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 32,
+            "correct": 32
+          }
+        ]
+      },
+      "connection-pool-exhaustion": {
+        "total": 31,
+        "correct": 31,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 31,
+            "correct": 31
+          }
+        ]
+      },
+      "disk-full": {
+        "total": 25,
+        "correct": 25,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 25,
+            "correct": 25
+          }
+        ]
+      },
+      "cpu-throttling": {
+        "total": 23,
+        "correct": 23,
+        "bins": [
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 0,
+            "correct": 0
+          },
+          {
+            "total": 23,
+            "correct": 23
+          }
+        ]
+      }
+    },
+    "fitted_at": "2026-08-06T16:03:57.512123+00:00"
+  },
+  "openrouter:openai/gpt-oss-20b:free": {
+    "total_episodes": 47,
+    "tag": "self_reported_calibrated",
+    "smoothing": [
+      1,
+      2
+    ],
+    "per_model_bins": [
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 0,
+        "correct": 0
+      },
+      {
+        "total": 47,
+        "correct": 47
+      }
+    ],
+    "per_class_pairs": {},
+    "fitted_at": "2026-08-06T16:03:57.512123+00:00"
+  }
+}

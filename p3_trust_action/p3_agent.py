@@ -51,6 +51,7 @@ import concurrent.futures
 import importlib.util
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
@@ -95,6 +96,11 @@ COMPARISON_ENTRIES = [
         ("openrouter", "openai/gpt-oss-20b:free"),
     }
 ]
+
+# OpenRouter's real, live-confirmed free-model daily cap (2026-08-05,
+# 'free-models-per-day' 429 body, account-wide not per-model). Used by
+# _openrouter_should_fire's reserve-based even-split gate.
+OPENROUTER_DAILY_CAP = 50
 
 # Bounded and module-level -- never created per-request (Kimi review 24,
 # point 6: unbounded thread growth). Sized for a handful of concurrent
@@ -225,19 +231,30 @@ def _compare_and_log(entry: dict, tool_output: dict, episode_id: str | None):
 
 def _openrouter_should_fire(episode_id: str) -> bool:
     """
-    Coverage-first gating for OpenRouter's REAL 50 free-model-requests/
-    day cap (found live 2026-08-05 -- 'free-models-per-day', account-
-    wide, not per-model). Groq isn't gated at all -- its real 1,000/day
-    headroom makes this unnecessary there.
+    Reserve-based even-split gating for OpenRouter's REAL 50
+    free-model-requests/day cap (found live 2026-08-05 --
+    'free-models-per-day', account-wide, not per-model). Groq isn't
+    gated at all -- its real 1,000/day headroom makes this unnecessary
+    there.
 
-    Rule: fire for this episode's real fault class UNLESS (a) that
-    class already has >=1 real OpenRouter comparison row logged TODAY
-    (UTC, matching the real reset boundary) AND (b) at least one other
-    real class still has zero samples today -- i.e. spend the scarce
-    daily budget guaranteeing full-roster coverage first (13 real
-    classes incl. "none"), then stop gating once every class has been
-    sampled at least once, letting the remaining ~37 real slots/day go
-    to whichever episodes come up next.
+    Supersedes the original binary "fire once per class, then fire
+    freely once the whole roster is covered" gate -- real data showed
+    that rule consistently starved every class down to ~1-2 real
+    samples/day site-wide, since full 13-class coverage tends to land
+    late in a shuffled batch, leaving few episodes after it to spend
+    the remaining ~37 slots/day on (confirmed against real
+    comparison_sampling_log data, 2026-08-1x).
+
+    Since episode order is a random shuffle, this can't guarantee a
+    perfectly even split -- there's no lookahead into which classes are
+    still coming today. What it CAN guarantee, as a streaming rationer:
+    (a) every class gets its first shot today no matter when it shows
+    up (the `uncovered` reserve), and (b) no single class can hog the
+    budget past its fair share (`target_per_class`, an even 50-way
+    split) while other classes are still below that share -- so budget
+    spreads across whatever classes actually appear today, capped, not
+    front-loaded onto whichever class happens to be running when
+    coverage completes.
 
     Reads episodes.fault_class directly -- a real, deliberate, narrow
     exception to this endpoint's usual ground-truth blindness. This
@@ -256,22 +273,38 @@ def _openrouter_should_fire(episode_id: str) -> bool:
             return True  # no ground truth on record yet -- fail open, don't block on a lookup gap
         actual_class = row[0]
 
-        covered_today = {
-            r[0] for r in conn.execute(
+        counts_today = dict(
+            conn.execute(
                 """
-                SELECT DISTINCT e.fault_class
+                SELECT e.fault_class, COUNT(*)
                 FROM comparison_sampling_log c
                 JOIN episodes e ON e.episode_id = c.episode_id
                 WHERE c.provider = 'openrouter' AND date(c.completed_at) = date('now')
+                GROUP BY e.fault_class
                 """
             ).fetchall()
-        }
+        )
     finally:
         conn.close()
 
-    if len(covered_today) >= len(FAULT_CLASSES):
-        return True  # full roster already covered today -- no more gating, spend freely
-    return actual_class not in covered_today
+    uncovered = [c for c in FAULT_CLASSES if counts_today.get(c, 0) == 0]
+    used_today = sum(counts_today.values())
+    remaining_budget = OPENROUTER_DAILY_CAP - used_today
+
+    if remaining_budget <= 0:
+        return False
+
+    if actual_class in uncovered:
+        return True  # guaranteed first shot, regardless of remaining budget
+
+    # Already covered at least once today -- only spend extra budget if
+    # doing so can't cost any still-uncovered class its own first shot.
+    reserve_for_others = len(uncovered)
+    if remaining_budget - reserve_for_others <= 0:
+        return False
+
+    target_per_class = math.ceil(OPENROUTER_DAILY_CAP / len(FAULT_CLASSES))
+    return counts_today.get(actual_class, 0) < target_per_class
 
 # Both P2 and P3 have a file named agent.py -- a plain `from agent import
 # ...` here would resolve to THIS file (already partially loaded) instead
