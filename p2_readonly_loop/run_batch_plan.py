@@ -91,6 +91,8 @@ from run_episodes import (  # noqa: E402
     run as run_script,
     wait_for_infra_ready,
 )
+from check_deepinfra_model_version import check_and_log as _check_deepinfra_model_version  # noqa: E402
+from check_cloudflare_model_version import check_and_log as _check_cloudflare_model_version  # noqa: E402
 from injector import (  # noqa: E402 -- real per-class targets, not hardcoded
     FAULT_CONFIG,
     _ensure_cpu_throttle_baseline,
@@ -544,6 +546,17 @@ def main():
     real_stdout = sys.stdout
     sys.stdout = _Tee(real_stdout, log_f)
     print(f"(full log also being written to {log_path})")
+
+    # Real checks wired in 2026-08-1x: neither DeepInfra/Nemotron NOR
+    # Cloudflare/gemma expose a per-call version signal (both confirmed
+    # live -- Nemotron has no system_fingerprint at all, gemma's real
+    # chat response also lacks one despite sharing Groq's OpenAI-
+    # compatible shape). These are the external substitutes, run once
+    # per batch start (new or resumed), landing in this batch's own log
+    # for free. Never blocks the batch -- a real network/API failure is
+    # printed and swallowed, not raised (see check_and_log()'s docstring).
+    _check_deepinfra_model_version()
+    _check_cloudflare_model_version()
 
     new_plan_arg_given = args.plan or args.shuffle or args.pairs_file
     plan_state = _load_plan()

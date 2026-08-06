@@ -374,6 +374,7 @@ def run_react_diagnosis(
                 "llm_confidence_source": result.confidence_source,
                 "llm_reasoning": parsed.get("reasoning"),
                 "provider": result.provider, "model": result.model, "tier": result.tier,
+                "llm_version_fingerprint": result.version_fingerprint,
                 "turns_used": attempt["turns_used"],
                 "transcript": attempt["transcript"],
                 "failed_attempts": failed_attempts,

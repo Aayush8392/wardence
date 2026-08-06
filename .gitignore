@@ -22,6 +22,12 @@ __pycache__/
 # Stale local DB folder from before the DB moved to WSL2's native filesystem
 p2_readonly_loop/output/
 
+# Live local database copies -- binary, constantly changing, never meant
+# to be tracked. Real source of truth is WSL2's native filesystem copy
+# (~/wardence_p2_data/wardence.db), these are stale/incidental local copies.
+wardence.db
+p2_readonly_loop/wardence.db
+
 # One-off diagnostic/probe scripts
 traffic_gen/repro_session_race.py
 p3_trust_action/stitch_data_sample.py
@@ -97,6 +103,7 @@ p5_dl_hardening/diag_target_gating_check.py
 p5_dl_hardening/train_fault_classifier.py
 p2_readonly_loop/diag_batch_cross_analysis.py
 p3_trust_action/diag_provider_accuracy_by_class.py
+p3_trust_action/diag_4way_provider_accuracy_by_class.py
 p3_trust_action/diag_predicts_none_pattern.py
 p3_trust_action/diag_predicts_none_reasoning.py
 p3_trust_action/diag_predicts_none_demotion_check.py
@@ -126,6 +133,9 @@ p2_readonly_loop/check_comparison_sampling_table.py
 p2_readonly_loop/check_provider_limits.py
 p2_readonly_loop/check_groq_openrouter_raw_full.py
 p2_readonly_loop/diag_batch_model_comparison.py
+p2_readonly_loop/diag_provider_version_fields.py
+p2_readonly_loop/deepinfra_model_version_log.jsonl
+p2_readonly_loop/cloudflare_model_version_log.jsonl
 
 # log_sequence_pipeline.py's real, generated state -- watermarks, drain3
 # binary snapshots, and per-service JSONL event streams. Real accumulated

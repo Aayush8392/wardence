@@ -151,6 +151,13 @@ def ensure_comparison_sampling_table(conn: sqlite3.Connection):
         )
         """
     )
+    # version_fingerprint added 2026-08-1x -- same real per-call backend-
+    # version signal as llm_diagnosis_log's llm_version_fingerprint (see
+    # model_backend.py's LLMResult / llm_replay_test.py's migration for
+    # the full reasoning). Nullable/additive, never backfilled.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(comparison_sampling_log)")}
+    if "version_fingerprint" not in existing_cols:
+        conn.execute("ALTER TABLE comparison_sampling_log ADD COLUMN version_fingerprint TEXT")
     conn.commit()
 
 
@@ -214,13 +221,13 @@ def _compare_and_log(entry: dict, tool_output: dict, episode_id: str | None):
             """
             INSERT INTO comparison_sampling_log (
                 episode_id, provider, model, diagnosis, confidence,
-                confidence_source, reasoning, response_time_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                confidence_source, reasoning, response_time_ms, version_fingerprint
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 episode_id, result.provider, result.model,
                 parsed.get("diagnosis"), result.confidence, result.confidence_source,
-                parsed.get("reasoning"), response_time_ms,
+                parsed.get("reasoning"), response_time_ms, result.version_fingerprint,
             ),
         )
         conn.commit()

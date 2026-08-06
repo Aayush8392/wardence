@@ -296,8 +296,8 @@ def record_llm_trust(conn: sqlite3.Connection, episode_id: str, actual_class: st
             episode_id, actual_class, stub_predicted_class, stub_correct,
             llm_diagnosis, llm_confidence, llm_confidence_source, llm_reasoning,
             provider, model, tier, matches_ground_truth, matches_stub, failed_attempts_json,
-            response_time_ms
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            response_time_ms, llm_version_fingerprint
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             episode_id, actual_class, stub_predicted,
@@ -309,6 +309,7 @@ def record_llm_trust(conn: sqlite3.Connection, episode_id: str, actual_class: st
             int(_same_diagnosis(llm_diagnosis, stub_predicted)) if llm_diagnosis and stub_predicted else None,
             json.dumps(llm_result.get("failed_attempts", []), default=lambda o: getattr(o, "__dict__", str(o))),
             llm_result.get("response_time_ms"),
+            llm_result.get("llm_version_fingerprint"),
         ),
     )
     conn.commit()

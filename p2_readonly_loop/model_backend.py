@@ -56,6 +56,16 @@ class LLMResult:
     confidence: Optional[float]
     confidence_source: Optional[str]  # "logprob" | "self_reported"
     raw: dict
+    # Real per-call backend-version signal, added 2026-08-1x after a live
+    # Gemini regression (responseLogprobs unexpectedly started 400ing)
+    # surfaced the need for a future model-version-drift check. NOT a
+    # detector itself -- just capture, for whenever that's built. Gemini:
+    # raw's own `modelVersion` (only informative when calling an alias;
+    # echoes the pinned ID back otherwise). openai_compat providers:
+    # `system_fingerprint` where the provider returns one (confirmed live
+    # for Groq; Cloudflare/OpenRouter unconfirmed, DeepInfra confirmed
+    # absent). None when the provider doesn't expose one.
+    version_fingerprint: Optional[str] = None
 
 
 @dataclass
@@ -112,6 +122,35 @@ def _call_gemini(model: str, prompt: str, timeout: int, system_prompt: str | Non
     except requests.exceptions.RequestException as e:
         return LLMFailure("gemini", model, "bad_response", str(e))
 
+    # Real regression found live 2026-08-1x: gemini-3-flash-preview started
+    # 400ing on responseLogprobs (message: "Logprobs is not enabled for
+    # this model") on the exact call shape that worked in production up to
+    # that point -- confirmed via direct isolation test (same call minus
+    # responseLogprobs -> real 200, model unaffected otherwise; /models
+    # list confirms the model itself still exists, same version string).
+    # Real, permanent server-side capability change on Google's end, not
+    # a transient error -- retrying the SAME request would fail forever.
+    # Graceful degrade: retry once without logprobs, fall back to
+    # self-reported confidence, rather than losing this provider's real
+    # diagnoses entirely every time the chain reaches it.
+    if (
+        resp.status_code == 400
+        and "Logprobs is not enabled" in resp.text
+        and body["generationConfig"].get("responseLogprobs")
+    ):
+        body["generationConfig"].pop("responseLogprobs", None)
+        body["generationConfig"].pop("logprobs", None)
+        try:
+            resp = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}",
+                json=body,
+                timeout=timeout,
+            )
+        except requests.exceptions.Timeout:
+            return LLMFailure("gemini", model, "timeout", f"timed out after {timeout}s (logprobs-fallback retry)")
+        except requests.exceptions.RequestException as e:
+            return LLMFailure("gemini", model, "bad_response", str(e))
+
     if resp.status_code == 429:
         return LLMFailure("gemini", model, "rate_limited", resp.text[:500])
     if resp.status_code >= 500:
@@ -147,6 +186,7 @@ def _call_gemini(model: str, prompt: str, timeout: int, system_prompt: str | Non
     return LLMResult(
         text=text, parsed=parsed, provider="gemini", model=model, tier="primary",
         confidence=confidence, confidence_source=confidence_source, raw=data,
+        version_fingerprint=data.get("modelVersion"),
     )
 
 
@@ -260,6 +300,7 @@ def _call_openai_compat(
     return LLMResult(
         text=text, parsed=parsed, provider=provider, model=model, tier=tier,
         confidence=confidence, confidence_source=confidence_source, raw=data,
+        version_fingerprint=data.get("system_fingerprint"),
     )
 
 
@@ -420,7 +461,7 @@ def call_one(
     dead), and records real usage only for a request that actually got
     sent.
     """
-    from quota_tracker import check_quota, record_call  # local import: avoids a hard dependency for any caller that only wants call_chain's pure LLM logic, e.g. a future unit test with no DB
+    from quota_tracker import check_quota, record_call, clear_exhausted  # local import: avoids a hard dependency for any caller that only wants call_chain's pure LLM logic, e.g. a future unit test with no DB
 
     quota = check_quota(entry["provider"], entry["model"])
     if quota["status"] == "exhausted":
@@ -446,6 +487,13 @@ def call_one(
         entry["provider"], entry["model"], tokens=_extract_total_tokens(result),
         neurons=_extract_neurons(result), episode_id=episode_id,
     )
+    if isinstance(result, LLMResult):
+        # Real self-heal (2026-08-1x fix): a confirmed real success is
+        # strictly stronger evidence than any exhaustion mark's cooldown
+        # timer -- clear it immediately rather than waiting for
+        # is_marked_exhausted()'s next_probe_at to naturally elapse.
+        # No-op if this provider/model was never marked.
+        clear_exhausted(entry["provider"], entry["model"])
     return result
 
 

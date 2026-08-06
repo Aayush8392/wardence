@@ -114,6 +114,17 @@ def ensure_llm_diagnosis_log_table(conn: sqlite3.Connection):
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_diagnosis_log)")}
     if "response_time_ms" not in existing_cols:
         conn.execute("ALTER TABLE llm_diagnosis_log ADD COLUMN response_time_ms REAL")
+    # llm_version_fingerprint added 2026-08-1x -- real per-call backend-
+    # version signal (Gemini's modelVersion / openai_compat's
+    # system_fingerprint, see model_backend.py's LLMResult), captured for
+    # a future model-version-drift check, not consumed by anything yet.
+    # Nullable/additive, same convention as response_time_ms above --
+    # existing rows keep NULL, never backfilled (the real value only
+    # ever existed on the original live API response, not recoverable
+    # after the fact).
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(llm_diagnosis_log)")}
+    if "llm_version_fingerprint" not in existing_cols:
+        conn.execute("ALTER TABLE llm_diagnosis_log ADD COLUMN llm_version_fingerprint TEXT")
     conn.commit()
 
 

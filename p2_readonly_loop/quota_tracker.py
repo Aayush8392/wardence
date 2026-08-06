@@ -67,6 +67,26 @@ CLOUDFLARE_DAILY_NEURON_BUDGET = 10000
 # properly (and potentially made per-class) rather than one flat guess.
 CLOUDFLARE_NEURON_SAFETY_THRESHOLD = 400
 
+# Real bug found and fixed 2026-08-1x: a real Cloudflare 4006 429 was
+# treated as "genuinely exhausted for the rest of the day, no exceptions"
+# -- blocking every subsequent call until UTC midnight. Confirmed live
+# this session that this assumption is WRONG: the Cloudflare dashboard
+# showed 3.26k/10k Neurons used (real budget still available) at the
+# same time a direct, unmarked, hand-run probe call succeeded cleanly
+# (real 200, real answer, 6.34 Neurons charged) -- the account was never
+# actually locked out for the day, only briefly. Real cause not fully
+# root-caused (likely a short-lived rate-limit-shaped 429 sharing the
+# same 4006 code, not a true full-daily-exhaustion event every time) --
+# rather than trying to perfectly distinguish the two error shapes
+# up front, the fix is to verify periodically instead of trusting one
+# 429 for up to 24h. UTC midnight stays as the real hard ceiling (a
+# genuine full-day exhaustion still can't be hammered past that), but
+# every PROBE_COOLDOWN_MINUTES a real attempt is allowed back through to
+# check for itself, and a real success clears the block immediately
+# (see clear_exhausted() below) rather than waiting out the rest of the
+# cooldown window.
+PROBE_COOLDOWN_MINUTES = 15
+
 
 def ensure_quota_table(conn: sqlite3.Connection):
     conn.execute(
@@ -125,6 +145,13 @@ def ensure_exhaustion_table(conn: sqlite3.Connection):
         )
         """
     )
+    # next_probe_at added 2026-08-1x, real fix for the "trusted one 429
+    # for up to 24h" bug -- see PROBE_COOLDOWN_MINUTES's comment above.
+    # Nullable/additive, same migration convention used elsewhere in this
+    # project (llm_replay_test.py's response_time_ms, etc.).
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(provider_exhaustion)")}
+    if "next_probe_at" not in existing_cols:
+        conn.execute("ALTER TABLE provider_exhaustion ADD COLUMN next_probe_at TEXT")
     conn.commit()
 
 
@@ -138,17 +165,49 @@ def _next_utc_midnight() -> str:
 
 def mark_exhausted(provider: str, model: str, reason: str):
     """Called by model_backend.py's 429 handler on a real, confirmed
-    Cloudflare 4006 (or equivalent) response -- never speculatively."""
+    Cloudflare 4006 (or equivalent) response -- never speculatively.
+
+    exhausted_until stays the real hard ceiling (UTC midnight -- a
+    genuine full-day exhaustion still can't be probed past this).
+    next_probe_at is the real fix: a short cooldown after which
+    is_marked_exhausted() lets one real attempt back through to check
+    for itself, rather than blindly trusting this single event for the
+    rest of the day. Capped at exhausted_until so the probe window never
+    extends past the real ceiling."""
+    conn = sqlite3.connect(DB_PATH)
+    ensure_exhaustion_table(conn)
+    exhausted_until = _next_utc_midnight()
+    now = datetime.datetime.now(datetime.timezone.utc)
+    next_probe_at = min(
+        now + datetime.timedelta(minutes=PROBE_COOLDOWN_MINUTES),
+        datetime.datetime.fromisoformat(exhausted_until),
+    ).isoformat()
+    conn.execute(
+        """
+        INSERT INTO provider_exhaustion (provider, model, exhausted_until, reason, next_probe_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(provider, model) DO UPDATE SET
+            exhausted_until = excluded.exhausted_until, reason = excluded.reason,
+            next_probe_at = excluded.next_probe_at
+        """,
+        (provider, model, exhausted_until, reason, next_probe_at),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_exhausted(provider: str, model: str):
+    """Real self-heal: called by model_backend.call_one() the instant a
+    real call to this provider/model succeeds. Deletes any exhaustion
+    mark immediately rather than waiting for the next probe window or
+    UTC midnight to naturally elapse -- a confirmed real success is
+    strictly stronger evidence than any cooldown timer. No-op (harmless)
+    if no row exists."""
     conn = sqlite3.connect(DB_PATH)
     ensure_exhaustion_table(conn)
     conn.execute(
-        """
-        INSERT INTO provider_exhaustion (provider, model, exhausted_until, reason)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(provider, model) DO UPDATE SET
-            exhausted_until = excluded.exhausted_until, reason = excluded.reason
-        """,
-        (provider, model, _next_utc_midnight(), reason),
+        "DELETE FROM provider_exhaustion WHERE provider = ? AND model = ?",
+        (provider, model),
     )
     conn.commit()
     conn.close()
@@ -156,18 +215,28 @@ def mark_exhausted(provider: str, model: str, reason: str):
 
 def is_marked_exhausted(provider: str, model: str) -> "str | None":
     """Returns the real reason string if still within the marked
-    exhaustion window, else None (expired past UTC midnight or never
-    marked)."""
+    exhaustion window, else None -- either genuinely expired past UTC
+    midnight, never marked, OR (the real fix) the short probe cooldown
+    has elapsed and a real attempt should be let through to check for
+    itself. Returning None here does NOT clear the row -- if the
+    resulting real call fails again, mark_exhausted() re-marks it with a
+    fresh cooldown; if it succeeds, clear_exhausted() removes the row
+    for real."""
     conn = sqlite3.connect(DB_PATH)
     ensure_exhaustion_table(conn)
     row = conn.execute(
-        "SELECT exhausted_until, reason FROM provider_exhaustion WHERE provider = ? AND model = ?",
+        "SELECT exhausted_until, reason, next_probe_at FROM provider_exhaustion WHERE provider = ? AND model = ?",
         (provider, model),
     ).fetchone()
     conn.close()
     if row is None:
         return None
-    exhausted_until, reason = row
+    exhausted_until, reason, next_probe_at = row
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if next_probe_at is not None and now_iso >= next_probe_at:
+        # Cooldown elapsed -- let a real attempt back through instead of
+        # continuing to trust the original event for the rest of the day.
+        return None
     if datetime.datetime.now(datetime.timezone.utc).isoformat() < exhausted_until:
         return reason
     return None
