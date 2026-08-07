@@ -1,5 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { TransformWrapper, TransformComponent } from "react-zoom-pan-pinch";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 
 // Same threshold as the rest of the project's confidence-calibration
 // framing -- high confidence AND wrong is the specific thing worth
@@ -13,25 +12,41 @@ const DOT_RADIUS = 8; // px -- matches the ~16px dot diameter used below
 const VIEWPORT_VH = 60;
 
 // Deliberately tiny -- with zoom available, dots no longer need real
-// screen-space separation at 1x (that's what "cluttered by default" means);
-// they only need a GENUINELY DISTINCT coordinate so that zooming in later
-// can turn a small real gap into a large, clickable one. Max zoom (below)
-// is chosen so this minimum gap becomes comfortably clickable once fully
-// zoomed in: DOT_RADIUS*2 (16px, the click target) / MIN_STEP (2px) = 8x
-// to just touch; MAX_ZOOM is set well above that for margin.
+// screen-space separation at 1x; they only need a genuinely distinct
+// coordinate so zooming in can turn a small real gap into a large,
+// clickable one.
 const MIN_STEP = 2;
 const MAX_ZOOM = 24;
 
+// Fixed LOGICAL canvas width, never the live viewport width. The
+// previous version fed the ResizeObserver's viewport width directly
+// into `x = confidence * plotWidth`, so any resize noise (scrollbar
+// showing/hiding, a font/layout settle pass, the panel's own mount
+// animation) silently RESHUFFLED every dot's x position -- confirmed:
+// two screenshots of the same click, seconds apart, showed the exact
+// same cluster shape sitting at a different x. Geometry must be
+// computed once against a stable reference and never move again except
+// via the user's own zoom/pan; only fitScale (how that fixed canvas
+// maps onto whatever the real viewport happens to be) should react to
+// viewport size.
+const CANVAS_LOGICAL_WIDTH = 1000;
+
+// Custom zoom/pan replaced react-zoom-pan-pinch (2026-08-xx) -- the
+// library's wheel step semantics produced a huge jump on a single
+// wheel tick with no usable in-between, and its own pan updates were
+// hard to reason about. This is a small, fully-owned implementation:
+// wheel = exponential zoom centered on the cursor (each notch is a
+// fixed, predictable ~15% scale change, not a fixed absolute step),
+// drag = pan. No animation/easing needed -- multiplicative zoom
+// already feels continuous as the wheel fires repeatedly.
+const WHEEL_SENSITIVITY = 0.0015;
+
 // Beeswarm-style layout: x is the REAL confidence value (never adjusted).
 // Dots sharing (near-)identical confidence are grouped and spread
-// symmetrically around the band's center line, MIN_STEP apart -- a
-// deterministic placement (no collision-detection loop, no attempt cap,
-// no silent clamping/stacking at high density like the previous version
-// had). Every dot in a group of size N gets a genuinely unique y within
-// N * MIN_STEP px, which for realistic episode counts fits comfortably
-// inside a band even at moderate canvas heights -- there is no longer any
-// need for the canvas itself to be physically huge; zoom does the
-// decluttering, not the canvas's raw size.
+// symmetrically around the band's center line. Step is COMPRESSED, never
+// clamped, so an oversized group never collapses two dots onto the same
+// coordinate (that was silently making the top one eat every click for
+// the rest of the stack).
 function computeSwarmPositions(episodes, plotWidth, plotHeight) {
   const positions = {};
   if (!plotWidth || !plotHeight) return positions;
@@ -45,9 +60,6 @@ function computeSwarmPositions(episodes, plotWidth, plotHeight) {
   for (const band of Object.values(bands)) {
     const sorted = [...band.items].sort((a, b) => a.score_confidence - b.score_confidence);
 
-    // Group dots whose x lands within 1px of each other -- those are the
-    // ones that actually need separating; anything further apart in x is
-    // already visually distinct without any y offset.
     const groups = [];
     for (const ep of sorted) {
       const x = ep.score_confidence * plotWidth;
@@ -61,8 +73,10 @@ function computeSwarmPositions(episodes, plotWidth, plotHeight) {
 
     for (const group of groups) {
       const n = group.items.length;
+      const availableSpan = band.bottom - band.top - DOT_RADIUS * 2;
+      const step = n > 1 ? Math.min(MIN_STEP, availableSpan / (n - 1)) : MIN_STEP;
       group.items.forEach((ep, i) => {
-        const offset = (i - (n - 1) / 2) * MIN_STEP;
+        const offset = (i - (n - 1) / 2) * step;
         const y = Math.min(Math.max(band.baseY + offset, band.top + DOT_RADIUS), band.bottom - DOT_RADIUS);
         positions[ep.episode_id] = { x: group.x, y };
       });
@@ -73,8 +87,6 @@ function computeSwarmPositions(episodes, plotWidth, plotHeight) {
 }
 
 export default function ScatterPlot({ episodes, selectedId, onSelect }) {
-  // Measures the fixed VIEWPORT (not the canvas -- the canvas's own size
-  // is data-derived below, independent of anything measured here).
   const viewportRef = useRef(null);
   const [viewportSize, setViewportSize] = useState({ width: 0, height: 0 });
 
@@ -89,44 +101,105 @@ export default function ScatterPlot({ episodes, selectedId, onSelect }) {
     return () => observer.disconnect();
   }, []);
 
-  // Real, data-derived canvas height -- but based on MIN_STEP (2px), not
-  // the old collision-avoidance step (12.8px). At realistic episode counts
-  // this stays close to the viewport's own size (a band with ~150 same-
-  // confidence dots needs only ~150*MIN_STEP+16 =~316px), so fitScale
-  // below stays near 1 instead of collapsing toward ~0.03 like the earlier
-  // (much larger step) version did -- that's what let it crush the width.
-  // Without this, a band with more dots than (bandHeight/MIN_STEP) forces
-  // the excess onto genuinely IDENTICAL coordinates (not just close), which
-  // no zoom level can ever separate -- confirmed as the actual cause of
-  // the solid-blob-at-max-zoom result.
   const maxBandCount = useMemo(() => {
     let correct = 0;
     let incorrect = 0;
     for (const ep of episodes) (ep.correct ? correct++ : incorrect++);
     return Math.max(correct, incorrect, 1);
   }, [episodes]);
-  const canvasWidth = viewportSize.width;
-  const canvasHeight = Math.max(viewportSize.height, maxBandCount * MIN_STEP * 2 + 32);
+  const canvasWidth = CANVAS_LOGICAL_WIDTH;
+  const canvasHeight = maxBandCount * MIN_STEP * 2 + 32;
 
   const positions = useMemo(
     () => computeSwarmPositions(episodes, canvasWidth, canvasHeight),
     [episodes, canvasWidth, canvasHeight]
   );
 
-  // Fit the (now modest) canvas into the viewport by default -- close to
-  // 1x at realistic data volumes, not the near-zero crush from before.
   const fitScale =
-    viewportSize.height > 0 && canvasHeight > 0 ? Math.min(1, viewportSize.height / canvasHeight) : 1;
+    viewportSize.width > 0 && viewportSize.height > 0
+      ? Math.min(1, viewportSize.width / canvasWidth, viewportSize.height / canvasHeight)
+      : 1;
 
-  // Live zoom level, synced from the library's own transform state. A
-  // uniform CSS scale() on the canvas scales a dot's SIZE by the exact
-  // same factor as the GAP between dots -- overlap is a ratio, and uniform
-  // scaling can't change a ratio, so zoom alone can never resolve overlap
-  // (confirmed: dots got MORE overlapped when zoomed in, not less). The
-  // fix is to counter-scale each dot by 1/currentScale so its ON-SCREEN
-  // size stays constant while the real gap between dots keeps growing with
-  // zoom -- only then does zooming in actually separate them.
-  const [currentScale, setCurrentScale] = useState(fitScale);
+  // { scale, x, y } -- x/y are the CSS translate of the content div, in
+  // viewport px, applied BEFORE scale (transform-origin is top-left).
+  const [transform, setTransform] = useState({ scale: 1, x: 0, y: 0 });
+  const dragState = useRef(null);
+
+  // Reset to a centered fit only when the real DATA changes (a new
+  // episode set -- different model/class selected) or canvasHeight
+  // (which is itself purely data-derived, not viewport-derived).
+  // Deliberately NOT keyed on viewportSize -- that was what let resize
+  // noise silently recenter/reshuffle the view out from under the user.
+  const episodeSignature = episodes.map((e) => e.episode_id).join(",");
+
+  useEffect(() => {
+    if (!viewportSize.width || !viewportSize.height) return;
+    const scale = Math.min(1, viewportSize.width / canvasWidth, viewportSize.height / canvasHeight);
+    const x = (viewportSize.width - canvasWidth * scale) / 2;
+    const y = (viewportSize.height - canvasHeight * scale) / 2;
+    setTransform({ scale, x, y });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [episodeSignature, canvasHeight, viewportSize.width > 0 && viewportSize.height > 0]);
+
+  // React attaches wheel listeners as PASSIVE by default (since v17) --
+  // e.preventDefault() inside a React onWheel handler is silently a
+  // no-op, which is exactly why the page itself was scrolling: the
+  // browser's native scroll ran unprevented at the same time our state
+  // update did, and the resulting layout shift under the cursor is what
+  // made panning look uncontrolled and clicks miss their target. Fixed
+  // with a real native, non-passive listener attached directly to the
+  // DOM node.
+  const fitScaleRef = useRef(fitScale);
+  fitScaleRef.current = fitScale;
+
+  useEffect(() => {
+    const el = viewportRef.current;
+    if (!el) return;
+
+    const handleWheel = (e) => {
+      e.preventDefault();
+      const rect = el.getBoundingClientRect();
+      const cursorX = e.clientX - rect.left;
+      const cursorY = e.clientY - rect.top;
+
+      setTransform((prev) => {
+        const factor = Math.exp(-e.deltaY * WHEEL_SENSITIVITY);
+        const newScale = Math.min(Math.max(prev.scale * factor, fitScaleRef.current), MAX_ZOOM);
+        // Keep the point under the cursor fixed on screen.
+        const contentX = (cursorX - prev.x) / prev.scale;
+        const contentY = (cursorY - prev.y) / prev.scale;
+        return {
+          scale: newScale,
+          x: cursorX - contentX * newScale,
+          y: cursorY - contentY * newScale,
+        };
+      });
+    };
+
+    el.addEventListener("wheel", handleWheel, { passive: false });
+    return () => el.removeEventListener("wheel", handleWheel);
+  }, []);
+
+  const onPointerDown = useCallback((e) => {
+    dragState.current = { startX: e.clientX, startY: e.clientY, origX: transform.x, origY: transform.y, moved: false };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }, [transform.x, transform.y]);
+
+  const onPointerMove = useCallback((e) => {
+    const drag = dragState.current;
+    if (!drag) return;
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    if (Math.abs(dx) > 2 || Math.abs(dy) > 2) drag.moved = true;
+    if (drag.moved) {
+      setTransform((prev) => ({ ...prev, x: drag.origX + dx, y: drag.origY + dy }));
+    }
+  }, []);
+
+  const onPointerUp = useCallback((e) => {
+    dragState.current = null;
+    e.currentTarget.releasePointerCapture(e.pointerId);
+  }, []);
 
   return (
     <div className="col-span-12 lg:col-span-8 bg-surface-container-low border border-outline-variant relative flex flex-col p-8 overflow-hidden">
@@ -139,92 +212,80 @@ export default function ScatterPlot({ episodes, selectedId, onSelect }) {
         <span className="font-label-caps text-[11px] text-error-red">INCORRECT</span>
       </div>
 
-      {/* No flex-1 here on purpose -- Tailwind's flex-1 resolves to
-          flex-basis: 0%, which overrides an explicit height in a flex
-          column and lets the item grow to its own content size instead
-          (exactly the "still tall" bug: the fixed vh height was being
-          silently ignored). This div needs a real fixed height, not
-          "fill available space." */}
       <div
         ref={viewportRef}
-        className="shrink-0 border-l border-b border-outline relative scatter-grid mb-10 ml-4 mt-8 overflow-hidden"
-        style={{ height: `${VIEWPORT_VH}vh` }}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        className="shrink-0 border-l border-b border-outline relative scatter-grid mb-10 ml-4 mt-8 overflow-hidden cursor-grab active:cursor-grabbing"
+        style={{ height: `${VIEWPORT_VH}vh`, touchAction: "none" }}
       >
         {canvasWidth > 0 && (
-          // key forces a clean remount (zoom/pan reset to fit) whenever the
-          // real canvas dimensions change -- e.g. switching the fault-class
-          // filter changes the episode count, so an old zoom/pan state
-          // computed against the previous canvas size would be meaningless.
-          <TransformWrapper
-            key={`${canvasWidth}x${canvasHeight}`}
-            initialScale={fitScale}
-            minScale={fitScale}
-            maxScale={MAX_ZOOM}
-            centerOnInit
-            limitToBounds
-            doubleClick={{ disabled: true }}
-            onTransform={(_ref, state) => setCurrentScale(state.scale)}
+          <div
+            style={{
+              position: "absolute",
+              left: 0,
+              top: 0,
+              width: canvasWidth,
+              height: canvasHeight,
+              transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`,
+              transformOrigin: "0 0",
+            }}
           >
-            <TransformComponent
-              wrapperStyle={{ width: "100%", height: "100%" }}
-              contentStyle={{ width: canvasWidth, height: canvasHeight }}
+            {/* Hallucination zone: confidence >= threshold AND the
+                incorrect (bottom) half -- matches the real
+                HALLUCINATION_CONFIDENCE_THRESHOLD, not an arbitrary
+                decorative box. */}
+            <div
+              className="absolute right-0 bottom-0 h-1/2 bg-error-red/5 border-l border-t border-error-red/20 pointer-events-none"
+              style={{ width: `${(1 - HALLUCINATION_CONFIDENCE_THRESHOLD) * 100}%` }}
             >
-              <div style={{ width: canvasWidth, height: canvasHeight, position: "relative" }}>
-                {/* Hallucination zone: confidence >= threshold AND the
-                    incorrect (bottom) half -- matches the real
-                    HALLUCINATION_CONFIDENCE_THRESHOLD, not an arbitrary
-                    decorative box. */}
+              <div className="absolute top-1 right-1 opacity-40">
+                <span className="font-label-caps text-[9px] text-error-red">HALLUCINATION ZONE</span>
+              </div>
+            </div>
+
+            {episodes.map((ep) => {
+              const pos = positions[ep.episode_id];
+              if (!pos) return null;
+              const isHallucination = !ep.correct && ep.score_confidence >= HALLUCINATION_CONFIDENCE_THRESHOLD;
+              const isSelected = ep.episode_id === selectedId;
+
+              return (
                 <div
-                  className="absolute right-0 bottom-0 h-1/2 bg-error-red/5 border-l border-t border-error-red/20 pointer-events-none"
-                  style={{ width: `${(1 - HALLUCINATION_CONFIDENCE_THRESHOLD) * 100}%` }}
+                  key={ep.episode_id}
+                  className="absolute group/point"
+                  style={{ left: pos.x, top: pos.y, transform: "translate(-50%, -50%)" }}
                 >
-                  <div className="absolute top-1 right-1 opacity-40">
-                    <span className="font-label-caps text-[9px] text-error-red">HALLUCINATION ZONE</span>
+                  {/* Counter-scale: cancels the ancestor canvas's zoom
+                      so this dot's rendered size stays constant while
+                      its real (x, y) position still moves with zoom/pan
+                      like everything else -- this is what makes zoom
+                      actually separate dots instead of just enlarging
+                      the same overlap ratio. */}
+                  <div style={{ transform: `scale(${1 / transform.scale})` }}>
+                    <button
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={() => onSelect(ep)}
+                      aria-label={`Episode ${ep.episode_id.slice(0, 8)}`}
+                      className={`rounded-full cursor-pointer hover:scale-125 transition-transform ${
+                        isHallucination
+                          ? "w-4 h-4 bg-error-red ring-2 ring-white/20 border-2 border-error-red point-glow"
+                          : `w-3 h-3 ${ep.correct ? "bg-correct-green" : "bg-error-red"}`
+                      } ${isSelected ? "ring-2 ring-primary" : ""}`}
+                    />
+                    {isHallucination && (
+                      <div className="absolute -top-9 left-1/2 -translate-x-1/2 bg-surface-container-highest px-2 py-1 border border-outline hidden group-hover/point:block whitespace-nowrap z-20">
+                        <span className="font-data-mono text-[10px] text-error-red font-bold">
+                          CRITICAL: HIGH CONFIDENCE ERROR
+                        </span>
+                      </div>
+                    )}
                   </div>
                 </div>
-
-                {episodes.map((ep) => {
-                  const pos = positions[ep.episode_id];
-                  if (!pos) return null;
-                  const isHallucination = !ep.correct && ep.score_confidence >= HALLUCINATION_CONFIDENCE_THRESHOLD;
-                  const isSelected = ep.episode_id === selectedId;
-
-                  return (
-                    <div
-                      key={ep.episode_id}
-                      className="absolute group/point"
-                      style={{ left: pos.x, top: pos.y, transform: "translate(-50%, -50%)" }}
-                    >
-                      {/* Counter-scale: cancels the ancestor canvas's zoom
-                          so this dot's rendered size stays constant while
-                          its real (x, y) position still moves with zoom/pan
-                          like everything else -- this is what makes zoom
-                          actually separate dots instead of just enlarging
-                          the same overlap ratio. */}
-                      <div style={{ transform: `scale(${1 / currentScale})` }}>
-                        <button
-                          onClick={() => onSelect(ep)}
-                          aria-label={`Episode ${ep.episode_id.slice(0, 8)}`}
-                          className={`rounded-full cursor-pointer hover:scale-125 transition-transform ${
-                            isHallucination
-                              ? "w-4 h-4 bg-error-red ring-2 ring-white/20 border-2 border-error-red point-glow"
-                              : `w-3 h-3 ${ep.correct ? "bg-correct-green" : "bg-error-red"}`
-                          } ${isSelected ? "ring-2 ring-primary" : ""}`}
-                        />
-                        {isHallucination && (
-                          <div className="absolute -top-9 left-1/2 -translate-x-1/2 bg-surface-container-highest px-2 py-1 border border-outline hidden group-hover/point:block whitespace-nowrap z-20">
-                            <span className="font-data-mono text-[10px] text-error-red font-bold">
-                              CRITICAL: HIGH CONFIDENCE ERROR
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </TransformComponent>
-          </TransformWrapper>
+              );
+            })}
+          </div>
         )}
       </div>
 
