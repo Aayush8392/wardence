@@ -173,7 +173,20 @@ def main():
 
     with open(archive_path) as f:
         plan = json.load(f)
-    plan_classes = Counter(item["class"] for item in plan["plan"])
+    # REAL BUG FIXED (2026-08-1x, network-partition false MISMATCH on the
+    # T065344Z batch): this used to be Counter(item["class"] for item in
+    # plan["plan"]), which counts PLAN CHUNKS, not real episodes. A
+    # class's chunk count and its real episode total only diverge when
+    # _build_shuffled_plan()'s tail-drain block fires (the last class
+    # standing gets ONE chunk with target=remaining>1, not fragmented
+    # into single-episode chunks) -- confirmed exactly this on that
+    # batch's network-partition: 14 chunks of target=1 + 1 chunk of
+    # target=2 = 16 real episodes, correctly matching every other class,
+    # but only 15 chunk entries, which falsely flagged as a MISMATCH.
+    # Summing each chunk's own "target" field is the real per-class total.
+    plan_classes = Counter()
+    for item in plan["plan"]:
+        plan_classes[item["class"]] += item["target"]
 
     m = TS_RE.search(archive_path.name)
     if not m:

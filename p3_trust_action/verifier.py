@@ -449,17 +449,29 @@ def _make_bad_rollout_check():
     _front_end_image_pull_failing_live's docstring for the full story of
     why this needed a second round of fixing), since the ongoing poll
     could still read a stale Prometheus scrape even after the live
-    cluster state was already clean."""
+    cluster state was already clean.
+
+    REAL BUG FIXED (2026-08-1x, episode e6a03a82, bad-rollout's first-ever
+    flap after a 77-episode can_act streak): a pre-wait timeout used to
+    return a check_fn that ALWAYS reported "still faulty" for the rest of
+    the durability window, guaranteeing a flapped verdict even if the
+    rollback reconciled moments later -- confirmed via the real DB
+    (durability_elapsed_s=15, action_result showed a genuinely successful
+    applied=True/error=None rollback) that this specific flap was a
+    60s-pre-wait-timeout artifact, not a real regression. Fixed by
+    falling through to the SAME live check used on the success path
+    instead of hardcoding True -- a slow-to-reconcile rollback now gets
+    the full real durability window (up to DURABILITY_WINDOWS["bad-rollout"],
+    polled every POLL_INTERVAL_S) to genuinely clear, instead of being
+    condemned the instant the pre-wait's own 60s cap is hit."""
     reconciled = _wait_for_no_image_pull_failure("sock-shop", timeout_s=60)
     if not reconciled:
-        # Rollback never genuinely completed within a real margin -- this
-        # IS a real fix failure, not a premature check. Return a check
-        # function that always reports "still faulty" so verify_durability
-        # correctly reports flapped, honestly, for this real reason.
-        def check(target: str, namespace: str) -> bool:
-            return True
-
-        return check
+        print(
+            "WARNING: bad-rollout's pre-wait did not see a clean cluster "
+            "within 60s -- falling through to the real durability poll "
+            "loop instead of assuming failure; a genuinely slow-to-"
+            "reconcile rollback still gets the rest of the window."
+        )
 
     def check(target: str, namespace: str) -> bool:
         return _front_end_image_pull_failing_live(namespace)
