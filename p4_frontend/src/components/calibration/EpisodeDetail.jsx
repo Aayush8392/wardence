@@ -59,11 +59,21 @@ export default function EpisodeDetail({ episode, onViewReplay }) {
         </div>
       )}
 
+      {episode.isComparisonOnly && (
+        <div className="mt-4 p-3 bg-warning-amber/5 border-l-2 border-warning-amber">
+          <p className="text-[11px] text-on-surface-variant leading-relaxed">
+            This model never dispatches — it only ran a comparison-only diagnosis against this episode's real
+            evidence, never acted on the cluster. The linked replay below shows the primary chain's real dispatch
+            outcome for this episode (a different model), not this diagnosis.
+          </p>
+        </div>
+      )}
+
       <button
         onClick={onViewReplay}
         className="w-full mt-6 py-3 border border-primary text-primary font-label-caps text-[11px] hover:bg-primary hover:text-on-primary transition-all"
       >
-        VIEW FULL REPLAY →
+        {episode.isComparisonOnly ? "VIEW REAL DISPATCH REPLAY →" : "VIEW FULL REPLAY →"}
       </button>
     </div>
   );

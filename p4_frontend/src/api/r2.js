@@ -47,3 +47,13 @@ export async function fetchSystemStatus() {
 export async function fetchModelScorecard() {
   return fetchJson("model_scorecard.json");
 }
+
+// Comparison-only models (Groq/OpenRouter) never actually dispatch, so
+// they have no rows in episodes.json -- this is the real per-sample
+// data the Calibration drill-down needs to render a scatter for them
+// instead of an empty graph (see publish_to_r2.py's
+// build_comparison_episodes for the full reasoning).
+export async function fetchComparisonEpisodes() {
+  const rows = await fetchJson("comparison_episodes.json");
+  return rows.filter((r) => !INTERNAL_ONLY_CLASSES.has(r.fault_class));
+}

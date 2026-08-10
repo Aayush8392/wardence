@@ -743,6 +743,48 @@ def build_cost_per_correct(overall_accuracy: dict, efficiency: dict) -> dict:
     return out
 
 
+def build_comparison_episodes(conn: sqlite3.Connection) -> list[dict]:
+    """Real per-sample data for comparison-only models (Groq/OpenRouter --
+    never actually dispatched, see episode_snapshots/llm_diagnosis_log,
+    but real diagnoses via the always-on background comparison system,
+    comparison_sampling_log). Published separately from episodes.json
+    (real dispatched episodes only) rather than merged into it -- a
+    comparison sample has no action_taken/action_result/tool_output/
+    durability_verdict at all (it never acted), and episodes.json's
+    other real consumers (Replay Viewer's dot-sphere/CaseFile) assume
+    every entry IS a real dispatch outcome. Mixing the two shapes into
+    one file would silently misrepresent comparison-only samples there.
+
+    Real gap this closes: CalibrationSection.jsx's per-model deviation
+    bars already include Groq/OpenRouter (sourced from the wider
+    _model_rows() union), but clicking to expand into the scatter
+    drill-down found zero matches in episodes.json for those two
+    providers -- an empty graph, since they have no episode_snapshots
+    rows. This publishes the real comparison-sample data the drill-down
+    needs to actually render something for them."""
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT
+            c.episode_id, c.provider, c.model, c.diagnosis AS predicted_class,
+            c.confidence AS score_confidence, c.confidence_source, c.reasoning,
+            c.response_time_ms, c.completed_at,
+            e.fault_class, e.target, e.t0
+        FROM comparison_sampling_log c
+        JOIN episodes e ON e.episode_id = c.episode_id
+        WHERE c.diagnosis IS NOT NULL
+        """
+    ).fetchall()
+    conn.row_factory = None
+
+    out = []
+    for row in rows:
+        d = dict(row)
+        d["correct"] = _is_correct(d["predicted_class"], d["fault_class"])
+        out.append(d)
+    return out
+
+
 def build_model_scorecard(conn: sqlite3.Connection) -> dict:
     """Real Kimi review 27 (Calibration/Model Scorecard redesign) data,
     published as its own file since it's per-model, not per-class like
@@ -987,6 +1029,7 @@ def main():
     system_status = build_system_status(conn)
     calibration_curves = _load_calibration_curves()
     model_scorecard = build_model_scorecard(conn)
+    comparison_episodes = build_comparison_episodes(conn)
 
     conn.close()
 
@@ -995,6 +1038,7 @@ def main():
     upload_json(client, bucket, "episodes.json", episodes)
     upload_json(client, bucket, "system_status.json", system_status)
     upload_json(client, bucket, "model_scorecard.json", model_scorecard)
+    upload_json(client, bucket, "comparison_episodes.json", comparison_episodes)
     if calibration_curves:
         upload_json(client, bucket, "calibration_curves.json", calibration_curves)
     else:

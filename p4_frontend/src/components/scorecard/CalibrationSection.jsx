@@ -17,7 +17,7 @@ import {
 // instruction. Also implements the confidence-clustering guardrail
 // (item 2, 3rd bullet): a model whose σ(confidence) < 0.05 gets a ⚠️
 // badge here regardless of how small its deviation looks.
-export default function CalibrationSection({ scorecard, episodes }) {
+export default function CalibrationSection({ scorecard, episodes, comparisonEpisodes }) {
   const [expandedModel, setExpandedModel] = useState(null);
   const [selected, setSelected] = useState(null);
   const { navigateTo } = useNavHistory();
@@ -38,12 +38,42 @@ export default function CalibrationSection({ scorecard, episodes }) {
 
   const maxDeviation = Math.max(...rows.map((r) => r.calib.deviation ?? 0), 0.001);
 
+  // Real set of provider:model keys with at least one real DISPATCHED
+  // episode (episodes.json, from episode_snapshots) -- a model absent
+  // from this set never actually acts, it only ran comparison-only
+  // samples (comparison_sampling_log). Computed here, not assumed by
+  // provider name, so this stays correct if a currently-dispatching
+  // model (e.g. Gemini, thin as its real quota is) ever drops to zero,
+  // or a currently-comparison-only one is ever promoted into the real
+  // chain.
+  const dispatchedKeys = useMemo(() => {
+    const set = new Set();
+    for (const e of episodes || []) {
+      if (e.provider && e.model) set.add(`${e.provider}:${e.model}`);
+    }
+    return set;
+  }, [episodes]);
+
+  // Real dispatched episodes (episodes.json, from episode_snapshots) unioned
+  // with comparison-only samples (comparison_episodes.json, from
+  // comparison_sampling_log) for the same model. Groq/OpenRouter never
+  // dispatch -- see p3_trust_action/publish_to_r2.py's build_comparison_
+  // episodes -- so the real-dispatch filter alone always came back empty
+  // for them, and the drill-down rendered an empty graph even though those
+  // rows are visible (and real) in the deviation-bar list above. Comparison
+  // rows are tagged isComparisonOnly so ScatterPlot/EpisodeDetail can be
+  // honest about what they're showing (a diagnosis-only sample, not a real
+  // dispatch outcome) rather than silently presenting them the same way.
   const expandedEpisodes = useMemo(() => {
-    if (!expandedModel || !episodes) return [];
-    return episodes.filter(
+    if (!expandedModel) return [];
+    const real = (episodes || []).filter(
       (e) => `${e.provider}:${e.model}` === expandedModel && e.score_confidence != null
     );
-  }, [expandedModel, episodes]);
+    const comparison = (comparisonEpisodes || [])
+      .filter((e) => `${e.provider}:${e.model}` === expandedModel && e.score_confidence != null)
+      .map((e) => ({ ...e, isComparisonOnly: true }));
+    return [...real, ...comparison];
+  }, [expandedModel, episodes, comparisonEpisodes]);
 
   return (
     <div className="bg-surface-container-low border border-outline-variant p-5">
@@ -57,6 +87,7 @@ export default function CalibrationSection({ scorecard, episodes }) {
         {rows.map((r) => {
           const flagged = isLowVarianceFlag(r.variance);
           const isExpanded = expandedModel === r.key;
+          const isComparisonOnlyModel = !dispatchedKeys.has(r.key);
           return (
             <div key={r.key}>
               <button
@@ -64,6 +95,14 @@ export default function CalibrationSection({ scorecard, episodes }) {
                 className="w-full flex items-center gap-3 hover:bg-surface-container-high/40 px-1 py-1 -mx-1 text-left"
               >
                 <span className="font-data-mono text-xs text-on-surface w-40 shrink-0">{modelLabel(r.key)}</span>
+                {isComparisonOnlyModel && (
+                  <span
+                    className="font-label-caps text-[9px] px-1.5 py-0.5 bg-surface-container-highest text-on-surface-variant border border-outline-variant shrink-0"
+                    title="This model never dispatches -- diagnosis-only via the background comparison system, never a real action on the cluster."
+                  >
+                    COMPARISON-ONLY
+                  </span>
+                )}
                 <div className="flex-1 h-4 bg-surface-container-highest relative">
                   <div
                     className={`h-full ${r.calib.deviation > 0.1 ? "bg-error-red" : "bg-primary"}`}

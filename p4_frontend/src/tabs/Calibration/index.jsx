@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { fetchModelScorecard, fetchEpisodes } from "../../api/r2";
+import { fetchModelScorecard, fetchEpisodes, fetchComparisonEpisodes } from "../../api/r2";
 import ModelCardTable from "../../components/scorecard/ModelCardTable";
 import ConfusionMatrixHeatmap from "../../components/scorecard/ConfusionMatrixHeatmap";
 import FallbackFunnel from "../../components/scorecard/FallbackFunnel";
@@ -25,22 +25,24 @@ import CalibrationSection from "../../components/scorecard/CalibrationSection";
 export default function Calibration() {
   const [scorecard, setScorecard] = useState(null);
   const [episodes, setEpisodes] = useState(null);
+  const [comparisonEpisodes, setComparisonEpisodes] = useState(null);
   const [error, setError] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([fetchModelScorecard(), fetchEpisodes()])
-      .then(([sc, eps]) => {
+    Promise.all([fetchModelScorecard(), fetchEpisodes(), fetchComparisonEpisodes()])
+      .then(([sc, eps, cmpEps]) => {
         if (cancelled) return;
         setScorecard(sc);
         setEpisodes(eps);
+        setComparisonEpisodes(cmpEps);
       })
       .catch((e) => { if (!cancelled) setError(e.message); });
     return () => { cancelled = true; };
   }, []);
 
   if (error) return <p className="text-error-red">Failed to load model scorecard: {error}</p>;
-  if (!scorecard || !episodes) return <p className="text-on-surface-variant">Loading…</p>;
+  if (!scorecard || !episodes || !comparisonEpisodes) return <p className="text-on-surface-variant">Loading…</p>;
 
   return (
     <div className="max-w-[1600px] mx-auto">
@@ -71,7 +73,7 @@ export default function Calibration() {
           </div>
         </div>
 
-        <CalibrationSection scorecard={scorecard} episodes={episodes} />
+        <CalibrationSection scorecard={scorecard} episodes={episodes} comparisonEpisodes={comparisonEpisodes} />
       </div>
     </div>
   );
