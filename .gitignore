@@ -155,3 +155,8 @@ p3_trust_action/.env
 
 # LLM provider API keys (Gemini/Groq/OpenRouter) -- never committed
 .env
+check_stream_support.py
+check_stream_reasoning_example.py
+check_nonstream_reasoning_cost.py
+check_stream_real_prompt.py
+check_fault_evidence_persistence.py
