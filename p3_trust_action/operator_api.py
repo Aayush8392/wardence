@@ -41,6 +41,7 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "p2_readonly_loop"))
 
 import sqlite3  # noqa: E402
 
@@ -55,6 +56,15 @@ from trust_engine import (  # noqa: E402
     ensure_trust_tables,
     get_trust_state,
     manual_set_state,
+)
+# Real manual safety-net endpoint (Kimi review 34 finding #8) -- see
+# /admin/reset-catalogue-baseline below. Same direct-import pattern
+# run_batch_plan.py's own BASELINE_CHECKS already uses, not a subprocess
+# call -- these are plain kubectl-wrapping functions.
+from injector import (  # noqa: E402
+    FAULT_CONFIG,
+    _ensure_catalogue_replica_baseline,
+    _ensure_oom_baseline,
 )
 
 
@@ -176,23 +186,53 @@ INJECT_SUBPROCESS_TIMEOUT_S = {
     # oom: NOT extended the same way (no duration_s hold -- exits on
     # confirmed kill or the real ~260-266s ceiling). Real math: one
     # ceiling-miss (266s, rounded to 270s) + one typical success (91.3s
-    # observed max, rounded to 100s) = 370s, +80s margin = 450s.
-    "oom": 450,
-    # Remaining 4 auto-fix classes: NOT live-tested at an extended
+    # observed max, rounded to 100s) = 370s.
+    #
+    # RECALIBRATED 450 -> 500, 2026-08-1x (Kimi review 34 finding #8,
+    # confirmed via direct code read then a real live timing test,
+    # test_oom_baseline_reset_timing.py): the 450s figure excluded a real,
+    # occasional cost -- _ensure_oom_baseline (called inside injector.py's
+    # main(), the SAME subprocess this timeout bounds) can run a genuine
+    # kubectl rollout restart + up to a 300s rollout-status wait right
+    # before injection, if a prior real fix left catalogue's memory limit
+    # raised. Real measured cost of that reset alone: 181.6s (close to,
+    # and driven by the same root cause as, oom's own ~185s post-kill
+    # recovery number -- catalogue's readinessProbe.initialDelaySeconds=
+    # 180). 500s = 370s (ceiling-miss + typical-success math above) +
+    # margin, treating "both a fresh baseline-reset AND a ceiling-miss on
+    # the same trigger" as the one genuinely rare compound case acceptable
+    # to a clean 504, not padded for on every single call. The real,
+    # PRIMARY fix for this cost is p3_scorer.py's new automatic
+    # post-episode baseline-reset (moves the reset out of this hot path
+    # entirely, into the end of the PRECEDING episode's lifecycle) -- this
+    # number just covers the rare case that automatic reset didn't run
+    # (e.g. a crashed scorer process) and injector.py's own lazy check has
+    # to do it here instead.
+    "oom": 500,
+    # Remaining 3 auto-fix classes: NOT live-tested at an extended
     # duration this session (disk-full is a confirmed hard ceiling, never
-    # extended; under-provisioned-replicas/bad-rollout are standing
-    # config changes with a short verification burst, not a "hold
-    # longer" mechanism; cpu-throttling's real resource-safety was
-    # already tested up to 300s in an earlier session, 2026-08-01, but
-    # its own injector.py wall-clock cost wasn't specifically measured
-    # the way the other 8 classes were today). Derived from each class's
-    # real production duration_s + generous margin, not measured --
-    # revisit with a real live test the same way as the other 8 if these
-    # are ever extended for live-visibility too.
+    # extended; bad-rollout is a standing config change with a short
+    # verification burst, not a "hold longer" mechanism; cpu-throttling's
+    # real resource-safety was already tested up to 300s in an earlier
+    # session, 2026-08-01, but its own injector.py wall-clock cost wasn't
+    # specifically measured the way the other 8 classes were today).
+    # Derived from each class's real production duration_s + generous
+    # margin, not measured -- revisit with a real live test the same way
+    # as the other 8 if these are ever extended for live-visibility too.
     "disk-full": 220,             # duration_s=60, natural hard ceiling, no extension
-    "under-provisioned-replicas": 150,  # duration_s=20, short verification burst
     "bad-rollout": 200,           # duration_s=60, standing config change
     "cpu-throttling": 350,        # real-safety-tested to 300s (2026-08-01), injector cost not separately measured
+    # under-provisioned-replicas: RECALIBRATED 150 -> 300, 2026-08-1x
+    # (Kimi review 34 finding #8's scope extended past the review itself,
+    # to UPR -- it shares the same catalogue target/baseline-reset cost as
+    # oom, via _ensure_oom_baseline(FAULT_CONFIG["oom"]) called inside its
+    # OWN injector function). Real live test (test_upr_worst_case_timing.py,
+    # simulating a prior real oom fix AND a prior real UPR fix both landed
+    # on catalogue first): 209.1s real, genuine overage against the old
+    # 150s budget. 300s = real 209.1s + ~90s margin. Same primary-fix
+    # framing as oom above -- this covers the rare case the new automatic
+    # post-episode reset didn't run.
+    "under-provisioned-replicas": 300,
 }
 DEFAULT_INJECT_SUBPROCESS_TIMEOUT_S = 300  # any class not yet in the dict above
 # The subprocess call below is wrapped in try/except TimeoutExpired, so
@@ -795,6 +835,28 @@ def demote(fault_class: str, request: Request, payload: dict = Depends(require_r
     conn.close()
     _republish_to_r2()
     return {"fault_class": fault_class, "state": REPORT_ONLY}
+
+
+@app.post("/admin/reset-catalogue-baseline")
+def reset_catalogue_baseline(request: Request, payload: dict = Depends(require_role("admin"))):
+    """Manual, admin-only safety net for oom's/under-provisioned-replicas'
+    shared catalogue baseline (memory limit + replica count), added
+    2026-08-1x alongside Kimi review 34 finding #8's real fix. The
+    PRIMARY mechanism is now p3_scorer.py's automatic reset at the end of
+    every oom/under-provisioned-replicas episode's lifecycle -- this
+    endpoint exists only for the rare case that automatic reset itself
+    didn't run (e.g. the scorer process crashed mid-episode before
+    reaching it), so the next real trigger of either class doesn't have
+    to silently pay for it via its own injection timeout. Idempotent --
+    a cheap kubectl-get no-op if catalogue is already at baseline on
+    both dimensions."""
+    role = payload["role"]
+    _ensure_catalogue_replica_baseline(FAULT_CONFIG["under-provisioned-replicas"])
+    _ensure_oom_baseline(FAULT_CONFIG["oom"])
+    conn = _conn()
+    _audit(conn, role, "/admin/reset-catalogue-baseline", "manual reset", request.client.host)
+    conn.close()
+    return {"status": "reset applied (idempotent no-op on any dimension already at baseline)"}
 
 
 # --- Accounts (2026-07-22) -------------------------------------------------

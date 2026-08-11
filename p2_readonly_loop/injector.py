@@ -149,6 +149,7 @@ Usage:
 
 import argparse
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -654,6 +655,94 @@ def ensure_db():
     )
     conn.commit()
     return conn
+
+
+# Real cross-process lock, closes Kimi review 34 findings #2/#6, 2026-08-1x.
+# run_batch_plan.py and operator_api.py's live-trigger path both ultimately
+# shell out to THIS script as a subprocess, but neither can see the other
+# is running -- operator_api.py's own _TRIGGER_BUSY is an in-memory flag
+# scoped to its own process, structurally invisible to a separate
+# run_batch_plan.py process. This script is the one real entry point every
+# trigger path shares (same reasoning _clear_stale_oom_sticky_flag's own
+# placement in main() already uses), so it's the right place to make "only
+# one real cluster mutation in flight, system-wide" a real cross-process
+# guarantee instead of one that only holds within a single process.
+#
+# 600s staleness margin -- comfortably past oom's real worst-case ~500s
+# subprocess cost (the longest of any class) -- so a crashed process that
+# never released the lock can't wedge the system forever; a stale lock is
+# treated as free, same bounded-staleness reasoning as operator_api.py's
+# own EPISODE_IN_FLIGHT_MAX_AGE_MINUTES.
+SYSTEM_LOCK_STALE_S = 600
+SYSTEM_LOCK_RETRY_S = 5
+# Fail fast and loud rather than hang silently -- a genuine collision
+# should be rare and is worth surfacing immediately, not papered over
+# with a long wait that just delays the same eventual failure.
+SYSTEM_LOCK_MAX_WAIT_S = 30
+
+
+def _ensure_system_lock_table(conn):
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS system_lock (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            holder TEXT,
+            acquired_at REAL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO system_lock (id, holder, acquired_at) VALUES (1, NULL, NULL)"
+    )
+    conn.commit()
+
+
+def _acquire_system_lock(conn, holder: str) -> bool:
+    """Atomic acquire: succeeds if the row is free OR its holder is stale.
+    Real rowcount check under sqlite3's own implicit transaction -- same
+    check-and-set-atomically pattern operator_api.py's own
+    _try_acquire_trigger_busy already uses, just DB-backed instead of an
+    in-memory dict so it's visible across processes."""
+    now = time.time()
+    cur = conn.execute(
+        """
+        UPDATE system_lock SET holder = ?, acquired_at = ?
+        WHERE id = 1 AND (holder IS NULL OR acquired_at < ?)
+        """,
+        (holder, now, now - SYSTEM_LOCK_STALE_S),
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
+def _release_system_lock(conn, holder: str):
+    """Only releases a lock this exact holder actually acquired -- a run
+    that lost the race (or a stale lock it never held) can never release
+    someone else's real, still-active lock."""
+    conn.execute(
+        "UPDATE system_lock SET holder = NULL, acquired_at = NULL WHERE id = 1 AND holder = ?",
+        (holder,),
+    )
+    conn.commit()
+
+
+def acquire_system_lock_or_die(holder: str):
+    conn = ensure_db()
+    _ensure_system_lock_table(conn)
+    waited = 0
+    while not _acquire_system_lock(conn, holder):
+        if waited >= SYSTEM_LOCK_MAX_WAIT_S:
+            conn.close()
+            raise SystemExit(
+                f"Could not acquire the cross-process system lock after "
+                f"{SYSTEM_LOCK_MAX_WAIT_S}s -- another injector.py run (batch or "
+                f"live-trigger) appears to genuinely be in flight. Refusing to "
+                f"start a second concurrent cluster mutation."
+            )
+        print(f"  system lock held by another run -- waiting ({waited}s/{SYSTEM_LOCK_MAX_WAIT_S}s)...")
+        time.sleep(SYSTEM_LOCK_RETRY_S)
+        waited += SYSTEM_LOCK_RETRY_S
+    conn.close()
 
 
 def build_oom_manifest(chaos_name: str, cfg: dict, size: str = OOM_STRESS_SIZE) -> str:
@@ -2589,86 +2678,114 @@ def _inject_and_verify_oom(cfg: dict) -> str | None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--class", dest="fault_class", required=True, choices=FAULT_CONFIG.keys())
+    parser.add_argument(
+        "--duration-override", dest="duration_override", type=int, default=None,
+        help=(
+            "Override this class's FAULT_CONFIG duration_s for this run only -- "
+            "does NOT mutate FAULT_CONFIG (a fresh per-run copy is used). Exists "
+            "so the real production CLI path can be exercised at extended "
+            "durations (e.g. Operator's locked 180s/300s numbers) instead of "
+            "only via one-off scripts calling internal functions directly."
+        ),
+    )
     args = parser.parse_args()
 
     fault_class = args.fault_class
-    cfg = FAULT_CONFIG[fault_class]
-
-    # Real, live-verified fix, 2026-08-01 -- see _clear_stale_oom_sticky_flag's
-    # own docstring for the full incident. Placed HERE, in main(), not
-    # inside _ensure_oom_baseline (which only run_batch_plan.py's own
-    # BASELINE_CHECKS ever calls) -- this is the one real entry point
-    # EVERY trigger path shares (run_batch_plan.py's subprocess call,
-    # AND operator_api.py's live-trigger subprocess call), so a fix
-    # placed here applies universally regardless of who or what
-    # triggered this specific episode. Cheap no-op in the common case.
-    _clear_stale_oom_sticky_flag(cfg)
+    cfg = dict(FAULT_CONFIG[fault_class])
+    if args.duration_override is not None:
+        print(
+            f"  duration_s override: {cfg['duration_s']}s -> {args.duration_override}s "
+            f"(FAULT_CONFIG itself unchanged)"
+        )
+        cfg["duration_s"] = args.duration_override
 
     episode_id = str(uuid.uuid4())
     t0 = datetime.now(timezone.utc).isoformat()
-    print(f"Episode {episode_id}: attempting {fault_class} on {cfg['target']} ({cfg['namespace']}) at {t0}")
 
-    if fault_class == "disk-full":
-        _ensure_queue_master_pod_cleanup(cfg)
-        verified = _inject_and_verify_disk_full(cfg)
-        chaos_name = "manual-exec" if verified else None
-    elif fault_class == "crash-loop":
-        verified = _inject_and_verify_crash_loop(cfg)
-        chaos_name = "manual-exec" if verified else None
-    elif fault_class == "network-latency":
-        chaos_name = _inject_and_verify_network_latency(cfg)
-    elif fault_class == "memory-leak":
-        chaos_name = _inject_and_verify_memory_leak(cfg)
-    elif fault_class == "connection-pool-exhaustion":
-        chaos_name = _inject_and_verify_connection_pool_exhaustion(cfg)
-    elif fault_class == "network-partition":
-        chaos_name = _inject_and_verify_network_partition(cfg)
-    elif fault_class == "init-failure":
-        verified = _inject_and_verify_init_failure(cfg)
-        chaos_name = "manual-patch" if verified else None
-    elif fault_class == "session-cart-failure":
-        verified = _inject_and_verify_session_cart_failure(cfg)
-        chaos_name = "manual-scale" if verified else None
-    elif fault_class == "cpu-throttling":
-        chaos_name = _inject_and_verify_cpu_throttling(cfg)
-    elif fault_class == "under-provisioned-replicas":
-        chaos_name = _inject_and_verify_under_provisioned(cfg)
-    elif fault_class == "bad-rollout":
-        verified = _inject_and_verify_bad_rollout(cfg)
-        chaos_name = "manual-patch" if verified else None
-    elif fault_class == "oom":
-        # Real bug found 2026-08-06, live: oom and under-provisioned-
-        # replicas share the same target (catalogue), but each class's
-        # own baseline-reset function only ever touched ITS OWN
-        # dimension (memory limit here, replica count in
-        # _ensure_catalogue_replica_baseline) -- neither reset the
-        # OTHER'S. A real UPR fix that scaled catalogue to 3 replicas
-        # left it there for the next oom episode, and Chaos Mesh's
-        # `mode: one` StressChaos selector can then pick a DIFFERENT
-        # one of the 3 pods than the one _current_pod_name()/the
-        # verification poll is watching -- 3 consecutive real injection
-        # failures, confirmed live (kubectl showed replicas=3 mid-batch).
-        # Resetting both dimensions before injecting either class now.
-        _ensure_catalogue_replica_baseline(cfg)
-        _ensure_oom_baseline(cfg)
-        chaos_name = _inject_and_verify_oom(cfg)
-    else:
-        # Unreachable in practice -- argparse's choices=FAULT_CONFIG.keys()
-        # and every real key above already has its own explicit branch.
-        raise ValueError(f"no injection mechanism wired up for fault_class={fault_class!r}")
+    # Real cross-process lock -- see acquire_system_lock_or_die's own
+    # docstring/comment block above. Acquired before ANY real cluster
+    # mutation and released in the finally below regardless of how this
+    # run ends (success, a refused injection, or an exception).
+    lock_holder = f"pid={os.getpid()} class={fault_class} started={t0}"
+    acquire_system_lock_or_die(lock_holder)
+    try:
+        # Real, live-verified fix, 2026-08-01 -- see _clear_stale_oom_sticky_flag's
+        # own docstring for the full incident. Placed HERE, in main(), not
+        # inside _ensure_oom_baseline (which only run_batch_plan.py's own
+        # BASELINE_CHECKS ever calls) -- this is the one real entry point
+        # EVERY trigger path shares (run_batch_plan.py's subprocess call,
+        # AND operator_api.py's live-trigger subprocess call), so a fix
+        # placed here applies universally regardless of who or what
+        # triggered this specific episode. Cheap no-op in the common case.
+        _clear_stale_oom_sticky_flag(cfg)
 
-    if not chaos_name:
-        print(
-            f"INJECTION FAILED after {MAX_INJECT_ATTEMPTS} attempts for {fault_class} on "
-            f"{cfg['target']} -- NO episode recorded. If this keeps happening, the cluster "
-            f"(or Chaos Mesh's own daemon) is unhealthy, not the diagnosis/verifier code."
-        )
-        return
+        print(f"Episode {episode_id}: attempting {fault_class} on {cfg['target']} ({cfg['namespace']}) at {t0}")
 
-    conn = ensure_db()
-    record_episode(conn, episode_id, fault_class, cfg, chaos_name, t0)
-    conn.close()
-    print(f"Episode {episode_id}: injection verified ({chaos_name}) and ground truth recorded.")
+        if fault_class == "disk-full":
+            _ensure_queue_master_pod_cleanup(cfg)
+            verified = _inject_and_verify_disk_full(cfg)
+            chaos_name = "manual-exec" if verified else None
+        elif fault_class == "crash-loop":
+            verified = _inject_and_verify_crash_loop(cfg)
+            chaos_name = "manual-exec" if verified else None
+        elif fault_class == "network-latency":
+            chaos_name = _inject_and_verify_network_latency(cfg)
+        elif fault_class == "memory-leak":
+            chaos_name = _inject_and_verify_memory_leak(cfg)
+        elif fault_class == "connection-pool-exhaustion":
+            chaos_name = _inject_and_verify_connection_pool_exhaustion(cfg)
+        elif fault_class == "network-partition":
+            chaos_name = _inject_and_verify_network_partition(cfg)
+        elif fault_class == "init-failure":
+            verified = _inject_and_verify_init_failure(cfg)
+            chaos_name = "manual-patch" if verified else None
+        elif fault_class == "session-cart-failure":
+            verified = _inject_and_verify_session_cart_failure(cfg)
+            chaos_name = "manual-scale" if verified else None
+        elif fault_class == "cpu-throttling":
+            chaos_name = _inject_and_verify_cpu_throttling(cfg)
+        elif fault_class == "under-provisioned-replicas":
+            chaos_name = _inject_and_verify_under_provisioned(cfg)
+        elif fault_class == "bad-rollout":
+            verified = _inject_and_verify_bad_rollout(cfg)
+            chaos_name = "manual-patch" if verified else None
+        elif fault_class == "oom":
+            # Real bug found 2026-08-06, live: oom and under-provisioned-
+            # replicas share the same target (catalogue), but each class's
+            # own baseline-reset function only ever touched ITS OWN
+            # dimension (memory limit here, replica count in
+            # _ensure_catalogue_replica_baseline) -- neither reset the
+            # OTHER'S. A real UPR fix that scaled catalogue to 3 replicas
+            # left it there for the next oom episode, and Chaos Mesh's
+            # `mode: one` StressChaos selector can then pick a DIFFERENT
+            # one of the 3 pods than the one _current_pod_name()/the
+            # verification poll is watching -- 3 consecutive real injection
+            # failures, confirmed live (kubectl showed replicas=3 mid-batch).
+            # Resetting both dimensions before injecting either class now.
+            _ensure_catalogue_replica_baseline(cfg)
+            _ensure_oom_baseline(cfg)
+            chaos_name = _inject_and_verify_oom(cfg)
+        else:
+            # Unreachable in practice -- argparse's choices=FAULT_CONFIG.keys()
+            # and every real key above already has its own explicit branch.
+            raise ValueError(f"no injection mechanism wired up for fault_class={fault_class!r}")
+
+        if not chaos_name:
+            print(
+                f"INJECTION FAILED after {MAX_INJECT_ATTEMPTS} attempts for {fault_class} on "
+                f"{cfg['target']} -- NO episode recorded. If this keeps happening, the cluster "
+                f"(or Chaos Mesh's own daemon) is unhealthy, not the diagnosis/verifier code."
+            )
+            return
+
+        conn = ensure_db()
+        record_episode(conn, episode_id, fault_class, cfg, chaos_name, t0)
+        conn.close()
+        print(f"Episode {episode_id}: injection verified ({chaos_name}) and ground truth recorded.")
+    finally:
+        lock_conn = ensure_db()
+        _release_system_lock(lock_conn, lock_holder)
+        lock_conn.close()
 
 
 if __name__ == "__main__":

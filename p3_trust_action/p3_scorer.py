@@ -45,6 +45,16 @@ from action_proposer import DETERMINISTIC_ACTION_MAP, log_proposal  # noqa: E402
 from llm_replay_test import _same_diagnosis, ensure_llm_diagnosis_log_table  # noqa: E402
 from trust_gate import action_is_correct, eligible_action_for_streak, eligible_for_trust_ladder  # noqa: E402
 from misdispatch_guard import ensure_misdispatch_tables, record_misdispatch  # noqa: E402
+# Real structural fix, 2026-08-1x (Kimi review 34 finding #8) -- see the
+# call site near the end of main() for the full reasoning. Imported here
+# (not subprocess'd) same as run_batch_plan.py's own BASELINE_CHECKS
+# pattern -- these are plain kubectl-wrapping functions, no injector.py
+# CLI/argparse machinery needed.
+from injector import (  # noqa: E402
+    FAULT_CONFIG,
+    _ensure_catalogue_replica_baseline,
+    _ensure_oom_baseline,
+)
 
 DIAGNOSE_URL = "http://localhost:8001/diagnose"
 ACT_URL = "http://localhost:8001/act"
@@ -573,6 +583,32 @@ def main():
     record_llm_trust(conn, episode_id, actual_class, target, namespace, result)
 
     conn.close()
+
+    # Real structural fix, 2026-08-1x (Kimi review 34 finding #8 + two real
+    # follow-up timing tests, test_oom_baseline_reset_timing.py and
+    # test_upr_worst_case_timing.py). oom's and under-provisioned-replicas'
+    # shared target (catalogue) baseline-reset used to run INSIDE
+    # injector.py's own hot path, on the NEXT episode's injection attempt --
+    # a real, measured, growing cost (oom: ~181.6s reset able to stack on
+    # top of a ~270s ceiling-miss; UPR: a real 209.1s total against its old
+    # 150s budget) that only got worse as this project kept padding
+    # timeouts to cover an increasingly rare compound case.
+    #
+    # Moved here instead: reset immediately after THIS episode's own
+    # durability verification has already closed and it's fully scored --
+    # never earlier. Resetting the memory limit/replica count the moment a
+    # fix is merely APPLIED, before durability finishes measuring whether
+    # it holds, would corrupt the very check it's supposed to protect.
+    # Runs regardless of this episode's outcome (correct/incorrect, action
+    # taken or not) -- idempotent (a cheap kubectl-get no-op in the common
+    # case), so unconditional is safe. injector.py's own lazy
+    # _ensure_oom_baseline/_ensure_catalogue_replica_baseline checks stay
+    # in place as a defense-in-depth safety net for the rare case this
+    # automatic reset itself doesn't run (e.g. this process crashes before
+    # reaching this line) -- not removed, not the primary mechanism anymore.
+    if actual_class in ("oom", "under-provisioned-replicas"):
+        _ensure_catalogue_replica_baseline(FAULT_CONFIG["under-provisioned-replicas"])
+        _ensure_oom_baseline(FAULT_CONFIG["oom"])
 
     verdict = "CORRECT" if diagnosis_correct else "WRONG"
     print(f"Episode {episode_id}: predicted='{predicted_class}' actual='{actual_class}' -> {verdict}")
