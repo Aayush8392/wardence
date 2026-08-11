@@ -6,3 +6,4 @@ pyjwt
 boto3
 bcrypt
 pyotp
+httpx

@@ -166,3 +166,7 @@ test_cpe_180s.py
 test_oom_ceiling_worstcase.py
 test_oom_real_live_window.py
 test_report_only_180s.py
+test_trigger_endpoint_timeout.py
+test_untested_class_timeouts.py
+test_oom_baseline_reset_timing.py
+test_upr_worst_case_timing.py
