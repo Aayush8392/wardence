@@ -160,3 +160,9 @@ check_stream_reasoning_example.py
 check_nonstream_reasoning_cost.py
 check_stream_real_prompt.py
 check_fault_evidence_persistence.py
+check_cpu_stress_resource_contention.py
+test_crash_loop_180s.py
+test_cpe_180s.py
+test_oom_ceiling_worstcase.py
+test_oom_real_live_window.py
+test_report_only_180s.py

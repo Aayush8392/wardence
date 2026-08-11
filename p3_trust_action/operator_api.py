@@ -113,21 +113,90 @@ SAFE_DEMO_CLASSES = {
     "crash-loop", "oom", "disk-full",
     "cpu-throttling", "under-provisioned-replicas", "bad-rollout",
 }
-# Real worst-case injection time across all 12 classes, checked directly
-# against each class's own injection function (2026-08-06), NOT the
-# FAULT_CONFIG duration_s table alone -- that table proved an unreliable
-# proxy (oom's duration_s=90 comment describes a mechanism the 2026-08-01
-# Kimi-review-19 redesign fully replaced; the real driver for oom is
-# OOM_VERIFY_CEILING_S=200s in injector.py, unrelated to duration_s).
-# Real per-attempt worst case, oom: 200s. MAX_INJECT_ATTEMPTS=3 (injector.py)
-# -> 600s theoretical ceiling + small per-attempt overhead. 400s is below
-# that full theoretical ceiling deliberately -- typical real oom kills land
-# at 97-119s (see injector.py's _inject_and_verify_oom docstring), so
-# burning the full 200s ceiling on 2+ consecutive attempts is a rare,
-# worth-surfacing event, not a case worth padding the UX wait time for.
+# Per-class injection subprocess timeout, same shape/precedent as
+# run_episodes.py's TARGET_RECENCY_WINDOW_S dict -- a single flat constant
+# tried and failed here first (see history below), for the identical
+# reason a flat TARGET_RECENCY_WINDOW_S failed: different classes have
+# genuinely different real injector.py wall-clock cost, not just different
+# duration_s values.
+#
+# History: originally a flat 400s, sized (2026-08-06/07) against an
+# ASSUMED oom ceiling-hit cost of 200s/attempt. RECALIBRATED 2026-08-11
+# to 450s (still flat) after two real live tests
+# (p2_readonly_loop/test_oom_ceiling_worstcase.py,
+# test_oom_real_live_window.py) found the real per-attempt ceiling-hit
+# cost is ~260-266s, not 200s -- the poll loop's own `elapsed` counter in
+# _inject_and_verify_oom only tracks OOM_VERIFY_POLL_S (3s) added per
+# iteration, never the real ~1s of kubectl round-trip latency each
+# iteration's two API calls also cost (confirmed: 3/3 forced ceiling-miss
+# attempts landed at 260.1s/266.3s/261.9s). Real typical (non-ceiling-miss)
+# oom kill time, measured across 5 live production-stressor runs:
+# 6.6s/18.5s/31.1s/57.8s/91.3s.
+#
+# Converted to per-class SAME SESSION, 2026-08-11, once live-testing the
+# 5 remaining report-only classes at their own real 180s max surfaced a
+# real, DIFFERENT cost outlier: network-latency's real injector mechanism
+# polls _probe_orders_latency_ms every 10s throughout the ENTIRE hold (not
+# just once at the end) -- each probe spins a real throwaway pod
+# (kubectl run --rm), already documented elsewhere in this codebase as
+# ~28s for a clean idle round trip (LATENCY_PROBE_TIMEOUT_S=50s exists
+# specifically because of this). At 180s that's 19 real probe calls
+# (1 baseline + 18 in-loop); observed real single-attempt cost was 306.7s
+# -- already close to the flat 450s ceiling on ONE successful attempt, no
+# retry needed. A single flat constant covering both oom's ceiling-miss
+# shape and network-latency's per-probe-overhead shape would have to be
+# padded for the worse of the two on EVERY class, which is exactly the
+# TARGET_RECENCY_WINDOW_S mistake repeating itself.
+#
+# Real per-class values below, each derived from its own real live-test
+# result (2026-08-11) + margin, using the same design intent throughout:
+# cover the real observed cost with real margin, not the full theoretical
+# worst case (e.g. every probe hitting its own 50s internal timeout) --
+# a genuinely pathological run should still trip this timeout and surface
+# as a clean 504, not be silently padded for.
+INJECT_SUBPROCESS_TIMEOUT_S = {
+    # Report-only classes, all real-tested at the locked 180s max
+    # (2026-08-11). Six of seven cost ~181-190s real (clean, minimal
+    # per-probe overhead) -> 260s gives ~70-80s real margin.
+    "network-partition": 260,           # real: 181.0s
+    "memory-leak": 260,                 # real: 181.2s
+    "init-failure": 260,                # real: 181.0s
+    "session-cart-failure": 260,        # real: 190.4s
+    "connection-pool-exhaustion": 260,  # real: 184.2s
+    # network-latency: real outlier, see the class docstring above --
+    # every-10s real throwaway-pod probing throughout the hold. Real:
+    # 306.7s on ONE clean attempt. 500s covers real probe-overhead
+    # variance (average ~6.67s/probe this run, room for it to run
+    # notably slower under real cluster load) without being padded for
+    # every probe hitting its own internal 50s cap.
+    "network-latency": 500,
+    # Auto-fix classes extended under completion-gating (2026-08-11 live
+    # tests). crash-loop: real 188.3s, single attempt, clean -> 260s.
+    "crash-loop": 260,
+    # oom: NOT extended the same way (no duration_s hold -- exits on
+    # confirmed kill or the real ~260-266s ceiling). Real math: one
+    # ceiling-miss (266s, rounded to 270s) + one typical success (91.3s
+    # observed max, rounded to 100s) = 370s, +80s margin = 450s.
+    "oom": 450,
+    # Remaining 4 auto-fix classes: NOT live-tested at an extended
+    # duration this session (disk-full is a confirmed hard ceiling, never
+    # extended; under-provisioned-replicas/bad-rollout are standing
+    # config changes with a short verification burst, not a "hold
+    # longer" mechanism; cpu-throttling's real resource-safety was
+    # already tested up to 300s in an earlier session, 2026-08-01, but
+    # its own injector.py wall-clock cost wasn't specifically measured
+    # the way the other 8 classes were today). Derived from each class's
+    # real production duration_s + generous margin, not measured --
+    # revisit with a real live test the same way as the other 8 if these
+    # are ever extended for live-visibility too.
+    "disk-full": 220,             # duration_s=60, natural hard ceiling, no extension
+    "under-provisioned-replicas": 150,  # duration_s=20, short verification burst
+    "bad-rollout": 200,           # duration_s=60, standing config change
+    "cpu-throttling": 350,        # real-safety-tested to 300s (2026-08-01), injector cost not separately measured
+}
+DEFAULT_INJECT_SUBPROCESS_TIMEOUT_S = 300  # any class not yet in the dict above
 # The subprocess call below is wrapped in try/except TimeoutExpired, so
 # even a genuine miss fails with a clean error, not a crash.
-INJECT_SUBPROCESS_TIMEOUT_S = 400
 COOLDOWN_S = 60
 DAILY_CAP = 3  # per-IP cap -- a fairness layer, NOT the real budget protection
 
@@ -494,13 +563,14 @@ def trigger_inject(
         _audit(conn, role, "/trigger/inject", f"fault_class={fault_class}", ip)
         conn.close()
 
+        inject_timeout_s = INJECT_SUBPROCESS_TIMEOUT_S.get(fault_class, DEFAULT_INJECT_SUBPROCESS_TIMEOUT_S)
         try:
             result = subprocess.run(
                 [sys.executable, str(INJECTOR_PATH), "--class", fault_class],
                 cwd=str(INJECTOR_CWD),
                 capture_output=True,
                 text=True,
-                timeout=INJECT_SUBPROCESS_TIMEOUT_S,
+                timeout=inject_timeout_s,
             )
         except subprocess.TimeoutExpired:
             # Real bug, logged 2026-08-03: an uncaught TimeoutExpired used to
@@ -514,7 +584,7 @@ def trigger_inject(
             raise HTTPException(
                 504,
                 f"injector for '{fault_class}' did not finish within "
-                f"{INJECT_SUBPROCESS_TIMEOUT_S}s -- likely a genuinely stuck "
+                f"{inject_timeout_s}s -- likely a genuinely stuck "
                 f"cluster/injector process, not a normal retry. Check the "
                 f"cluster directly before retrying.",
             )
