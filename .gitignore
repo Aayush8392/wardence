@@ -170,3 +170,7 @@ test_trigger_endpoint_timeout.py
 test_untested_class_timeouts.py
 test_oom_baseline_reset_timing.py
 test_upr_worst_case_timing.py
+
+# Real trust-state safety-net snapshots (snapshot_restore_trust_state.py's
+# output) -- reusable-tool artifacts, not source, regenerable at will.
+trust_snapshot_*.json

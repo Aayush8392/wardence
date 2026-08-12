@@ -391,6 +391,15 @@ class HandleRequest(BaseModel):
     # episode instead of reconstructed via timestamp-window diffing.
     # None means "no attribution" (e.g. a caller other than p3_scorer.py).
     episode_id: str | None = None
+    # Real evidence-freezing timestamp (RFC3339), added after a genuine
+    # live-tested false negative: a crash-loop episode's real restart
+    # events aged out of agent.py's own [3m] diagnosis query because
+    # Operator's holding+abandonment-ceiling flow can now take 8+ real
+    # minutes from injection to diagnosis. operator_api.py computes this
+    # as t0 + SETTLE_SECONDS (the moment evidence was genuinely ready)
+    # and threads it through p3_scorer.py --snapshot-at. None (every
+    # batch-run episode) preserves today's live "now" query behavior.
+    snapshot_at: str | None = None
 
 
 class ActRequest(BaseModel):
@@ -425,12 +434,18 @@ class ActRequest(BaseModel):
     actual_class: str | None = None
 
 
-def _build_llm_tools(target: str, namespace: str) -> dict:
+def _build_llm_tools(target: str, namespace: str, snapshot_at: str | None = None) -> dict:
     """Same real tool set + binding convention as test_react_agent.py's
     build_tools -- kept in sync by hand (same 'duplicated by hand'
     convention this project already uses for FAULT_CLASSES/FIELD_GUIDANCE/
-    DETERMINISTIC_ACTION_MAP, not a new pattern)."""
-    tools = {"query_prometheus": lambda: query_prometheus(target, namespace)}
+    DETERMINISTIC_ACTION_MAP, not a new pattern).
+
+    snapshot_at threaded through here too, not just the stub's own
+    query_prometheus call below -- otherwise the real LLM's own ReAct
+    tool call would see LIVE "now" evidence while the stub sees frozen
+    evidence, undermining Dimension B's whole comparison premise (both
+    are supposed to be judged against the SAME evidence)."""
+    tools = {"query_prometheus": lambda: query_prometheus(target, namespace, snapshot_at=snapshot_at)}
     if target in DL_DETECTOR_SERVICES:
         tools["call_dl_detector"] = lambda: call_dl_detector(target)
     if target == "catalogue":
@@ -468,7 +483,7 @@ def diagnose(req: HandleRequest):
     the caller uses this to decide whether /act is even worth calling,
     same as the old /handle's early-return-on-report-only behavior.
     """
-    tool_output = query_prometheus(req.target, req.namespace)
+    tool_output = query_prometheus(req.target, req.namespace, snapshot_at=req.snapshot_at)
     stub_result = stub_diagnose(tool_output)
     # under-provisioned-replicas fallback -- mirrors agent.py's own
     # /diagnose endpoint exactly, same reason (see
@@ -523,7 +538,7 @@ def diagnose(req: HandleRequest):
         llm_result = {"status": "llm_unavailable", "llm_diagnosis": None,
                        "failed_attempts": [], "detail": "WARDENCE_STUB_ONLY set -- LLM call skipped"}
     else:
-        llm_tools = _build_llm_tools(req.target, req.namespace)
+        llm_tools = _build_llm_tools(req.target, req.namespace, snapshot_at=req.snapshot_at)
         _t0 = time.perf_counter()
         llm_result = run_react_diagnosis(req.target, req.namespace, llm_tools, episode_id=req.episode_id)
         # Real wall-clock duration of the primary chain's own call

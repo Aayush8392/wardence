@@ -29,10 +29,12 @@ Usage:
 """
 
 import datetime
+import os
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import jwt
@@ -61,10 +63,21 @@ from trust_engine import (  # noqa: E402
 # /admin/reset-catalogue-baseline below. Same direct-import pattern
 # run_batch_plan.py's own BASELINE_CHECKS already uses, not a subprocess
 # call -- these are plain kubectl-wrapping functions.
+#
+# The 4 evidence-check helpers + 1 constant below (added for Phase 1's
+# async wrapper, Kimi review 33/36) are the SAME real production checks
+# injector.py's own verification already uses for crash-loop/
+# cpu-throttling -- reused directly rather than reimplemented, so the
+# early-exit unlock condition can never quietly drift from what the
+# injector itself considers "confirmed."
 from injector import (  # noqa: E402
+    CPU_THROTTLE_MIN_PERIODS_INCREASE,
     FAULT_CONFIG,
+    _cfs_throttled_periods,
+    _crash_loop_backoff_now,
     _ensure_catalogue_replica_baseline,
     _ensure_oom_baseline,
+    _restart_count,
 )
 
 
@@ -113,13 +126,41 @@ IMPLEMENTED_CLASSES = {
     "network-latency", "memory-leak", "connection-pool-exhaustion",
     "network-partition", "init-failure", "session-cart-failure",
 }
-# The 6 auto-fix classes -- all ops-level, RBAC-caged, reversible actions,
-# a consistent blast-radius bound. Report-only classes stay admin-only:
-# several involve real resource pressure (e.g. connection-pool-exhaustion's
-# DB flood) with no bounded auto-fix to clean up after, unlike the auto-fix
-# set. Decided 2026-08-06, expanding the original 2026-07-24 3-class set
-# (crash-loop/oom/disk-full) to the full auto-fix roster.
-SAFE_DEMO_CLASSES = {
+# RE-OPENED to the full 12-class roster, 2026-08-1x -- the original
+# 2026-08-06 admin-only restriction on report-only classes (reasoning:
+# "no bounded auto-fix to clean up after, unlike the auto-fix set") was
+# re-examined and found weaker than it sounded at the time: all 6
+# report-only injector functions are confirmed self-timed and
+# self-reverting by construction (a `finally` block cleans up
+# unconditionally once duration_s elapses -- extensively validated
+# across this project's own Operator design saga, no exception ever
+# found), so there's no scenario where a report-only class "gets stuck"
+# the way the original reasoning implied. If anything, the 6 auto-fix
+# classes are the ones that mutate the live cluster (patch_memory_limit,
+# scale_deployment, real kubectl patches) -- report-only classes never
+# dispatch anything at all. Real, expected demo-trigger volume is low
+# enough that the one narrower legitimate concern left (connection-pool-
+# exhaustion's MySQL flood and memory-leak's elevated memory both apply
+# real shared-resource pressure during their hold, unlike the
+# single-pod-contained classes) isn't worth gating on for this project's
+# actual scale.
+SAFE_DEMO_CLASSES = set(IMPLEMENTED_CLASSES)
+
+# Real fix, same session: AUTO_FIX_CLASSES used to be implicit --
+# _run_live_episode_inner's report-only-vs-auto-fix branch reused
+# SAFE_DEMO_CLASSES as a stand-in for "has a real fix action," which
+# only worked by coincidence while SAFE_DEMO_CLASSES happened to equal
+# exactly the 6 auto-fix classes. The moment SAFE_DEMO_CLASSES was
+# widened above (to unlock all 12 for demo-trigger), that coincidence
+# broke silently -- confirmed via a real live test the same session:
+# connection-pool-exhaustion (report-only, no fix) sat in awaiting_fix
+# for 296s (nearly the full 5-minute abandonment ceiling) instead of
+# auto-chaining to resolved in ~0s, because the branch now read it as
+# an auto-fix class. A real, separate constant closes this for good --
+# these two concepts (which classes demo-trigger may use vs. which
+# classes have an actual fix to dispatch) are independent and must
+# never be conflated again.
+AUTO_FIX_CLASSES = {
     "crash-loop", "oom", "disk-full",
     "cpu-throttling", "under-provisioned-replicas", "bad-rollout",
 }
@@ -304,59 +345,244 @@ RESOLVE_SAFETY_BUFFER_S = 5
 # isn't a fair reflection of the agent -- the episode is simply never
 # scored (matches this project's standing "refuse rather than corrupt"
 # principle, same as injector.py's own total-failure handling).
+#
+# NOTE, Phase 1 async redesign: this constant is currently unused by the
+# real trigger flow below (report-only classes' own extended hold
+# durations already exceed it, and auto-fix classes now settle-wait +
+# score via _attempt_resolve's own SETTLE_SECONDS handling regardless of
+# elapsed time). Left in place, not deleted -- still documents the real
+# reasoning behind SETTLE_SECONDS/RESOLVE_SAFETY_BUFFER_S, and may be
+# reintroduced as an explicit guard if a future session decides one is
+# still warranted for a genuinely abandoned-then-revived episode.
 RESOLVE_WINDOW_MAX_S = 180
 
-# Real concurrency guard, shared across BOTH /trigger/inject and
-# /trigger/resolve (2026-07-24, found during checklist review before the
-# two-phase flow was ever tested). The DB-backed checks each endpoint
-# already has (_episode_in_flight for inject, the "already scored" query
-# for resolve) both have the same blind spot: they can only see a row
-# that's already been WRITTEN. Neither can see work that's currently
-# running but hasn't produced a row yet --
-#   - inject: no episodes row exists until injector.py's subprocess
-#     finishes, so a fast double-click (or two different classes clicked
-#     back-to-back) can start TWO concurrent injector.py runs against the
-#     cluster before either check would catch it.
-#   - resolve: no scores row exists until p3_scorer.py's subprocess
-#     finishes, so a fast double-click can run the scorer twice,
-#     concurrently, against the same episode -- for an auto-fix class
-#     that means the real fix action could genuinely fire twice and
-#     trust_engine.record_outcome could double-count one real outcome
-#     into the streak.
-# One shared flag (not two separate per-phase ones) because the real
-# invariant is "only one episode in flight, in ANY phase, system-wide" --
-# the same invariant _episode_in_flight already enforces for the window
-# AFTER a row exists. Checked-and-set atomically under the lock so two
-# near-simultaneous requests can't both pass the check before either
-# marks itself busy.
-_TRIGGER_BUSY: dict | None = None  # {"phase": "injecting" | "resolving", "detail": str} or None while idle
+# Real concurrency guard for the row-CREATION race only (Kimi review 36
+# finding 12 -- narrowed scope from the old design's broader in-memory
+# busy flag, now that episode_state IS the real source of truth for
+# "something's in flight" once a row exists). Two near-simultaneous
+# /trigger/inject calls could both query _episode_in_flight, both see
+# nothing non-terminal, and both proceed to insert a row and start an
+# injector.py subprocess before either write lands -- this lock's ONLY
+# job is closing that millisecond-scale window between "check the DB"
+# and "the new row exists." Once the row exists, _episode_in_flight
+# (querying episode_state) is the real guard for everything after that,
+# same as the DB-backed "already scored" check already guards
+# double-resolving. Not used anywhere else -- resolving/holding/
+# abandon-flag state all live in the DB, not behind this lock.
 _TRIGGER_LOCK = threading.Lock()
 
-
-def _try_acquire_trigger_busy(phase: str, detail: str) -> bool:
-    global _TRIGGER_BUSY
-    with _TRIGGER_LOCK:
-        if _TRIGGER_BUSY is not None:
-            return False
-        _TRIGGER_BUSY = {"phase": phase, "detail": detail}
-        return True
-
-
-def _release_trigger_busy() -> None:
-    global _TRIGGER_BUSY
-    with _TRIGGER_LOCK:
-        _TRIGGER_BUSY = None
+# Tracks the live 5-minute abandonment Timer for whichever episode is
+# currently awaiting_fix, keyed by episode_id (Kimi review 37 finding 7)
+# -- without this, a Timer that lost the Gate 2 CAS to a manual resolve
+# just sits alive for the remainder of its 5 minutes before firing and
+# silently no-op'ing, a real (if harmless) leak on a 24/7 process. Only
+# ever holds one real entry at a time given the single-episode-in-flight
+# invariant, but keyed by episode_id rather than a single global
+# variable so a stale reference can never be popped/cancelled against
+# the wrong episode.
+_ABANDON_TIMERS: dict[str, threading.Timer] = {}
 
 # p3_scorer.py's own agent request timeout is already 180s (durability
 # windows run up to 3 min for oom -- see p3_scorer.py's docstring); give
 # the subprocess itself real margin beyond that, not a tight guess.
 SCORER_TIMEOUT_S = 400
 
+# Where the wrapper thread's DB-to-file bridge writes the early-exit
+# signal injector.py's crash-loop/cpu-throttling hold loops check
+# (Kimi review 36 finding 2/7 -- a file, not a DB poll, since injector.py
+# has no DB connection). One file per episode so a stale leftover file
+# from a previous episode can never fire on the wrong one.
+STOP_FILE_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_stop_files"
+STOP_FILE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Real per-episode injector.py output, for live debugging (see
+# _run_live_episode_inner's Popen call for why this replaced an
+# earlier DEVNULL/PIPE attempt). Not auto-cleaned -- small, human-
+# readable text files, left for manual inspection/cleanup same as the
+# stop-file convention.
+LIVE_TRIGGER_LOG_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_trigger_logs"
+LIVE_TRIGGER_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _stop_file_path(episode_id: str) -> Path:
+    return STOP_FILE_DIR / f"wardence_stop_{episode_id}"
+
+
+def _evidence_file_path(episode_id: str) -> Path:
+    """Same dir/naming convention as _stop_file_path, opposite
+    direction -- report-only classes' injector.py writes THIS file
+    (never the wrapper), the wrapper only ever reads it."""
+    return STOP_FILE_DIR / f"wardence_evidence_{episode_id}"
+
+
+# Real episode-state-machine substrate for Operator's live-trigger flow
+# (Phase 1 item 4, locked design -- see wardence_frontend.md's Operator
+# saga, reviewed via Kimi review 35). ONLY operator_api.py ever writes
+# these columns -- injector.py stays fully agnostic (it never references
+# them, per Kimi review 35 finding 3's ownership split), so the migration
+# only needs to live here, not duplicated into injector.py's own
+# connection setup. Additive/nullable, same convention as every other
+# migration in this codebase (llm_replay_test.py/quota_tracker.py/
+# p3_scorer.py) -- existing rows (all real batch episodes) keep every
+# new column NULL/default forever, since this machinery is Operator-only.
+#
+# Uses try/except OperationalError instead of the usual PRAGMA-table_info
+# check-then-add pattern (Kimi review 35 finding 3): PRAGMA-then-add is
+# not atomic across processes -- two processes racing to add the same
+# missing column on a fresh DB can both pass the check before either
+# commits, and the loser crashes with "duplicate column name" instead of
+# silently no-op'ing. try/except is safe under that race; PRAGMA-then-add
+# is not.
+_EPISODE_STATE_COLUMNS = [
+    # NULL for every batch-run episode (run_batch_plan.py never touches
+    # this) -- one of injecting/holding/awaiting_fix/resolving/resolved/
+    # failed for a live-triggered one. 'failed' exists because the async
+    # wrapper pre-creates this row before injector.py runs (so there's a
+    # DB-backed in-flight signal during injection itself) -- if
+    # injector.py then fails, the row needs a terminal state to land in
+    # rather than being deleted (which would erase the audit trail of a
+    # real attempt that already consumed rate-limit budget and cluster
+    # time).
+    ("episode_state", "TEXT"),
+    # ISO timestamp of the last state transition -- what real
+    # startup-reconciliation recomputes elapsed time from after an API
+    # restart, instead of losing all in-flight timer state to the crash
+    # (this project has hit exactly that shape of bug once already, the
+    # uvicorn-crash-left-port-8002-held incident).
+    ("state_entered_at", "TEXT"),
+    # Gate 1: checked by the crash-loop/cpu-throttling injection loop at
+    # its own ~10s tick during 'holding' only. Set by either the user's
+    # early "Diagnose & Fix" click or an abandon signal (logout/tab-
+    # close) arriving mid-hold -- whichever sets it first wins, the
+    # second setter is a harmless no-op.
+    ("stop_hold_requested", "INTEGER NOT NULL DEFAULT 0"),
+    # Drives Gate 2's auto-fire (the awaiting_fix -> resolving atomic
+    # transition) alongside a manual click and the 5-minute abandonment
+    # ceiling -- all three attempt the identical CAS, whichever claims
+    # it first wins, the rest silently no-op.
+    ("abandon_requested", "INTEGER NOT NULL DEFAULT 0"),
+    # manual | auto_resolve, set atomically with the resolved transition
+    # (never by p3_scorer.py, which stays agnostic same as injector.py --
+    # see Kimi review 35 finding 8). Observability only, never affects
+    # scoring -- both are equally real episodes.
+    ("triggered_by", "TEXT"),
+    # NULL for batch episodes, or once the subprocess exits. Lets
+    # startup-reconciliation distinguish "subprocess still genuinely
+    # running" from "subprocess died without updating state" via
+    # os.kill(pid, 0), instead of guessing purely from elapsed time
+    # against INJECT_SUBPROCESS_TIMEOUT_S (Kimi review 35 finding 1).
+    ("subprocess_pid", "INTEGER"),
+    # crash-loop/cpu-throttling only (Kimi review 33's original design,
+    # wired for real here). While episode_state='holding', a background
+    # poll (folded into the same Popen-wait loop that owns the
+    # subprocess, per Kimi review 36 finding 7 -- no separate thread)
+    # checks the class's real production evidence field every ~10s
+    # (crash-loop: real restartCount delta; cpu-throttling: the same
+    # raw CFS-throttle-periods delta injector.py's own verification
+    # already uses). Once confirmed, this flips to 1 and the frontend's
+    # live-status poll unlocks the "Diagnose & Fix early" button.
+    ("evidence_confirmed", "INTEGER NOT NULL DEFAULT 0"),
+    # Set at row pre-creation from the triggering request's own JWT
+    # payload. Lets POST /logout (Kimi review 36 finding 8: best-effort,
+    # never a hard dependency for correctness -- the 5-minute ceiling is
+    # the real, reliable auto-resolve mechanism regardless) check
+    # whether the account logging out actually owns the one episode
+    # currently in flight before setting abandon_requested, rather than
+    # any logged-in user's logout abandoning someone else's episode.
+    ("triggering_username", "TEXT"),
+]
+
+# Non-terminal episode_state values -- an explicit allow-list, not a
+# "!= resolved" exclusion (Kimi review 35 finding 2): SQL's
+# `episode_state != 'resolved'` is true for NULL too only by accident of
+# how NULL comparisons behave, and silently mis-including a future new
+# terminal state (this project already added 'failed' on top of the
+# original 5-state list) is exactly the kind of bug an explicit list
+# fails loudly on instead. 'abandoned' is deliberately NOT a distinct
+# state (Kimi review 36 finding 4) -- a report-only episode abandoned
+# mid-injection lands in 'failed' with triggered_by='abandoned', reusing
+# the same terminal state and the same observability field rather than
+# growing the state enum for a case that's really just one more reason
+# an episode didn't reach 'resolved'.
+NON_TERMINAL_EPISODE_STATES = {"injecting", "holding", "awaiting_fix", "resolving"}
+TERMINAL_EPISODE_STATES = {"resolved", "failed"}
+
+# The 8 classes with a genuinely extendable, early-exit-capable hold --
+# crash-loop/cpu-throttling (Kimi review 33's original locked design)
+# plus all 6 report-only classes (same session extension, after
+# confirming each one's own injector function already has a real
+# verification step whose "confirmed" moment can be signaled out).
+# Every other auto-fix class (oom/disk-full/under-provisioned-replicas/
+# bad-rollout) goes straight from injecting to awaiting_fix once its
+# own subprocess call returns -- no extendable hold to interrupt.
+HOLDING_CLASSES = {
+    "crash-loop", "cpu-throttling",
+    "network-latency", "network-partition", "memory-leak",
+    "connection-pool-exhaustion", "init-failure", "session-cart-failure",
+}
+
+# Real bug found and fixed the same session: FAULT_CONFIG's own
+# duration_s for every one of these 8 classes is its ORIGINAL,
+# pre-Operator-extension value (crash-loop 40s, cpu-throttling/
+# network-latency/network-partition/init-failure/session-cart-failure
+# 60s, memory-leak 100s) -- the real 180s/300s durations locked across
+# several earlier design sessions (live-tested, safety-verified) were
+# only ever applied via --duration-override in one-off test scripts,
+# never wired into the actual live-trigger wrapper. Confirmed live,
+# same session: a real connection-pool-exhaustion trigger's own log
+# showed "holding for the full 60s window", not 180s -- every holding-
+# class test run tonight before this fix used the wrong, short
+# duration. Passed explicitly here rather than editing FAULT_CONFIG
+# itself, matching the existing --duration-override convention (a
+# fresh per-run cfg copy, FAULT_CONFIG never mutated) -- batch runs are
+# UNAFFECTED, this dict is only ever consulted for live triggers.
+LIVE_TRIGGER_DURATION_OVERRIDE_S = {
+    "crash-loop": 180,
+    "cpu-throttling": 300,
+    "network-latency": 180,
+    "network-partition": 180,
+    "connection-pool-exhaustion": 180,
+    "session-cart-failure": 180,
+    "memory-leak": 180,
+    "init-failure": 180,
+}
+
+# Two different real evidence SOURCES for the 8 holding classes, not
+# one -- crash-loop/cpu-throttling's evidence is a cheap Prometheus
+# read the wrapper can safely re-run on its own every tick (see
+# _evidence_confirmed_now). The 6 report-only classes' own evidence
+# checks are active, real-cost probes (a throwaway pod, an actual mysql
+# connection attempt) -- re-running those from the wrapper in parallel
+# would double real load and risk skewing the very signal being
+# measured, so instead injector.py itself writes an evidence-file the
+# moment ITS OWN real verification first confirms, and the wrapper just
+# polls for that file's existence.
+WRAPPER_POLLED_EVIDENCE_CLASSES = {"crash-loop", "cpu-throttling"}
+EVIDENCE_FILE_CLASSES = HOLDING_CLASSES - WRAPPER_POLLED_EVIDENCE_CLASSES
+
+# 5-minute abandonment ceiling (Kimi review 33/36, matches the
+# durability verifier's own existing upper bound for
+# memory-leak/cascading-dependency-failure -- not an arbitrary new
+# number). Fires the awaiting_fix -> resolving CAS automatically if
+# nobody clicks "Diagnose & Fix" first.
+ABANDON_CEILING_S = 300
+
+
+def _ensure_episode_state_columns(conn) -> None:
+    for col, decl in _EPISODE_STATE_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE episodes ADD COLUMN {col} {decl}")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+    conn.commit()
+
 
 def _conn():
     conn = sqlite3.connect(DB_PATH)
     ensure_trust_tables(conn)
     accounts.ensure_accounts_tables(conn)
+    _ensure_episode_state_columns(conn)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS operator_audit (
@@ -424,45 +650,50 @@ def trust(request: Request, payload: dict = Depends(require_role("admin", "demo-
     return {"states": states}
 
 
-# Mirrors p3_scorer.py's MAX_EPISODE_AGE_MINUTES -- found the SAME class
-# of bug here (2026-07-22) that p3_scorer.py already had to fix once
-# before: this query originally had no staleness bound at all, so a
-# genuinely stale, long-abandoned unscored episode (e.g. a leftover from
-# an earlier manual test) would report "in flight" forever, permanently
-# blocking demo-trigger with a 429 even though nothing was actually
-# running. Anything older than this is treated as abandoned, not in
-# flight -- same reasoning as p3_scorer.py's own fix.
-#
-# Lowered from 10 to 4 minutes (2026-07-24, real bug found during Phase B
-# testing): the ORIGINAL 10-minute number was never grounded in real
-# diagnosis behavior -- see RESOLVE_WINDOW_MAX_S below, which is the real,
-# newly-added hard limit on how long a fault stays genuinely diagnosable
-# (~3 minutes, derived from agent.py's actual PromQL lookback windows).
-# Leaving this at 10 would have created a real dead zone: an episode
-# correctly refused by /trigger/resolve as "too old to score" would still
-# report episode_in_flight=True for up to 6 more minutes, blocking a fresh
-# inject even after the system had already told the user the old one was
-# a lost cause. 4 minutes gives a small buffer above RESOLVE_WINDOW_MAX_S
-# (180s) without reintroducing that gap.
-EPISODE_IN_FLIGHT_MAX_AGE_MINUTES = 4
+# SUPERSEDED, 2026-08-1x -- was an age-based heuristic on the
+# t0-vs-scores-row gap (originally 10 minutes, lowered to 4 in the
+# 2026-07-24 Phase B session). Confirmed via real arithmetic (Kimi
+# review 35 finding 4) to be genuinely wrong once holding classes exist:
+# cpu-throttling's real worst case is up to 300s hold + 35s settle + 300s
+# abandonment ceiling = 635s -- almost 3x this heuristic's 240s bound.
+# _episode_in_flight below now queries episode_state directly (exact,
+# not a guess) -- this constant is kept only as a legacy fallback for
+# rows with episode_state IS NULL (pre-migration batch episodes have no
+# state at all, and would otherwise be invisible to this check forever;
+# in practice batch rows are always already scored by the time anyone
+# calls this, so the fallback rarely if ever fires).
+LEGACY_EPISODE_IN_FLIGHT_MAX_AGE_MINUTES = 4
 
 
 def _episode_in_flight(conn) -> bool:
+    """Exact, not heuristic (Kimi review 35 finding 4): a live-triggered
+    episode is in flight iff its episode_state is one of the real
+    non-terminal states -- no age guessing involved. The legacy age
+    check below only ever applies to episode_state IS NULL rows (see
+    LEGACY_EPISODE_IN_FLIGHT_MAX_AGE_MINUTES's own comment)."""
+    placeholders = ",".join("?" for _ in NON_TERMINAL_EPISODE_STATES)
     row = conn.execute(
+        f"SELECT 1 FROM episodes WHERE episode_state IN ({placeholders}) LIMIT 1",
+        tuple(NON_TERMINAL_EPISODE_STATES),
+    ).fetchone()
+    if row is not None:
+        return True
+
+    legacy_row = conn.execute(
         """
         SELECT e.episode_id, e.t0 FROM episodes e
         LEFT JOIN scores s ON e.episode_id = s.episode_id
-        WHERE s.episode_id IS NULL
+        WHERE s.episode_id IS NULL AND e.episode_state IS NULL
         ORDER BY e.t0 DESC
         LIMIT 1
         """
     ).fetchone()
-    if row is None:
+    if legacy_row is None:
         return False
-    _, t0_str = row
+    _, t0_str = legacy_row
     t0 = datetime.datetime.fromisoformat(t0_str)
     age_minutes = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds() / 60
-    return age_minutes <= EPISODE_IN_FLIGHT_MAX_AGE_MINUTES
+    return age_minutes <= LEGACY_EPISODE_IN_FLIGHT_MAX_AGE_MINUTES
 
 
 def _global_triggers_today(conn) -> int:
@@ -510,6 +741,382 @@ def trigger_status(request: Request):
     }
 
 
+# Whitelist for _set_episode_state's **extra columns (Kimi review 37
+# finding 8) -- every current call site passes a hardcoded literal
+# keyword (triggered_by=, subprocess_pid=), never anything derived from
+# request input, so this isn't exploitable today. Enforced anyway: the
+# column names get interpolated directly into the SQL SET clause below,
+# and a whitelist is what keeps that permanently true rather than
+# relying on every future caller remembering not to pass anything
+# untrusted.
+_SET_EPISODE_STATE_ALLOWED_EXTRA_KEYS = {"subprocess_pid", "triggered_by", "evidence_confirmed"}
+
+
+def _set_episode_state(conn, episode_id: str, state: str, **extra) -> None:
+    """Every state transition goes through this one function -- keeps
+    state_entered_at updated on EVERY transition (load-bearing: Kimi
+    review 36 finding 11 confirms reconciliation's Timer-remaining math
+    depends on this being genuinely true), and gives every transition a
+    single audit point instead of ad-hoc UPDATEs scattered per call
+    site."""
+    cols = ["episode_state", "state_entered_at"]
+    vals = [state, datetime.datetime.now(datetime.timezone.utc).isoformat()]
+    for k, v in extra.items():
+        if k not in _SET_EPISODE_STATE_ALLOWED_EXTRA_KEYS:
+            raise ValueError(f"_set_episode_state: '{k}' is not an allowed extra column")
+        cols.append(k)
+        vals.append(v)
+    set_clause = ", ".join(f"{c} = ?" for c in cols)
+    conn.execute(f"UPDATE episodes SET {set_clause} WHERE episode_id = ?", (*vals, episode_id))
+    conn.commit()
+
+
+def _evidence_confirmed_now(fault_class: str, cfg: dict, baseline_restarts: int, baseline_periods: int) -> bool:
+    """Single-poll evidence check for the 2 holding classes -- reuses
+    injector.py's own real production checks directly (see the import
+    block above), confirmed structurally safe for a single poll (not a
+    consecutive-poll guard) by Kimi review 33: crash-loop's restartCount
+    is a monotonic past-event latch, cpu-throttling's own injector-side
+    verification already uses a raw instant-counter delta, not a
+    windowed PromQL query, so neither can false-positive on a transient
+    blip the way a windowed check could."""
+    if fault_class == "crash-loop":
+        target, namespace = cfg["target"], cfg["namespace"]
+        return _restart_count(target, namespace) > baseline_restarts or _crash_loop_backoff_now(target, namespace)
+    if fault_class == "cpu-throttling":
+        current = _cfs_throttled_periods(cfg["target"], cfg["namespace"], cfg["container"])
+        return current - baseline_periods >= CPU_THROTTLE_MIN_PERIODS_INCREASE
+    return False
+
+
+def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
+    """Gate 2 (Kimi review 35/36's locked design): the ONE atomic CAS
+    every trigger for moving awaiting_fix -> resolving goes through --
+    a manual /trigger/resolve click, the 5-minute abandonment Timer
+    firing, or (for report-only classes) the wrapper thread itself
+    immediately after its own subprocess exits. Whichever call wins the
+    UPDATE's rowcount, every other call silently no-ops -- no pairwise
+    special-casing needed. Runs the scorer subprocess and the terminal
+    transition; always called off the request thread (either already
+    inside the background wrapper thread, or spawned into a fresh one
+    by /trigger/resolve so a manual click never blocks its own HTTP
+    response on the scorer's own up-to-500s runtime)."""
+    conn = _conn()
+    cur = conn.execute(
+        "UPDATE episodes SET episode_state = 'resolving', state_entered_at = ? "
+        "WHERE episode_id = ? AND episode_state = 'awaiting_fix'",
+        (datetime.datetime.now(datetime.timezone.utc).isoformat(), episode_id),
+    )
+    conn.commit()
+    won = cur.rowcount > 0
+    if not won:
+        conn.close()
+        return False
+
+    # Real fix, Kimi review 37 finding 7: whichever caller actually wins
+    # Gate 2's CAS is what should own cancelling the abandonment Timer,
+    # since it's the only caller that can be sure the Timer's own future
+    # fire would just be a wasted no-op (win == the Timer either already
+    # fired and lost, or hasn't fired yet and now definitely will lose).
+    # .pop with a default so this is a no-op if no Timer was ever
+    # tracked for this episode (report-only classes never start one).
+    timer = _ABANDON_TIMERS.pop(episode_id, None)
+    if timer is not None:
+        timer.cancel()
+
+    t0_row = conn.execute("SELECT t0 FROM episodes WHERE episode_id = ?", (episode_id,)).fetchone()
+    conn.close()
+    t0 = datetime.datetime.fromisoformat(t0_row[0])
+    # Real evidence-freezing timestamp -- the moment evidence was
+    # genuinely ready (t0 + SETTLE_SECONDS), computed here regardless of
+    # how much real wall-clock time passes AFTER this point waiting for
+    # a manual resolve click or the abandonment ceiling. This is the
+    # actual fix for a genuine live-tested bug: a real crash-loop
+    # episode's restart evidence aged out of agent.py's own [3m]
+    # diagnosis query because the real elapsed time from injection to
+    # diagnosis (holding's own duration + up to the full 300s ceiling)
+    # can exceed 8 minutes -- the query was always evaluated against
+    # live "now", however much later "now" turned out to be. Passed
+    # through to p3_scorer.py --snapshot-at -> p3_agent.py /diagnose ->
+    # every PromQL query in agent.py's query_prometheus, all of which
+    # now evaluate against this fixed point instead of live "now".
+    snapshot_at = (t0 + datetime.timedelta(seconds=SETTLE_SECONDS)).isoformat()
+    elapsed_s = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds()
+    remaining_s = SETTLE_SECONDS - elapsed_s
+    if remaining_s > 0:
+        time.sleep(remaining_s + RESOLVE_SAFETY_BUFFER_S)
+
+    try:
+        scorer_result = subprocess.run(
+            [sys.executable, str(SCORER_PATH), "--episode-id", episode_id, "--snapshot-at", snapshot_at],
+            cwd=str(SCORER_CWD),
+            capture_output=True,
+            text=True,
+            timeout=SCORER_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        conn = _conn()
+        # p3_scorer.py stays agnostic to episode_state (Kimi review 35
+        # finding 8, same "the row's own transitions are the wrapper's
+        # job, not the tool it calls" split as injector.py) -- the
+        # wrapper performs the terminal transition itself, here, after
+        # the subprocess call returns/fails.
+        _set_episode_state(conn, episode_id, "failed", triggered_by=triggered_by)
+        conn.close()
+        return True
+
+    conn = _conn()
+    if scorer_result.returncode != 0:
+        _set_episode_state(conn, episode_id, "failed", triggered_by=triggered_by)
+        conn.close()
+        return True
+
+    # Terminal transition + triggered_by set together (Kimi review 35
+    # finding 8) -- the very next statement after the scorer subprocess
+    # returns 0, with nothing else able to interleave on this episode_id
+    # (Gate 2 already guarantees only one resolve is ever in flight).
+    _set_episode_state(conn, episode_id, "resolved", triggered_by=triggered_by)
+    conn.close()
+
+    # Runs from inside this background thread, never the request thread
+    # -- the ~12s real cost (measured, see wardence_frontend.md's
+    # Operator saga) never blocks an HTTP response now, which is most of
+    # what the earlier "fire-and-forget + completion-poll" design was
+    # solving for. A completion-signal poll for the frontend (so it
+    # never shows stale R2-sourced data on an immediate tab-switch) is
+    # still real future work, not built here -- out of scope for this
+    # step, flagged, not silently dropped.
+    _republish_to_r2()
+    return True
+
+
+def _run_live_episode(episode_id: str, fault_class: str, cfg: dict) -> None:
+    """Real top-level exception guard (Kimi review 37 finding 2) around
+    the actual logic in _run_live_episode_inner. Without this, ANY
+    exception inside the background thread (a DB hiccup, a Prometheus
+    blip during evidence polling, a disk-full write to the stop-file)
+    kills the thread silently and leaves the row stuck in a
+    non-terminal state -- which, since _episode_in_flight checks
+    exactly that state set, would deadlock every future trigger until
+    someone notices and does manual DB surgery."""
+    try:
+        _run_live_episode_inner(episode_id, fault_class, cfg)
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+        print(f"FATAL: _run_live_episode crashed for episode {episode_id}: {exc}")
+        try:
+            conn = _conn()
+            _set_episode_state(conn, episode_id, "failed")
+            conn.close()
+        except Exception as inner_exc:  # noqa: BLE001
+            print(f"  additionally failed to mark episode {episode_id} failed: {inner_exc}")
+
+
+def _run_live_episode_inner(episode_id: str, fault_class: str, cfg: dict) -> None:
+    """Everything from spawning injector.py through the terminal state
+    transition -- off the request thread (Kimi review 36 findings 2/7:
+    Popen, not subprocess.run, so the PID is real and evidence-polling
+    folds into the same wait loop instead of a second thread)."""
+    stop_file = _stop_file_path(episode_id)
+    evidence_file = _evidence_file_path(episode_id)
+    holding = fault_class in HOLDING_CLASSES
+    wrapper_polled = fault_class in WRAPPER_POLLED_EVIDENCE_CLASSES
+    evidence_file_class = fault_class in EVIDENCE_FILE_CLASSES
+    cmd = [sys.executable, str(INJECTOR_PATH), "--class", fault_class, "--episode-id", episode_id]
+    if fault_class in LIVE_TRIGGER_DURATION_OVERRIDE_S:
+        cmd += ["--duration-override", str(LIVE_TRIGGER_DURATION_OVERRIDE_S[fault_class])]
+    if holding:
+        cmd += ["--stop-file", str(stop_file)]
+    if evidence_file_class:
+        cmd += ["--evidence-file", str(evidence_file)]
+
+    baseline_restarts = baseline_periods = None
+    if fault_class == "crash-loop":
+        baseline_restarts = _restart_count(cfg["target"], cfg["namespace"])
+    elif fault_class == "cpu-throttling":
+        baseline_periods = _cfs_throttled_periods(cfg["target"], cfg["namespace"], cfg.get("container"))
+
+    # A real per-episode LOG FILE, not PIPE and not DEVNULL (refined
+    # same session after a real failed episode showed DEVNULL threw
+    # away exactly the debugging info needed to understand why). PIPE
+    # was the original bug (Kimi review 37 finding 1): nothing in this
+    # loop reads the child's stdout/stderr, and once combined output
+    # exceeds the OS pipe buffer (~64KiB typical), the child blocks on
+    # write() forever, since the parent only calls proc.poll(), never
+    # drains it. A file has no such buffer limit -- writing to disk
+    # never blocks the child the way an unread pipe does -- so this
+    # keeps the real fix (no deadlock risk) while restoring real
+    # visibility into injector.py's own prints for live debugging.
+    log_path = LIVE_TRIGGER_LOG_DIR / f"episode_{episode_id}.log"
+    log_file = open(log_path, "w")
+    proc = subprocess.Popen(cmd, cwd=str(INJECTOR_CWD), stdout=log_file, stderr=subprocess.STDOUT)
+
+    conn = _conn()
+    if holding:
+        # For these 2 classes, "injection lands" and "the extended hold
+        # begins" are the same real-world moment -- the kill loop/
+        # stressor starts immediately inside injector.py's own subprocess,
+        # there's no separate confirmation step to wait for first.
+        _set_episode_state(conn, episode_id, "holding", subprocess_pid=proc.pid)
+    else:
+        conn.execute("UPDATE episodes SET subprocess_pid = ? WHERE episode_id = ?", (proc.pid, episode_id))
+        conn.commit()
+    conn.close()
+
+    inject_timeout_s = INJECT_SUBPROCESS_TIMEOUT_S.get(fault_class, DEFAULT_INJECT_SUBPROCESS_TIMEOUT_S)
+    deadline = time.time() + inject_timeout_s
+    timed_out = False
+    while proc.poll() is None:
+        if time.time() > deadline:
+            # Graceful first (Kimi review 36 finding 3): a bare SIGKILL
+            # never lets injector.py's own finally-block chaos-resource
+            # cleanup run at all -- terminate() (SIGTERM) gives it the
+            # chance; only escalate to kill() if it doesn't take the
+            # hint. This is the real fix for the leaked-StressChaos risk
+            # a plain subprocess.run(timeout=X) has today.
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            timed_out = True
+            break
+        if holding:
+            conn = _conn()
+            row = conn.execute(
+                "SELECT evidence_confirmed, stop_hold_requested, abandon_requested FROM episodes "
+                "WHERE episode_id = ?",
+                (episode_id,),
+            ).fetchone()
+            confirmed_already, stop_requested, abandon_flag = row
+            if not confirmed_already:
+                newly_confirmed = (
+                    _evidence_confirmed_now(fault_class, cfg, baseline_restarts or 0, baseline_periods or 0)
+                    if wrapper_polled
+                    else evidence_file_class and evidence_file.exists()
+                )
+                if newly_confirmed:
+                    conn.execute(
+                        "UPDATE episodes SET evidence_confirmed = 1 WHERE episode_id = ?", (episode_id,)
+                    )
+                    conn.commit()
+            # This tick loop is the SOLE writer of the stop-file (Kimi
+            # review 36 finding 10, simplified from its dual-write
+            # proposal): both a manual /trigger/stop-hold click and an
+            # abandon signal (logout/the 5-min ceiling, though the
+            # ceiling only ever fires post-hold in practice) just set a
+            # DB flag; this loop is what converts either flag into the
+            # real file injector.py is watching, on its own next ~10s
+            # tick. Structurally cannot produce Kimi's "file exists but
+            # DB flag wasn't written yet" crash race, since the file is
+            # never written before the DB flag that causes it -- the
+            # ordering only ever goes one direction. Trade-off accepted:
+            # up to ~10s extra latency vs. writing the file synchronously
+            # inside the endpoint handler, judged acceptable for a
+            # "stop early" UX, not a real-time control signal.
+            if (stop_requested or abandon_flag) and not stop_file.exists():
+                stop_file.write_text(str(time.time()))
+            conn.close()
+        time.sleep(10)
+
+    # stop_file left in place after the subprocess exits -- harmless
+    # (episode_id-scoped filename, never reused), cheap to leave for
+    # /tmp's own eventual cleanup rather than adding another failure
+    # path here to remove it.
+    log_file.close()
+    print(f"episode {episode_id}: injector.py output saved to {log_path}")
+
+    conn = _conn()
+    row = conn.execute(
+        "SELECT t0, chaos_resource_name, stop_hold_requested, evidence_confirmed FROM episodes WHERE episode_id = ?",
+        (episode_id,),
+    ).fetchone()
+    t0_written, chaos_name_written, stop_was_requested, was_evidence_confirmed = row
+    # Defensive check (Kimi review 35/36 finding 1), NOT trusting
+    # returncode alone even after injector.py's own sys.exit(1) fix --
+    # this is what actually defends against a future injector.py
+    # regression reintroducing the same bug, not just today's fix.
+    succeeded = not timed_out and proc.returncode == 0 and t0_written is not None and chaos_name_written is not None
+
+    if not succeeded:
+        # Kimi review 37 finding 9 raised a real question: could an
+        # early-stop (holding classes only) win the race against
+        # injector.py's own post-hold verification, so the frontend
+        # already unlocked "Diagnose & Fix" (evidence_confirmed=1) but
+        # injector.py's fresh check somehow disagreed and exited
+        # nonzero? Traced through, not assumed: both this wrapper's
+        # evidence poll (_evidence_confirmed_now) and injector.py's own
+        # verification read the EXACT SAME monotonic, non-resetting
+        # counter (_restart_count for crash-loop, _cfs_throttled_periods
+        # for cpu-throttling -- injector.py's own docstring confirms the
+        # latter is "non-resetting"). Since this wrapper's check runs
+        # strictly BEFORE injector.py's own later re-check of that same
+        # counter, and the counter can only move forward, injector.py's
+        # check cannot see LESS evidence than this wrapper already saw
+        # -- the race Kimi described is structurally impossible against
+        # this code, not just unlikely. Not silently patched over with a
+        # forced-success override (which would be actively wrong here:
+        # t0/chaos_resource_name are still NULL in exactly this failure
+        # path, so forcing 'awaiting_fix' would crash _attempt_resolve's
+        # datetime.fromisoformat(None) a few lines into scoring). Instead:
+        # log loudly if the "impossible" case is ever actually observed,
+        # so a future change that breaks the monotonic assumption is
+        # caught immediately rather than silently mis-scoring episodes.
+        if stop_was_requested and was_evidence_confirmed:
+            print(
+                f"WARNING: episode {episode_id} ({fault_class}) failed injector-side verification "
+                f"despite evidence_confirmed=1 and an early stop having been requested -- this was "
+                f"traced as structurally impossible given the monotonic counters both checks share; "
+                f"if this fires for real, the monotonic assumption has been broken by a code change "
+                f"and needs re-investigating, not just re-suppressing."
+            )
+        _set_episode_state(conn, episode_id, "failed")
+        conn.close()
+        return
+
+    # Real bug, Kimi review 37 finding 5: this check used to live ONLY
+    # inside the report-only branch below, so a user who abandoned mid-
+    # HOLD (crash-loop/cpu-throttling -- the stop-file gets written for
+    # abandon_requested exactly the same as for a manual early-stop
+    # click, see the tick loop above) fell straight through to
+    # awaiting_fix + the 5-minute Timer, silently getting scored once
+    # the ceiling fired despite their explicit abandon. Checked once
+    # here, uniformly, for every class -- covers report-only, holding,
+    # and the other 4 auto-fix classes with one code path instead of
+    # three.
+    abandon_flag = conn.execute(
+        "SELECT abandon_requested FROM episodes WHERE episode_id = ?", (episode_id,)
+    ).fetchone()[0]
+    if abandon_flag:
+        _set_episode_state(conn, episode_id, "failed", triggered_by="abandoned")
+        conn.close()
+        return
+
+    if fault_class not in AUTO_FIX_CLASSES:
+        # A report-only class -- has no real fix action to dispatch.
+        # Passes through awaiting_fix for ~0 real seconds by design (no
+        # manual click exists for these at all, matching the locked
+        # single "Trigger & Diagnose" button spec).
+        _set_episode_state(conn, episode_id, "awaiting_fix")
+        conn.close()
+        _attempt_resolve(episode_id, triggered_by="auto_resolve")
+        return
+
+    _set_episode_state(conn, episode_id, "awaiting_fix")
+    conn.close()
+
+    # 5-minute abandonment ceiling (Kimi review 33/36) -- fires the same
+    # Gate 2 CAS as a manual click; if the user already clicked (or a
+    # different abandon path already won), this attempt just silently
+    # loses the CAS, harmless. Tracked in _ABANDON_TIMERS (Kimi review
+    # 37 finding 7) so a winning manual resolve can cancel it instead of
+    # leaking a live Timer that fires uselessly 5 minutes later.
+    timer = threading.Timer(ABANDON_CEILING_S, _attempt_resolve, args=(episode_id, "auto_resolve"))
+    timer.daemon = True
+    _ABANDON_TIMERS[episode_id] = timer
+    timer.start()
+
+
 @app.post("/trigger/inject")
 def trigger_inject(
     fault_class: str,
@@ -517,15 +1124,18 @@ def trigger_inject(
     payload: dict = Depends(require_role("admin", "demo-trigger")),
 ):
     """
-    Phase 1 of the two-phase trigger flow (2026-07-24, superseding the old
-    single-call /trigger): injects only, returns immediately with the real
-    episode_id + t0. Does NOT settle-wait, diagnose, act, or score -- the
-    caller decides when to move to /trigger/resolve, after visually
-    confirming on the frontend that the fault actually landed. All the
-    same rate-limiting/safety checks the old /trigger had still apply here,
-    unchanged -- they gate INJECTION, not resolution.
+    Real async redesign, Phase 1 item 5 (Kimi reviews 35/36) -- returns
+    almost immediately (sub-second) with just the new episode_id and its
+    starting state; every real cluster mutation (injector.py's
+    subprocess, up to holding's extended hold, the eventual scorer call)
+    happens in a background thread. The frontend polls
+    GET /trigger/live-status for real progress instead of this call
+    itself blocking for up to inject_timeout_s. All the same rate-
+    limiting/safety checks the old synchronous /trigger/inject had still
+    apply here, unchanged -- they gate injection, not resolution.
     """
     role = payload["role"]
+    username = payload.get("username")
     conn = _conn()
     ip = request.client.host
 
@@ -534,256 +1144,363 @@ def trigger_inject(
         conn.close()
         raise HTTPException(400, f"'{fault_class}' has no injector implementation yet")
 
-    # Real concurrency-safety guard, not a fairness/budget one -- applies to
-    # EVERY role, including admin. Two genuinely concurrent injector.py runs
-    # against the same cluster target is a correctness risk (races on pod
-    # selection/baselining, the same class of bug this project already hit
-    # repeatedly with disk-full's settle-wait timing), not something an
-    # admin should be able to bypass just because the cooldown/cap fairness
-    # rules below don't apply to them.
-    if _episode_in_flight(conn):
-        _audit(conn, role, "/trigger/inject", "rejected: episode already in flight", ip)
-        conn.close()
-        raise HTTPException(429, "an episode is already in flight, try again shortly")
+    if role == "demo-trigger":
+        if fault_class not in SAFE_DEMO_CLASSES:
+            _audit(conn, role, "/trigger/inject", f"rejected: '{fault_class}' not in safe subset", ip)
+            conn.close()
+            raise HTTPException(403, f"demo-trigger may only trigger {SAFE_DEMO_CLASSES}")
 
-    # Closes the real gap _episode_in_flight can't see -- see _TRIGGER_BUSY's
-    # module-level comment. Deliberately checked BEFORE the cooldown/cap
-    # bookkeeping below, so a busy-rejection never costs a demo-trigger
-    # caller their cooldown/daily-cap allowance for a request that never
-    # actually ran.
-    if not _try_acquire_trigger_busy("injecting", fault_class):
-        _audit(conn, role, "/trigger/inject", "rejected: another trigger call in progress", ip)
-        conn.close()
-        raise HTTPException(429, "an episode is already in flight, try again shortly")
+        if _global_triggers_today(conn) >= GLOBAL_DAILY_CAP:
+            _audit(conn, role, "/trigger/inject", "rejected: global daily cap reached", ip)
+            conn.close()
+            raise HTTPException(429, f"site-wide daily cap of {GLOBAL_DAILY_CAP} reached, try again tomorrow")
 
-    # Everything from here on has already acquired _TRIGGER_BUSY -- every
-    # exit path (a rejection below, injector failure, or success) MUST
-    # release it, or one rejected/failed call would wedge every future
-    # trigger behind a busy flag nothing will ever clear.
-    try:
-        if role == "demo-trigger":
-            if fault_class not in SAFE_DEMO_CLASSES:
-                _audit(conn, role, "/trigger/inject", f"rejected: '{fault_class}' not in safe subset", ip)
-                conn.close()
-                raise HTTPException(403, f"demo-trigger may only trigger {SAFE_DEMO_CLASSES}")
-
-            if _global_triggers_today(conn) >= GLOBAL_DAILY_CAP:
-                _audit(conn, role, "/trigger/inject", "rejected: global daily cap reached", ip)
-                conn.close()
-                raise HTTPException(429, f"site-wide daily cap of {GLOBAL_DAILY_CAP} reached, try again tomorrow")
-
-            last = conn.execute(
-                "SELECT triggered_at FROM demo_trigger_log WHERE ip = ? ORDER BY triggered_at DESC LIMIT 1",
-                (ip,),
-            ).fetchone()
-            if last is not None:
-                elapsed = conn.execute(
-                    "SELECT (julianday('now') - julianday(?)) * 86400.0", (last[0],)
-                ).fetchone()[0]
-                if elapsed < COOLDOWN_S:
-                    _audit(conn, role, "/trigger/inject", "rejected: cooldown", ip)
-                    conn.close()
-                    raise HTTPException(429, f"cooldown active, wait {COOLDOWN_S - elapsed:.0f}s")
-
-            today_count = conn.execute(
-                "SELECT COUNT(*) FROM demo_trigger_log WHERE ip = ? AND date(triggered_at) = date('now')",
-                (ip,),
+        last = conn.execute(
+            "SELECT triggered_at FROM demo_trigger_log WHERE ip = ? ORDER BY triggered_at DESC LIMIT 1",
+            (ip,),
+        ).fetchone()
+        if last is not None:
+            elapsed = conn.execute(
+                "SELECT (julianday('now') - julianday(?)) * 86400.0", (last[0],)
             ).fetchone()[0]
-            if today_count >= DAILY_CAP:
-                _audit(conn, role, "/trigger/inject", "rejected: daily cap reached", ip)
+            if elapsed < COOLDOWN_S:
+                _audit(conn, role, "/trigger/inject", "rejected: cooldown", ip)
                 conn.close()
-                raise HTTPException(429, f"daily cap of {DAILY_CAP} reached for this IP")
+                raise HTTPException(429, f"cooldown active, wait {COOLDOWN_S - elapsed:.0f}s")
 
+        today_count = conn.execute(
+            "SELECT COUNT(*) FROM demo_trigger_log WHERE ip = ? AND date(triggered_at) = date('now')",
+            (ip,),
+        ).fetchone()[0]
+        if today_count >= DAILY_CAP:
+            _audit(conn, role, "/trigger/inject", "rejected: daily cap reached", ip)
+            conn.close()
+            raise HTTPException(429, f"daily cap of {DAILY_CAP} reached for this IP")
+
+    # Real concurrency-safety guard, applies to EVERY role including
+    # admin -- two genuinely concurrent injector.py runs against the
+    # same cluster target is a correctness risk (races on pod
+    # selection/baselining), not a fairness rule admin should bypass.
+    # Narrowed to just this check-and-insert critical section (Kimi
+    # review 36 finding 12) -- once the row below exists, episode_state
+    # IS the real guard for everything after, not this lock.
+    cfg = dict(FAULT_CONFIG[fault_class])
+    with _TRIGGER_LOCK:
+        if _episode_in_flight(conn):
+            _audit(conn, role, "/trigger/inject", "rejected: episode already in flight", ip)
+            conn.close()
+            raise HTTPException(429, "an episode is already in flight, try again shortly")
+
+        episode_id = str(uuid.uuid4())
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # t0/chaos_resource_name genuinely unknown yet -- NULL, not a
+        # sentinel (Kimi review 35/36 finding 5). injector.py's own
+        # UPSERT (record_episode, called via --episode-id) fills in the
+        # real values once known.
+        conn.execute(
+            "INSERT INTO episodes "
+            "(episode_id, fault_class, target, namespace, t0, chaos_resource_name, "
+            "episode_state, state_entered_at, triggering_username) "
+            "VALUES (?, ?, ?, ?, NULL, NULL, 'injecting', ?, ?)",
+            (episode_id, fault_class, cfg["target"], cfg["namespace"], now, username),
+        )
+        conn.commit()
+
+        if role == "demo-trigger":
             # Cooldown/cap bookkeeping happens on INJECT, not resolve --
             # "an episode was triggered" is the fairness-relevant event,
             # matching the old /trigger's behavior.
             conn.execute("INSERT INTO demo_trigger_log (ip) VALUES (?)", (ip,))
             conn.commit()
 
-        _audit(conn, role, "/trigger/inject", f"fault_class={fault_class}", ip)
-        conn.close()
-
-        inject_timeout_s = INJECT_SUBPROCESS_TIMEOUT_S.get(fault_class, DEFAULT_INJECT_SUBPROCESS_TIMEOUT_S)
-        try:
-            result = subprocess.run(
-                [sys.executable, str(INJECTOR_PATH), "--class", fault_class],
-                cwd=str(INJECTOR_CWD),
-                capture_output=True,
-                text=True,
-                timeout=inject_timeout_s,
-            )
-        except subprocess.TimeoutExpired:
-            # Real bug, logged 2026-08-03: an uncaught TimeoutExpired used to
-            # surface as a bare unhandled 500 and could kill injector.py
-            # mid-attempt, risking leaked flood/stressor state its own
-            # `finally`-block cleanup never got to run (the exact class of
-            # bug fault-injection-cleanup-discipline exists to catch). Still
-            # not a clean recovery -- a genuinely stuck injector process is a
-            # real infra problem -- but this at least gives the caller an
-            # honest, specific error instead of a crash.
-            raise HTTPException(
-                504,
-                f"injector for '{fault_class}' did not finish within "
-                f"{inject_timeout_s}s -- likely a genuinely stuck "
-                f"cluster/injector process, not a normal retry. Check the "
-                f"cluster directly before retrying.",
-            )
-        if result.returncode != 0:
-            raise HTTPException(500, f"injector failed: {result.stderr}")
-
-        # injector.py writes ground truth straight to SQLite -- read the
-        # real episode_id + t0 back from there rather than scraping
-        # stdout text.
-        conn = _conn()
-        row = conn.execute(
-            "SELECT episode_id, t0 FROM episodes WHERE fault_class = ? ORDER BY t0 DESC LIMIT 1",
-            (fault_class,),
-        ).fetchone()
-        conn.close()
-        if row is None:
-            raise HTTPException(500, "injector reported success but no episode was recorded")
-
-        return {"status": "injected", "episode_id": row[0], "t0": row[1]}
-    finally:
-        # Deliberately NOT released here on the success path alone -- an
-        # unscored episode row now exists, so _episode_in_flight takes
-        # over as the guard for the "awaiting fix" window that follows.
-        # This flag only needs to cover the sub-window where NO row
-        # exists yet, which ends the instant this function returns
-        # (success) or raises (every rejection/failure path above).
-        _release_trigger_busy()
-
-
-@app.post("/trigger/resolve")
-def trigger_resolve(
-    episode_id: str,
-    request: Request,
-    payload: dict = Depends(require_role("admin", "demo-trigger")),
-):
-    """
-    Phase 2 of the two-phase trigger flow (2026-07-24): the user clicked
-    "Diagnose & Fix" for a real, already-injected episode. Enforces the
-    same SETTLE_SECONDS floor the old atomic /trigger always waited out --
-    if the user resolves fast, this silently sleeps out whatever's left
-    (+RESOLVE_SAFETY_BUFFER_S) before actually diagnosing; if they waited
-    long enough on their own, it proceeds immediately. Deliberately does
-    NOT expose which of those two cases happened -- see
-    wardence_frontend.md's "Two-Phase Trigger Flow" section for why the
-    settle-wait must stay invisible to the end user.
-    """
-    role = payload["role"]
-    conn = _conn()
-    ip = request.client.host
-
-    row = conn.execute(
-        "SELECT t0 FROM episodes WHERE episode_id = ?", (episode_id,)
-    ).fetchone()
-    if row is None:
-        _audit(conn, role, "/trigger/resolve", f"rejected: no such episode '{episode_id}'", ip)
-        conn.close()
-        raise HTTPException(404, f"no such episode '{episode_id}'")
-
-    already_scored = conn.execute(
-        "SELECT 1 FROM scores WHERE episode_id = ?", (episode_id,)
-    ).fetchone()
-    if already_scored is not None:
-        _audit(conn, role, "/trigger/resolve", f"rejected: '{episode_id}' already scored", ip)
-        conn.close()
-        raise HTTPException(409, f"episode '{episode_id}' was already resolved")
-
-    # Hard block, checked BEFORE acquiring the busy flag or sleeping --
-    # see RESOLVE_WINDOW_MAX_S's module-level comment. This episode will
-    # NEVER be scored past this point; deliberately not attempted at all,
-    # rather than run the scorer and let it silently fail/return nulls.
-    elapsed_s = (
-        datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(row[0])
-    ).total_seconds()
-    if elapsed_s > RESOLVE_WINDOW_MAX_S:
-        _audit(conn, role, "/trigger/resolve", f"rejected: '{episode_id}' window expired ({elapsed_s:.0f}s)", ip)
-        conn.close()
-        raise HTTPException(
-            410,
-            f"too much time has passed since this fault was injected ({elapsed_s:.0f}s, "
-            f"limit {RESOLVE_WINDOW_MAX_S}s) -- its evidence window has likely expired and "
-            f"it will not be scored. Inject a fresh fault instead.",
-        )
-
-    # Closes the gap the DB-backed already_scored check above can't see --
-    # see _TRIGGER_BUSY's module-level comment. Shares the same flag
-    # /trigger/inject uses, since the real invariant is one episode in
-    # flight system-wide, in ANY phase, not a per-endpoint rule.
-    if not _try_acquire_trigger_busy("resolving", episode_id):
-        _audit(conn, role, "/trigger/resolve", f"rejected: '{episode_id}' resolve already in progress", ip)
-        conn.close()
-        raise HTTPException(409, f"diagnosis already in progress for episode '{episode_id}'")
-
-    _audit(conn, role, "/trigger/resolve", f"episode_id={episode_id}", ip)
+    _audit(conn, role, "/trigger/inject", f"fault_class={fault_class} episode_id={episode_id}", ip)
     conn.close()
 
-    try:
-        t0 = datetime.datetime.fromisoformat(row[0])
-        elapsed_s = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds()
-        remaining_s = SETTLE_SECONDS - elapsed_s
-        if remaining_s > 0:
-            time.sleep(remaining_s + RESOLVE_SAFETY_BUFFER_S)
+    thread = threading.Thread(target=_run_live_episode, args=(episode_id, fault_class, cfg), daemon=True)
+    thread.start()
 
-        # p3_agent.py (the real agent, port 8001) must already be running
-        # for this to succeed -- p3_scorer.py calls it directly.
-        # --episode-id (2026-07-24): tells the scorer exactly which
-        # episode to score, instead of letting it guess "most recent
-        # unscored" -- see get_episode_by_id's docstring in p3_scorer.py
-        # for why guessing is a real correctness risk, not just untidy.
-        scorer_result = subprocess.run(
-            [sys.executable, str(SCORER_PATH), "--episode-id", episode_id],
-            cwd=str(SCORER_CWD),
-            capture_output=True,
-            text=True,
-            timeout=SCORER_TIMEOUT_S,
-        )
-        if scorer_result.returncode != 0:
-            # The episode itself is real and already recorded -- surface
-            # the scorer failure but don't pretend resolution failed
-            # outright.
-            return {
-                "status": "triggered_but_unscored",
-                "episode_id": episode_id,
-                "scorer_error": scorer_result.stderr,
-            }
-    finally:
-        # Always release, even on a scorer failure/timeout/exception --
-        # otherwise one failed resolve would permanently wedge every
-        # future trigger call behind a busy flag nothing will ever clear.
-        _release_trigger_busy()
+    return {"status": "injecting", "episode_id": episode_id, "episode_state": "injecting"}
 
+
+@app.get("/trigger/live-status")
+def trigger_live_status(episode_id: str, payload: dict = Depends(require_role("admin", "demo-trigger"))):
+    """
+    New (Phase 1 item 5) -- what the frontend polls for real progress
+    now that /trigger/inject and /trigger/resolve both return almost
+    immediately. Reports exactly what's persisted, nothing inferred or
+    guessed -- an absent live per-attempt progress field (e.g. "attempt
+    2 of 3") is a deliberate, logged scope cut for this step, not an
+    oversight: it needs injector.py to write a --progress-file
+    (Kimi review 36 finding 9's recommended mechanism), not yet built.
+    """
     conn = _conn()
-    # target + confidence: target comes from the episodes table (the
-    # injector's own record of what it hit), confidence from scores (the
-    # diagnoser's self-reported confidence, same field Calibration uses).
-    score_row = conn.execute(
-        "SELECT s.predicted_class, s.correct, s.action_taken, s.action_applied, s.durability_verdict, "
-        "s.confidence, e.target "
-        "FROM scores s JOIN episodes e ON e.episode_id = s.episode_id "
-        "WHERE s.episode_id = ?",
+    row = conn.execute(
+        "SELECT episode_state, state_entered_at, evidence_confirmed, fault_class, t0, triggering_username "
+        "FROM episodes WHERE episode_id = ?",
         (episode_id,),
     ).fetchone()
     conn.close()
-
-    # Refresh the R2 snapshot so "VIEW FULL REPLAY" (which reads episodes.json
-    # from R2, not the live DB) actually finds this episode right away --
-    # same staleness gap already fixed for /promote and /demote.
-    _republish_to_r2()
-
+    if row is None:
+        raise HTTPException(404, f"no such episode '{episode_id}'")
+    state, state_entered_at, evidence_confirmed, fault_class, t0, triggering_username = row
+    elapsed_s = None
+    if state_entered_at is not None:
+        entered = datetime.datetime.fromisoformat(state_entered_at)
+        elapsed_s = round((datetime.datetime.now(datetime.timezone.utc) - entered).total_seconds())
     return {
-        "status": "scored",
         "episode_id": episode_id,
-        "predicted_class": score_row[0] if score_row else None,
-        "correct": bool(score_row[1]) if score_row else None,
-        "action_taken": score_row[2] if score_row else None,
-        "action_applied": bool(score_row[3]) if score_row and score_row[3] is not None else None,
-        "durability_verdict": score_row[4] if score_row else None,
-        "confidence": score_row[5] if score_row else None,
-        "target": score_row[6] if score_row else None,
+        "episode_state": state,
+        "elapsed_in_state_s": elapsed_s,
+        "evidence_confirmed": bool(evidence_confirmed),
+        "fault_class": fault_class,
+        "t0": t0,
+        "can_stop_hold_early": state == "holding" and bool(evidence_confirmed),
     }
+
+
+@app.post("/trigger/stop-hold")
+def trigger_stop_hold(episode_id: str, payload: dict = Depends(require_role("admin", "demo-trigger"))):
+    """
+    New (Phase 1 item 5, Kimi review 33's early-exit design wired for
+    real) -- the user's "stop and diagnose now" click, valid only once
+    the frontend's own live-status poll shows can_stop_hold_early=True.
+    Only sets a DB flag; the running episode's own wrapper thread (see
+    _run_live_episode's tick loop) is what actually converts this into
+    the file injector.py's hold loop is watching, on its own next tick.
+    """
+    role = payload["role"]
+    conn = _conn()
+    row = conn.execute(
+        "SELECT episode_state, evidence_confirmed, triggering_username FROM episodes WHERE episode_id = ?",
+        (episode_id,),
+    ).fetchone()
+    if row is None:
+        conn.close()
+        raise HTTPException(404, f"no such episode '{episode_id}'")
+    state, evidence_confirmed, triggering_username = row
+    if role == "demo-trigger" and triggering_username != payload.get("username"):
+        conn.close()
+        raise HTTPException(403, "you may only stop an episode you triggered yourself")
+    if state != "holding" or not evidence_confirmed:
+        conn.close()
+        raise HTTPException(409, f"episode '{episode_id}' is not in an early-stoppable state right now")
+    conn.execute("UPDATE episodes SET stop_hold_requested = 1 WHERE episode_id = ?", (episode_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "stop_requested", "episode_id": episode_id}
+
+
+@app.post("/trigger/resolve")
+def trigger_resolve(episode_id: str, payload: dict = Depends(require_role("admin", "demo-trigger"))):
+    """
+    Real async redesign, Phase 1 item 5 -- the manual "Diagnose & Fix"
+    click. Attempts Gate 2 (the same atomic CAS the 5-minute ceiling and
+    a report-only class's own auto-resolve also attempt) in a background
+    thread and returns immediately; the frontend polls
+    GET /trigger/live-status for the real terminal result (episode_state
+    'resolved' or 'failed') instead of this call blocking for the
+    scorer's own up-to-500s runtime.
+    """
+    role = payload["role"]
+    conn = _conn()
+    row = conn.execute("SELECT episode_state FROM episodes WHERE episode_id = ?", (episode_id,)).fetchone()
+    if row is None:
+        _audit(conn, role, "/trigger/resolve", f"rejected: no such episode '{episode_id}'", None)
+        conn.close()
+        raise HTTPException(404, f"no such episode '{episode_id}'")
+    if row[0] != "awaiting_fix":
+        _audit(conn, role, "/trigger/resolve", f"rejected: '{episode_id}' not awaiting_fix (state={row[0]})", None)
+        conn.close()
+        raise HTTPException(409, f"episode '{episode_id}' is not currently awaiting a manual resolve")
+    _audit(conn, role, "/trigger/resolve", f"episode_id={episode_id}", None)
+    conn.close()
+
+    thread = threading.Thread(target=_attempt_resolve, args=(episode_id, "manual"), daemon=True)
+    thread.start()
+    return {"status": "resolving", "episode_id": episode_id}
+
+
+@app.post("/logout")
+def logout(payload: dict = Depends(require_role("admin", "demo-trigger"))):
+    """
+    New (Phase 1 item 5, Kimi review 36 finding 8) -- best-effort only,
+    NEVER a hard dependency for correctness. sendBeacon/tab-close can't
+    guarantee this ever fires (browser/OS can kill the tab before the
+    request completes), so the 5-minute abandonment ceiling remains the
+    one reliable auto-resolve mechanism regardless of whether this ever
+    gets called. If the logging-out account happens to be the one that
+    triggered the episode currently in flight, this sets abandon_requested
+    so it can wind down sooner than the full ceiling -- pure optimization.
+    """
+    username = payload.get("username")
+    conn = _conn()
+    conn.execute(
+        "UPDATE episodes SET abandon_requested = 1 "
+        "WHERE triggering_username = ? AND episode_state IN ({})".format(
+            ",".join("?" for _ in NON_TERMINAL_EPISODE_STATES)
+        ),
+        (username, *NON_TERMINAL_EPISODE_STATES),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "logged_out"}
+
+
+def _wait_for_orphan(pid: int, episode_id: str) -> None:
+    """Spawned by reconciliation for a still-alive orphaned subprocess
+    (the API restarted but the real injector.py process is still
+    running) -- a plain liveness poll, not a full re-run of
+    _run_live_episode (can't reattach a Popen handle across a process
+    restart, so this can't resume live evidence-polling for a
+    still-holding class). Wrapped in its own try/except (Kimi review 37
+    finding 6) -- without this, an exception here (e.g. the scorer
+    subprocess called by _attempt_resolve crashing) kills this thread
+    silently and leaves the episode stuck forever, since nothing else
+    is watching it."""
+    try:
+        while True:
+            try:
+                os.kill(pid, 0)
+            except (ProcessLookupError, PermissionError, OSError):
+                break
+            time.sleep(10)
+        conn = _conn()
+        row = conn.execute(
+            "SELECT t0, chaos_resource_name FROM episodes WHERE episode_id = ?", (episode_id,)
+        ).fetchone()
+        if row[0] is not None and row[1] is not None:
+            _set_episode_state(conn, episode_id, "awaiting_fix")
+            conn.close()
+            threading.Thread(target=_attempt_resolve, args=(episode_id, "auto_resolve"), daemon=True).start()
+        else:
+            _set_episode_state(conn, episode_id, "failed")
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+        print(f"WARNING: _wait_for_orphan failed for episode {episode_id}: {exc}")
+        try:
+            conn = _conn()
+            _set_episode_state(conn, episode_id, "failed")
+            conn.close()
+        except Exception as inner_exc:  # noqa: BLE001
+            print(f"  additionally failed to mark episode {episode_id} failed: {inner_exc}")
+
+
+def _reconcile_one_row(episode_id: str, fault_class: str, state: str, state_entered_at: str, pid, t0, chaos_name) -> None:
+    entered = datetime.datetime.fromisoformat(state_entered_at)
+    age_s = (datetime.datetime.now(datetime.timezone.utc) - entered).total_seconds()
+
+    if state in ("injecting", "holding"):
+        if pid is None:
+            # Real fix, Kimi review 37 finding 4: the original 60s age
+            # grace period assumed reconciliation might run again soon
+            # and re-check a young row -- it does NOT, reconciliation
+            # runs exactly once at startup. A row younger than 60s at
+            # that single check point was left NON-terminal with no
+            # thread ever watching it again -- a permanent zombie,
+            # deadlocking every future trigger via the in-flight guard,
+            # on the very first crash that lands between the row INSERT
+            # and Popen returning a PID. No PID + no live process to
+            # check == an orphan, unconditionally, regardless of age.
+            conn = _conn()
+            _set_episode_state(conn, episode_id, "failed")
+            conn.close()
+            return
+
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError, OSError):
+            alive = False
+
+        if alive:
+            # The real injector.py subprocess is still genuinely running
+            # even though the API itself restarted -- subprocess
+            # lifetimes aren't tied to the parent Python process by
+            # default.
+            threading.Thread(target=_wait_for_orphan, args=(pid, episode_id), daemon=True).start()
+        else:
+            # Process already gone by the time we checked -- classify
+            # immediately from the row's own real populated-ness (can't
+            # retrieve the real exit code without the original Popen
+            # handle, so this is the honest signal available
+            # post-restart).
+            conn = _conn()
+            if t0 is not None and chaos_name is not None:
+                _set_episode_state(conn, episode_id, "awaiting_fix")
+                conn.close()
+                threading.Thread(target=_attempt_resolve, args=(episode_id, "auto_resolve"), daemon=True).start()
+            else:
+                _set_episode_state(conn, episode_id, "failed")
+                conn.close()
+
+    elif state == "awaiting_fix":
+        # Real fix, Kimi review 37 finding 3: calling _attempt_resolve
+        # directly on the reconciliation (startup) call stack blocks
+        # the FastAPI startup handler for SETTLE_SECONDS +
+        # RESOLVE_SAFETY_BUFFER_S + up to SCORER_TIMEOUT_S (up to ~7
+        # real minutes) before the app accepts its first request, if an
+        # episode was genuinely abandoned right before a restart.
+        # Backgrounded exactly like every other real trigger of this
+        # function.
+        remaining_s = ABANDON_CEILING_S - age_s
+        if remaining_s <= 0:
+            threading.Thread(target=_attempt_resolve, args=(episode_id, "auto_resolve"), daemon=True).start()
+        else:
+            timer = threading.Timer(remaining_s, _attempt_resolve, args=(episode_id, "auto_resolve"))
+            timer.daemon = True
+            _ABANDON_TIMERS[episode_id] = timer
+            timer.start()
+
+    elif state == "resolving":
+        # The scorer subprocess was mid-flight when the API crashed --
+        # no PID is tracked for it (only injector.py's own subprocess
+        # gets one). Not safely re-runnable blind (a real fix action
+        # may have already dispatched once); check whether a real
+        # scores row landed before the crash.
+        conn = _conn()
+        scored = conn.execute("SELECT 1 FROM scores WHERE episode_id = ?", (episode_id,)).fetchone()
+        if scored is not None:
+            _set_episode_state(conn, episode_id, "resolved", triggered_by="auto_resolve")
+        else:
+            _set_episode_state(conn, episode_id, "failed", triggered_by="auto_resolve")
+        conn.close()
+
+
+def _reconcile_on_startup() -> None:
+    """Real startup-reconciliation (Phase 1 item 10, Kimi review 36
+    findings 6/11) -- runs once when the API process starts, before it
+    accepts any real traffic. Finds any episode left in a non-terminal
+    state by a crash (this project has hit exactly this shape of bug
+    once already, the uvicorn-crash-left-port-8002-held incident) and
+    resolves it one way or another rather than leaving it stuck forever,
+    which -- given the single-episode-in-flight invariant -- would
+    otherwise deadlock every future trigger.
+    """
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT episode_id, fault_class, episode_state, state_entered_at, subprocess_pid, "
+        "t0, chaos_resource_name FROM episodes WHERE episode_state IN ({})".format(
+            ",".join("?" for _ in NON_TERMINAL_EPISODE_STATES)
+        ),
+        tuple(NON_TERMINAL_EPISODE_STATES),
+    ).fetchall()
+    conn.close()
+
+    for episode_id, fault_class, state, state_entered_at, pid, t0, chaos_name in rows:
+        # Real fix, Kimi review 37 finding 6: one bad row (a malformed
+        # state_entered_at, a DB hiccup) used to be able to raise and
+        # abort the whole loop, silently skipping reconciliation for
+        # every row after it. Isolated per-row so one failure can't
+        # starve the rest.
+        try:
+            _reconcile_one_row(episode_id, fault_class, state, state_entered_at, pid, t0, chaos_name)
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, see docstring
+            print(f"WARNING: reconciliation failed for episode {episode_id}: {exc}")
+
+
+@app.on_event("startup")
+def _on_startup():
+    _reconcile_on_startup()
 
 
 @app.post("/promote")

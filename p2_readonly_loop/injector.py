@@ -153,6 +153,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timezone
@@ -1073,7 +1074,7 @@ def _kill_main_process(pod_name: str, namespace: str, container: str, kill_patte
     return result.returncode == 0
 
 
-def run_crash_loop_injection(cfg: dict, duration_s: int):
+def run_crash_loop_injection(cfg: dict, duration_s: int, stop_file: str | None = None) -> bool:
     """
     Repeatedly SIGKILLs the container's real application process (by
     name pattern, NOT PID 1 -- see _kill_main_process) via kubectl exec
@@ -1081,15 +1082,28 @@ def run_crash_loop_injection(cfg: dict, duration_s: int):
     action), so restarts genuinely accumulate and kubelet can back off
     into CrashLoopBackOff. Not a Chaos Mesh resource -- see module
     docstring for why.
+
+    stop_file (Operator's early-exit mechanism, Kimi review 36 finding
+    2/7 -- a file path, not a DB poll or signal, since this function has
+    no SQLite connection to Operator's DB and shouldn't gain one just
+    for this): checked once per tick (~CRASH_LOOP_KILL_INTERVAL_S). If
+    it appears, the loop stops at its next natural checkpoint -- never
+    mid-kubectl-exec -- and this returns True (interrupted early) rather
+    than False (ran the full duration_s), so the caller knows not to
+    retry a user-requested early stop. omit for batch runs; the check is
+    then skipped entirely, identical to today's behavior.
     """
     end_time = time.time() + duration_s
     while time.time() < end_time:
+        if stop_file is not None and os.path.exists(stop_file):
+            return True
         pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
         if pod_name is None:
             time.sleep(2)
             continue
         _kill_main_process(pod_name, cfg["namespace"], cfg["container"], cfg["kill_pattern"])
         time.sleep(CRASH_LOOP_KILL_INTERVAL_S)
+    return False
 
 
 def _restart_count(target: str, namespace: str) -> int:
@@ -1850,7 +1864,41 @@ def _verify_init_failure_effect(namespace: str) -> bool:
     return False
 
 
-def _inject_and_verify_init_failure(cfg: dict) -> bool:
+def _interruptible_sleep(duration_s: float, stop_file: str | None) -> bool:
+    """Sleeps up to duration_s in ~5s ticks, checking stop_file each
+    tick -- returns True if interrupted early (stop_file appeared),
+    False if the full duration elapsed naturally. Shared by every
+    report-only class's own 'hold for the remainder of duration_s' step
+    (Operator's early-exit extension, mirroring crash-loop/
+    cpu-throttling's own poll-based hold). Never called with stop_file
+    set for a batch run -- omitted entirely, this degrades to a plain
+    full sleep."""
+    elapsed = 0.0
+    tick = 5.0
+    while elapsed < duration_s:
+        if stop_file is not None and os.path.exists(stop_file):
+            return True
+        this_tick = min(tick, duration_s - elapsed)
+        time.sleep(this_tick)
+        elapsed += this_tick
+    return False
+
+
+def _write_evidence_file_once(evidence_file: str | None) -> None:
+    """Called the moment a report-only class's own real verification
+    first confirms the fault landed -- writes a real file (idempotent,
+    a re-write is harmless) that Operator's wrapper thread polls for
+    instead of re-running the same probe/mysql-exec/etc a second time
+    in parallel (several of these are active, real-cost checks --
+    spinning a throwaway pod, an actual mysql connection attempt --
+    re-running them redundantly from the wrapper would double real load
+    and risk skewing the very signal being measured). None (every batch
+    run) makes this a no-op."""
+    if evidence_file is not None:
+        Path(evidence_file).write_text(str(time.time()))
+
+
+def _inject_and_verify_init_failure(cfg: dict, stop_file: str | None = None, evidence_file: str | None = None) -> bool:
     """Patches payment's readinessProbe.httpGet.path to a nonexistent
     endpoint via a strategic-merge kubectl patch, leaving livenessProbe
     untouched. NOT Chaos Mesh -- a direct Deployment patch, same
@@ -1865,9 +1913,10 @@ def _inject_and_verify_init_failure(cfg: dict) -> bool:
         _patch_payment_readiness_path(cfg, PAYMENT_READINESS_PATH_FAULT)
         verified = _verify_init_failure_effect(namespace)
         if verified:
+            _write_evidence_file_once(evidence_file)
             remaining = cfg["duration_s"] - (time.time() - window_start)
             if remaining > 0:
-                time.sleep(remaining)
+                _interruptible_sleep(remaining, stop_file)
             _restore_init_failure(cfg)
             return True
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
@@ -1927,7 +1976,9 @@ def _ensure_session_failure_baseline(cfg: dict):
     _wait_for_replicas_available(cfg["namespace"], cfg["target"], 1, SESSION_FAILURE_SCALE_TIMEOUT_S)
 
 
-def _inject_and_verify_session_cart_failure(cfg: dict) -> bool:
+def _inject_and_verify_session_cart_failure(
+    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+) -> bool:
     """Scales session-db to 0 for the fault window, then back to 1 --
     NOT a process kill/restart (which would produce the exact same
     restart-increase/CrashLoopBackOff signature crash-loop already
@@ -1951,9 +2002,10 @@ def _inject_and_verify_session_cart_failure(cfg: dict) -> bool:
         _scale_deployment(cfg, 0)
         verified = _wait_for_replicas_available(namespace, target, 0, SESSION_FAILURE_SCALE_TIMEOUT_S)
         if verified:
+            _write_evidence_file_once(evidence_file)
             remaining = cfg["duration_s"] - (time.time() - window_start)
             if remaining > 0:
-                time.sleep(remaining)
+                _interruptible_sleep(remaining, stop_file)
             print(f"  restoring {target} to 1 replica, waiting for real recovery...")
             _scale_deployment(cfg, 1)
             recovered = _wait_for_replicas_available(namespace, target, 1, SESSION_FAILURE_SCALE_TIMEOUT_S)
@@ -1971,9 +2023,24 @@ def _inject_and_verify_session_cart_failure(cfg: dict) -> bool:
 def record_episode(
     conn: sqlite3.Connection, episode_id: str, fault_class: str, cfg: dict, chaos_name: str, t0: str
 ):
+    """UPSERT, not a plain INSERT -- Operator's async wrapper (Phase 1
+    item 5) pre-creates a row for this exact episode_id (via --episode-id
+    below) BEFORE this function ever runs, with t0/chaos_resource_name
+    still NULL, so it has a real DB-backed row to attach live state to
+    while injection is still in progress. This UPSERT is what fills in
+    the real values once they're genuinely known -- ON CONFLICT covers
+    that case, the plain INSERT path covers today's batch behavior
+    (no pre-existing row, --episode-id omitted) unchanged. injector.py
+    otherwise stays completely unaware of episode_state/holding/
+    awaiting_fix/etc -- this is the one, narrow point of contact with
+    the wrapper's own row (Kimi review 35/36's locked ownership split)."""
     conn.execute(
         "INSERT INTO episodes (episode_id, fault_class, target, namespace, t0, chaos_resource_name) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "VALUES (?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(episode_id) DO UPDATE SET "
+        "fault_class=excluded.fault_class, target=excluded.target, "
+        "namespace=excluded.namespace, t0=excluded.t0, "
+        "chaos_resource_name=excluded.chaos_resource_name",
         (episode_id, fault_class, cfg["target"], cfg["namespace"], t0, chaos_name),
     )
     conn.commit()
@@ -2039,20 +2106,29 @@ def _inject_and_verify_disk_full(cfg: dict) -> bool:
     return False
 
 
-def _inject_and_verify_crash_loop(cfg: dict) -> bool:
+def _inject_and_verify_crash_loop(cfg: dict, stop_file: str | None = None) -> bool:
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
         baseline_restarts = _restart_count(cfg["target"], cfg["namespace"])
         print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: running exec-based kill loop for {cfg['duration_s']}s...")
-        run_crash_loop_injection(cfg, cfg["duration_s"])
+        interrupted = run_crash_loop_injection(cfg, cfg["duration_s"], stop_file=stop_file)
         verified = _verify_crash_loop_effect(cfg["target"], cfg["namespace"], baseline_restarts)
         if verified:
             return True
+        if interrupted:
+            # A user-requested early stop (Operator's stop-file), not a
+            # failed attempt -- honor it, don't retry against their
+            # explicit request just because this one attempt's own
+            # verification came back empty.
+            print("  early-stop requested -- not retrying")
+            return False
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
         print(f"  attempt {attempt}: no restart detected{suffix}")
     return False
 
 
-def _inject_and_verify_network_latency(cfg: dict) -> str | None:
+def _inject_and_verify_network_latency(
+    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+) -> str | None:
     """Unlike the other Chaos Mesh class (oom), verification here does
     NOT reuse _verify_restart_effect -- a network delay never restarts
     anything. Verified via _probe_orders_latency_ms's direct, timed
@@ -2089,16 +2165,28 @@ def _inject_and_verify_network_latency(cfg: dict) -> str | None:
         # (crash-loop/oom/disk-full's own injection loops already do
         # this naturally).
         verified = False
+        interrupted = False
         elapsed = 0
         try:
             while elapsed < cfg["duration_s"]:
+                if stop_file is not None and os.path.exists(stop_file):
+                    interrupted = True
+                    break
                 time.sleep(10)
                 elapsed += 10
                 during_ms = _probe_orders_latency_ms(namespace)
                 if during_ms is not None and during_ms >= baseline_ms + NETWORK_LATENCY_MIN_INCREASE_MS:
+                    if not verified:
+                        _write_evidence_file_once(evidence_file)
                     verified = True
         finally:
             delete_chaos_resource(chaos_kind, chaos_name)
+
+        if interrupted:
+            if verified:
+                return chaos_name
+            print("  early-stop requested -- not retrying")
+            return None
 
         if verified:
             return chaos_name
@@ -2107,7 +2195,9 @@ def _inject_and_verify_network_latency(cfg: dict) -> str | None:
     return None
 
 
-def _inject_and_verify_network_partition(cfg: dict) -> str | None:
+def _inject_and_verify_network_partition(
+    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+) -> str | None:
     """Verified via _probe_orders_reachable (direct probe, NOT k6/
     Prometheus -- see NETWORK_PARTITION_PROBE_SAMPLES's docstring for
     why k6_http_req_failed is unusable here: front-end's own call to
@@ -2161,6 +2251,8 @@ def _inject_and_verify_network_partition(cfg: dict) -> str | None:
             verified = failures >= NETWORK_PARTITION_MIN_FAILURES
             print(f"  early probe: {failures}/{NETWORK_PARTITION_PROBE_SAMPLES} samples failed "
                   f"(need >= {NETWORK_PARTITION_MIN_FAILURES})")
+            if verified:
+                _write_evidence_file_once(evidence_file)
 
             # Sleep out whatever's genuinely left of duration_s, based on
             # REAL elapsed wall-clock time (the 5s wait + the probe's own
@@ -2169,7 +2261,7 @@ def _inject_and_verify_network_partition(cfg: dict) -> str | None:
             # taught about probe overhead eating into fault windows.
             remaining = cfg["duration_s"] - (time.time() - window_start)
             if remaining > 0:
-                time.sleep(remaining)
+                _interruptible_sleep(remaining, stop_file)
         finally:
             delete_chaos_resource(chaos_kind, chaos_name)
 
@@ -2180,7 +2272,9 @@ def _inject_and_verify_network_partition(cfg: dict) -> str | None:
     return None
 
 
-def _inject_and_verify_memory_leak(cfg: dict) -> str | None:
+def _inject_and_verify_memory_leak(
+    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+) -> str | None:
     """Verified via cAdvisor's own container_memory_working_set_bytes
     (a reliable, real-time kube-native metric -- not the k6/Prometheus
     percentile that turned out unreliable for network-latency). TWO
@@ -2211,20 +2305,34 @@ def _inject_and_verify_memory_leak(cfg: dict) -> str | None:
               f"holding the fault active for the full {cfg['duration_s']}s window...")
 
         restarted = False
+        interrupted = False
         peak_mib = baseline_mib
+        evidence_written = False
         elapsed = 0
         try:
             while elapsed < cfg["duration_s"]:
+                if stop_file is not None and os.path.exists(stop_file):
+                    interrupted = True
+                    break
                 time.sleep(10)
                 elapsed += 10
                 current_mib = _memory_working_set_mib(target, namespace, container)
                 if current_mib is not None:
                     peak_mib = max(peak_mib, current_mib)
+                if not evidence_written and peak_mib >= baseline_mib + MEMORY_LEAK_MIN_INCREASE_MIB:
+                    _write_evidence_file_once(evidence_file)
+                    evidence_written = True
                 if _restart_count(target, namespace) > baseline_restarts:
                     restarted = True
                     break  # stop early -- this is an OOM now, not a leak, no point holding further
         finally:
             delete_chaos_resource(chaos_kind, chaos_name)
+
+        if interrupted:
+            if evidence_written:
+                return chaos_name
+            print("  early-stop requested -- not retrying")
+            return None
 
         if restarted:
             print(f"  attempt {attempt}: pod restarted during injection (stressor too large -- "
@@ -2472,7 +2580,9 @@ def _restart_catalogue_db_pod(cfg: dict, timeout_s: int = 90) -> bool:
     return True
 
 
-def _inject_and_verify_connection_pool_exhaustion(cfg: dict) -> str | None:
+def _inject_and_verify_connection_pool_exhaustion(
+    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+) -> str | None:
     """Verified by actually attempting one more real connection and
     confirming it fails with MySQL's genuine 'too many connections'
     error -- the same thing catalogue itself would experience, not an
@@ -2498,9 +2608,11 @@ def _inject_and_verify_connection_pool_exhaustion(cfg: dict) -> str | None:
         try:
             time.sleep(5)  # give the flood a moment to actually establish all connections
             verified = _test_connection_fails(cfg)
+            if verified:
+                _write_evidence_file_once(evidence_file)
             remaining = duration_s - 5
             if remaining > 0:
-                time.sleep(remaining)
+                _interruptible_sleep(remaining, stop_file)
         finally:
             _cleanup_connection_flood(cfg)
 
@@ -2527,13 +2639,16 @@ def _verify_cpu_throttle_effect(
     return False
 
 
-def _inject_and_verify_cpu_throttling(cfg: dict) -> str | None:
+def _inject_and_verify_cpu_throttling(cfg: dict, stop_file: str | None = None) -> str | None:
     """StressChaos cpu stressor against `user`, held for the full
     duration_s (same 'don't end early' discipline every other class
     learned the hard way -- an external observer, or a future real
     diagnosis call, needs a fair chance to see the fault too). Verified
     via a raw before/after delta on container_cpu_cfs_throttled_periods_total,
-    not Chaos Mesh's own state."""
+    not Chaos Mesh's own state.
+
+    stop_file: same early-exit contract as run_crash_loop_injection --
+    checked once per ~10s tick during the hold; omit for batch runs."""
     _ensure_cpu_throttle_baseline(cfg)
     chaos_kind = "stresschaos"
     namespace = cfg["namespace"]
@@ -2547,13 +2662,36 @@ def _inject_and_verify_cpu_throttling(cfg: dict) -> str | None:
         apply_manifest(manifest)
         print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: baseline_periods={baseline_periods}, "
               f"holding the fault active for the full {cfg['duration_s']}s window...")
-        time.sleep(cfg["duration_s"])
+        interrupted = False
+        elapsed = 0
         try:
+            while elapsed < cfg["duration_s"]:
+                if stop_file is not None and os.path.exists(stop_file):
+                    interrupted = True
+                    break
+                time.sleep(10)
+                elapsed += 10
+            # Verified INSIDE the same try as the hold, before cleanup --
+            # matches every other class's own established pattern
+            # (network-latency, connection-pool-exhaustion above), not a
+            # new ordering. The counter being checked
+            # (container_cpu_cfs_throttled_periods_total) is a
+            # non-resetting kernel cgroup counter, so checking it before
+            # vs. after the chaos resource itself is deleted makes no
+            # real difference to the reading -- kept ordered this way
+            # purely for consistency with the rest of this file.
             verified = _verify_cpu_throttle_effect(target, namespace, container, baseline_periods)
         finally:
             delete_chaos_resource(chaos_kind, chaos_name)
         if verified:
             return chaos_name
+        if interrupted:
+            # A user-requested early stop, not a failed attempt -- honor
+            # it, don't retry against their explicit request just
+            # because this one attempt's own verification came back
+            # empty.
+            print("  early-stop requested -- not retrying")
+            return None
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
         print(f"  attempt {attempt}: no real throttled-periods increase observed{suffix}")
     return None
@@ -2688,6 +2826,43 @@ def main():
             "only via one-off scripts calling internal functions directly."
         ),
     )
+    parser.add_argument(
+        "--episode-id", dest="episode_id", default=None,
+        help=(
+            "Operator's async wrapper (Phase 1 item 5, Kimi review 36's "
+            "locked Option A) pre-creates the episodes row under this ID "
+            "before this script ever runs, so it has a real DB-backed "
+            "row to attach live episode_state to during injection. "
+            "record_episode() UPSERTs into that existing row instead of "
+            "INSERTing a fresh one. Omit for batch runs (run_batch_plan.py "
+            "never passes this) -- a fresh UUID is generated as today."
+        ),
+    )
+    parser.add_argument(
+        "--stop-file", dest="stop_file", default=None,
+        help=(
+            "Operator's early-exit signal, all 8 extendable classes "
+            "(crash-loop/cpu-throttling from Kimi review 36 findings 2/7, "
+            "plus the 6 report-only classes) -- the hold loop checks "
+            "os.path.exists(stop_file) once per tick and exits cleanly, "
+            "running its own finally-block cleanup, if the file appears. "
+            "Ignored by disk-full/under-provisioned-replicas/bad-rollout/"
+            "oom (no extendable hold to interrupt). Omit for batch runs."
+        ),
+    )
+    parser.add_argument(
+        "--evidence-file", dest="evidence_file", default=None,
+        help=(
+            "Report-only classes only -- written the moment this "
+            "script's own real verification first confirms the fault "
+            "landed, so Operator's wrapper can unlock an early-stop "
+            "button without re-running the same active probe/mysql-exec "
+            "a second time in parallel. Ignored by every other class "
+            "(crash-loop/cpu-throttling's evidence check is a cheap "
+            "Prometheus read the wrapper re-runs independently instead). "
+            "Omit for batch runs."
+        ),
+    )
     args = parser.parse_args()
 
     fault_class = args.fault_class
@@ -2699,7 +2874,7 @@ def main():
         )
         cfg["duration_s"] = args.duration_override
 
-    episode_id = str(uuid.uuid4())
+    episode_id = args.episode_id if args.episode_id is not None else str(uuid.uuid4())
     t0 = datetime.now(timezone.utc).isoformat()
 
     # Real cross-process lock -- see acquire_system_lock_or_die's own
@@ -2726,24 +2901,36 @@ def main():
             verified = _inject_and_verify_disk_full(cfg)
             chaos_name = "manual-exec" if verified else None
         elif fault_class == "crash-loop":
-            verified = _inject_and_verify_crash_loop(cfg)
+            verified = _inject_and_verify_crash_loop(cfg, stop_file=args.stop_file)
             chaos_name = "manual-exec" if verified else None
         elif fault_class == "network-latency":
-            chaos_name = _inject_and_verify_network_latency(cfg)
+            chaos_name = _inject_and_verify_network_latency(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
         elif fault_class == "memory-leak":
-            chaos_name = _inject_and_verify_memory_leak(cfg)
+            chaos_name = _inject_and_verify_memory_leak(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
         elif fault_class == "connection-pool-exhaustion":
-            chaos_name = _inject_and_verify_connection_pool_exhaustion(cfg)
+            chaos_name = _inject_and_verify_connection_pool_exhaustion(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
         elif fault_class == "network-partition":
-            chaos_name = _inject_and_verify_network_partition(cfg)
+            chaos_name = _inject_and_verify_network_partition(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
         elif fault_class == "init-failure":
-            verified = _inject_and_verify_init_failure(cfg)
+            verified = _inject_and_verify_init_failure(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
             chaos_name = "manual-patch" if verified else None
         elif fault_class == "session-cart-failure":
-            verified = _inject_and_verify_session_cart_failure(cfg)
+            verified = _inject_and_verify_session_cart_failure(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
             chaos_name = "manual-scale" if verified else None
         elif fault_class == "cpu-throttling":
-            chaos_name = _inject_and_verify_cpu_throttling(cfg)
+            chaos_name = _inject_and_verify_cpu_throttling(cfg, stop_file=args.stop_file)
         elif fault_class == "under-provisioned-replicas":
             chaos_name = _inject_and_verify_under_provisioned(cfg)
         elif fault_class == "bad-rollout":
@@ -2776,7 +2963,18 @@ def main():
                 f"{cfg['target']} -- NO episode recorded. If this keeps happening, the cluster "
                 f"(or Chaos Mesh's own daemon) is unhealthy, not the diagnosis/verifier code."
             )
-            return
+            # Real bug, found via Kimi review 36 finding 1: this used to
+            # be a bare `return`, which exits main() -- and therefore the
+            # whole process -- with code 0. A caller checking returncode
+            # alone (which Operator's new async wrapper does, since
+            # UPSERT-based row pre-creation means a plain "no episode
+            # exists" check isn't available anymore) would misread total
+            # injection failure as success. run_batch_plan.py never hit
+            # this (it only ever checks "did an unscored episode row
+            # appear," which already correctly stayed empty on failure)
+            # -- this was a latent bug, not something today's batch path
+            # was ever exposed to.
+            sys.exit(1)
 
         conn = ensure_db()
         record_episode(conn, episode_id, fault_class, cfg, chaos_name, t0)

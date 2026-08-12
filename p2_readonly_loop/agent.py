@@ -253,9 +253,44 @@ app = FastAPI()
 class DiagnoseRequest(BaseModel):
     target: str
     namespace: str
+    # Real evidence-freezing timestamp (RFC3339), optional -- None
+    # (every existing caller) preserves today's live "now" query
+    # behavior exactly. See _prom_instant_query's docstring for why
+    # this exists.
+    snapshot_at: str | None = None
 
 
-def query_prometheus(target: str, namespace: str) -> dict:
+def _prom_instant_query(query: str, snapshot_at: str | None = None) -> list:
+    """Real evidence-freezing mechanism (the 'snapshot_at' design locked
+    in an earlier Operator design session, wired for real here after a
+    genuine live-tested false-negative confirmed it was missing --
+    crash-loop's real restart events aged out of its own [3m]
+    increase() window during a live-triggered episode whose real
+    total elapsed time from injection to diagnosis exceeded 8 minutes
+    (a genuinely extended hold + the 5-minute abandonment ceiling
+    stacking up), even though the fault genuinely happened and the
+    injector's own sticky-signal verification confirmed it in real
+    time. Passing Prometheus's real `time=` instant-query parameter
+    (RFC3339, same format datetime.isoformat() already produces
+    everywhere else in this codebase) shifts EVERY windowed function's
+    right edge (max_over_time/min_over_time/increase/subqueries) to
+    that fixed point instead of live "now" -- exactly reproducing what
+    the query would have seen if it had run right when evidence was
+    genuinely ready, regardless of how much real wall-clock time
+    passes afterward waiting for a manual resolve click or an
+    abandonment ceiling to fire. snapshot_at=None (every existing
+    caller, e.g. every batch-run episode) preserves today's exact
+    live-query behavior -- purely additive, not a behavior change for
+    anything that doesn't opt in."""
+    params = {"query": query}
+    if snapshot_at is not None:
+        params["time"] = snapshot_at
+    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["data"]["result"]
+
+
+def query_prometheus(target: str, namespace: str, snapshot_at: str | None = None) -> dict:
     """Tool: check whether a matching container is crash-looping, was OOM-killed,
     was evicted (disk-full), or is seeing elevated request latency
     (network-latency, via p95_latency_ms -- k6's own observed latency
@@ -415,31 +450,11 @@ def query_prometheus(target: str, namespace: str) -> dict:
         f'pod=~"{_pod_re}"}}[3m]) > 0)'
     )
 
-    oom_resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": oom_query}, timeout=10)
-    oom_resp.raise_for_status()
-    oom_result = oom_resp.json()["data"]["result"]
-
-    oom_sticky_resp = requests.get(
-        f"{PROMETHEUS_URL}/api/v1/query", params={"query": oom_sticky_query}, timeout=10
-    )
-    oom_sticky_resp.raise_for_status()
-    oom_sticky_result = oom_sticky_resp.json()["data"]["result"]
-
-    evicted_resp = requests.get(
-        f"{PROMETHEUS_URL}/api/v1/query", params={"query": evicted_query}, timeout=10
-    )
-    evicted_resp.raise_for_status()
-    evicted_result = evicted_resp.json()["data"]["result"]
-
-    recent_running_resp = requests.get(
-        f"{PROMETHEUS_URL}/api/v1/query", params={"query": recent_running_pod_query}, timeout=10
-    )
-    recent_running_resp.raise_for_status()
-    has_recent_replacement_pod = len(recent_running_resp.json()["data"]["result"]) > 0
-
-    crash_resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": crash_query}, timeout=10)
-    crash_resp.raise_for_status()
-    crash_result = crash_resp.json()["data"]["result"]
+    oom_result = _prom_instant_query(oom_query, snapshot_at)
+    oom_sticky_result = _prom_instant_query(oom_sticky_query, snapshot_at)
+    evicted_result = _prom_instant_query(evicted_query, snapshot_at)
+    has_recent_replacement_pod = len(_prom_instant_query(recent_running_pod_query, snapshot_at)) > 0
+    crash_result = _prom_instant_query(crash_query, snapshot_at)
 
     # network-latency: no pod-restart signal at all (a network delay
     # doesn't touch the container), so this checks the traffic
@@ -479,11 +494,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
     # any target by construction.
     if target == "orders":
         latency_query = f'max_over_time(k6_http_req_duration_p95{{url=~".*{target}.*"}}[2m])'
-        latency_resp = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query", params={"query": latency_query}, timeout=10
-        )
-        latency_resp.raise_for_status()
-        latency_result = latency_resp.json()["data"]["result"]
+        latency_result = _prom_instant_query(latency_query, snapshot_at)
         # k6's exported value is in SECONDS -- confirmed empirically
         # (2026-07-21), see injector.py's _orders_p95_latency_ms docstring.
         p95_latency_ms = max((float(e["value"][1]) * 1000 for e in latency_result), default=None)
@@ -530,11 +541,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
             f'min_over_time((sum(rate(container_network_receive_bytes_total{{namespace="{namespace}", '
             f'pod=~"{target}-[^-]+-[^-]+$"}}[30s])))[2m:30s])'
         )
-        throughput_resp = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query", params={"query": throughput_query}, timeout=10
-        )
-        throughput_resp.raise_for_status()
-        throughput_result = throughput_resp.json()["data"]["result"]
+        throughput_result = _prom_instant_query(throughput_query, snapshot_at)
         combined_throughput_bps = (
             float(throughput_result[0]["value"][1]) if throughput_result else None
         )
@@ -569,11 +576,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
             f'max_over_time(kube_pod_status_ready{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$", '
             f'condition="false"}}[2m]) == 1'
         )
-        ready_false_resp = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query", params={"query": ready_false_query}, timeout=10
-        )
-        ready_false_resp.raise_for_status()
-        payment_stuck_not_ready = len(ready_false_resp.json()["data"]["result"]) > 0
+        payment_stuck_not_ready = len(_prom_instant_query(ready_false_query, snapshot_at)) > 0
     else:
         payment_stuck_not_ready = False
 
@@ -596,11 +599,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
             f'max_over_time(kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
             f'pod=~"{target}-[^-]+-[^-]+$", reason=~"ImagePullBackOff|ErrImagePull"}}[2m]) == 1'
         )
-        image_pull_failing_resp = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query", params={"query": image_pull_failing_query}, timeout=10
-        )
-        image_pull_failing_resp.raise_for_status()
-        front_end_image_pull_failing = len(image_pull_failing_resp.json()["data"]["result"]) > 0
+        front_end_image_pull_failing = len(_prom_instant_query(image_pull_failing_query, snapshot_at)) > 0
     else:
         front_end_image_pull_failing = False
 
@@ -626,11 +625,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
             f'min_over_time(kube_deployment_status_replicas_available'
             f'{{namespace="{namespace}", deployment="{target}"}}[2m])'
         )
-        min_replicas_resp = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query", params={"query": min_replicas_query}, timeout=10
-        )
-        min_replicas_resp.raise_for_status()
-        min_replicas_result = min_replicas_resp.json()["data"]["result"]
+        min_replicas_result = _prom_instant_query(min_replicas_query, snapshot_at)
         session_db_replicas_hit_zero = (
             len(min_replicas_result) > 0 and float(min_replicas_result[0]["value"][1]) == 0
         )
@@ -669,11 +664,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
             f'max_over_time(container_memory_working_set_bytes{{namespace="{namespace}", '
             f'pod=~"{target}-[^-]+-[^-]+$", container="{target}"}}[{_PEAK_MEMORY_TARGETS[target]}])'
         )
-        memory_resp = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query", params={"query": memory_query}, timeout=10
-        )
-        memory_resp.raise_for_status()
-        memory_result = memory_resp.json()["data"]["result"]
+        memory_result = _prom_instant_query(memory_query, snapshot_at)
         peak_memory_mib = max(
             (float(e["value"][1]) / (1024 * 1024) for e in memory_result), default=None
         )
@@ -695,11 +686,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
             f'max_over_time(mysql_global_status_threads_connected{{namespace="{namespace}", '
             f'pod=~"{target}-[^-]+-[^-]+$"}}[3m])'
         )
-        threads_resp = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query", params={"query": threads_query}, timeout=10
-        )
-        threads_resp.raise_for_status()
-        threads_result = threads_resp.json()["data"]["result"]
+        threads_result = _prom_instant_query(threads_query, snapshot_at)
         peak_threads_connected = max(
             (float(e["value"][1]) for e in threads_result), default=None
         )
@@ -747,11 +734,7 @@ def query_prometheus(target: str, namespace: str) -> dict:
             f'increase(container_cpu_cfs_throttled_periods_total{{namespace="{namespace}", '
             f'pod=~"{target}-[^-]+-[^-]+$", container="{target}"}}[6m])'
         )
-        throttle_resp = requests.get(
-            f"{PROMETHEUS_URL}/api/v1/query", params={"query": throttle_query}, timeout=10
-        )
-        throttle_resp.raise_for_status()
-        throttle_result = throttle_resp.json()["data"]["result"]
+        throttle_result = _prom_instant_query(throttle_query, snapshot_at)
         # SECOND real bug found the same session as the 2m->6m window fix
         # (2026-07-26, direct repro): during a CPU-limit reset rollout
         # (_ensure_cpu_throttle_baseline), the OLD and NEW `user` pods
@@ -803,12 +786,15 @@ def query_prometheus(target: str, namespace: str) -> dict:
     # "propose something greater than" from, and kept echoing the
     # SYSTEM_PROMPT's own few-shot example value (3) instead, which
     # always failed constraint_checks.check_safe's "> current" bound.
+    # Frozen at the same snapshot_at as every other field above for
+    # consistency (one diagnosis-time tool_output = one consistent point
+    # in time) -- doesn't compromise action-sizing safety: the actual
+    # patch-time safety check (constraint_checks.py's own live kubectl
+    # .spec.replicas read) re-verifies the REAL current value
+    # independently right before dispatch, this field is only ever a
+    # reasoning aid for the diagnoser's proposed magnitude.
     replicas_query = f'kube_deployment_spec_replicas{{namespace="{namespace}", deployment="{target}"}}'
-    replicas_resp = requests.get(
-        f"{PROMETHEUS_URL}/api/v1/query", params={"query": replicas_query}, timeout=10
-    )
-    replicas_resp.raise_for_status()
-    replicas_result = replicas_resp.json()["data"]["result"]
+    replicas_result = _prom_instant_query(replicas_query, snapshot_at)
     current_replicas = int(float(replicas_result[0]["value"][1])) if replicas_result else None
 
     return {
@@ -976,7 +962,7 @@ def stub_diagnose(tool_output: dict) -> dict:
 
 @app.post("/diagnose")
 def diagnose(req: DiagnoseRequest):
-    tool_output = query_prometheus(req.target, req.namespace)
+    tool_output = query_prometheus(req.target, req.namespace, snapshot_at=req.snapshot_at)
     result = stub_diagnose(tool_output)
     # under-provisioned-replicas fallback: only fires the real active
     # probe when nothing cheaper already explains this target, and

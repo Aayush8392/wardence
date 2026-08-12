@@ -369,6 +369,16 @@ def main():
         "--episode-id", dest="episode_id", default=None,
         help="Score this specific episode instead of guessing the most recent unscored one.",
     )
+    parser.add_argument(
+        "--snapshot-at", dest="snapshot_at", default=None,
+        help=(
+            "Real evidence-freezing timestamp (RFC3339), passed straight through "
+            "to p3_agent.py's /diagnose. operator_api.py computes and passes this "
+            "for live-triggered episodes (t0 + SETTLE_SECONDS -- the moment "
+            "evidence was genuinely ready, not whenever this script happens to "
+            "run). Omitted for batch runs, which query live 'now' as before."
+        ),
+    )
     args = parser.parse_args()
 
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
@@ -397,7 +407,11 @@ def main():
 
     # Phase 1: diagnosis only (stub + background LLM), independently timed.
     diag_resp = requests.post(
-        DIAGNOSE_URL, json={"target": target, "namespace": namespace, "episode_id": episode_id},
+        DIAGNOSE_URL,
+        json={
+            "target": target, "namespace": namespace, "episode_id": episode_id,
+            "snapshot_at": args.snapshot_at,
+        },
         timeout=DIAGNOSE_TIMEOUT_S,
     )
     diag_resp.raise_for_status()
