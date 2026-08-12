@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import jwt
@@ -81,7 +82,7 @@ from injector import (  # noqa: E402
 )
 
 
-def _republish_to_r2() -> None:
+def _republish_to_r2() -> bool:
     """Refresh the public R2 snapshot right after a manual trust-state
     change (2026-07-24 fix). Without this, admin's /promote or /demote
     changes the LIVE DB instantly but the public Trust Ladder page (which
@@ -92,11 +93,21 @@ def _republish_to_r2() -> None:
     underlying trust-state change, which already succeeded in the DB --
     it just means the public snapshot stays stale until the next run,
     same as today, not a regression.
+
+    Returns True/False (real success signal, added Phase 2 item 2) so a
+    caller with an episode row to attach it to (currently only
+    _attempt_resolve) can record a real republished_at timestamp -- the
+    completion-signal half of the "so the frontend never shows stale
+    R2-sourced data on an immediate tab-switch" gap flagged in
+    _attempt_resolve's own docstring. Every existing caller ignores the
+    return value, unaffected.
     """
     try:
         publish_to_r2.main()
+        return True
     except Exception as e:  # noqa: BLE001 -- deliberately broad, see docstring
         print(f"WARNING: R2 republish after manual override failed: {e}")
+        return False
 
 app = FastAPI()
 
@@ -490,6 +501,20 @@ _EPISODE_STATE_COLUMNS = [
     # currently in flight before setting abandon_requested, rather than
     # any logged-in user's logout abandoning someone else's episode.
     ("triggering_username", "TEXT"),
+    # Phase 2 item 2 (real-time R2 republish completion signal): NULL
+    # until _attempt_resolve's own _republish_to_r2() call genuinely
+    # succeeds for THIS episode. Distinct from episode_state='resolved'
+    # -- an episode can be resolved (scorer ran, DB updated) for several
+    # real seconds before the R2 publish (a real ~12s cost, see
+    # wardence_frontend.md's Operator saga) actually finishes. The
+    # not-yet-built Operator frontend's completion-poll should wait for
+    # this to be non-NULL, not just episode_state=='resolved', before
+    # treating the public Trust Ladder/Replay Viewer R2 snapshot as safe
+    # to re-fetch. Stays NULL forever if the publish itself fails
+    # (best-effort, per _republish_to_r2's own docstring) -- the frontend
+    # should treat "resolved, republished_at still NULL after a
+    # reasonable wait" as "stale snapshot, not stuck," not an error.
+    ("republished_at", "TEXT"),
 ]
 
 # Non-terminal episode_state values -- an explicit allow-list, not a
@@ -882,11 +907,17 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     # -- the ~12s real cost (measured, see wardence_frontend.md's
     # Operator saga) never blocks an HTTP response now, which is most of
     # what the earlier "fire-and-forget + completion-poll" design was
-    # solving for. A completion-signal poll for the frontend (so it
-    # never shows stale R2-sourced data on an immediate tab-switch) is
-    # still real future work, not built here -- out of scope for this
-    # step, flagged, not silently dropped.
-    _republish_to_r2()
+    # solving for. republished_at (Phase 2 item 2) is the real
+    # completion signal a future frontend poll can wait on, closing the
+    # gap this comment used to flag as unbuilt.
+    if _republish_to_r2():
+        conn = _conn()
+        conn.execute(
+            "UPDATE episodes SET republished_at = ? WHERE episode_id = ?",
+            (datetime.datetime.now(datetime.timezone.utc).isoformat(), episode_id),
+        )
+        conn.commit()
+        conn.close()
     return True
 
 
@@ -1235,14 +1266,15 @@ def trigger_live_status(episode_id: str, payload: dict = Depends(require_role("a
     """
     conn = _conn()
     row = conn.execute(
-        "SELECT episode_state, state_entered_at, evidence_confirmed, fault_class, t0, triggering_username "
+        "SELECT episode_state, state_entered_at, evidence_confirmed, fault_class, t0, "
+        "triggering_username, republished_at "
         "FROM episodes WHERE episode_id = ?",
         (episode_id,),
     ).fetchone()
     conn.close()
     if row is None:
         raise HTTPException(404, f"no such episode '{episode_id}'")
-    state, state_entered_at, evidence_confirmed, fault_class, t0, triggering_username = row
+    state, state_entered_at, evidence_confirmed, fault_class, t0, triggering_username, republished_at = row
     elapsed_s = None
     if state_entered_at is not None:
         entered = datetime.datetime.fromisoformat(state_entered_at)
@@ -1255,6 +1287,13 @@ def trigger_live_status(episode_id: str, payload: dict = Depends(require_role("a
         "fault_class": fault_class,
         "t0": t0,
         "can_stop_hold_early": state == "holding" and bool(evidence_confirmed),
+        # Phase 2 item 2: null until the R2 snapshot genuinely reflects
+        # this episode. episode_state=='resolved' alone is NOT enough --
+        # the scorer finishing and the ~12s R2 publish finishing are two
+        # separate real steps. Frontend should wait for this to be
+        # non-null before re-fetching/navigating to Trust Ladder/Replay
+        # Viewer's R2-sourced data for this episode.
+        "republished_at": republished_at,
     }
 
 
@@ -1778,3 +1817,136 @@ def system_status(payload: dict = Depends(require_role("admin", "demo-trigger"))
         "error_rate": round(error_rate, 4),
         "pods_by_phase": pods_by_phase,
     }
+
+
+# Live-status readout for the 3 auto-fix-adjacent classes with no other
+# Operator-screen visibility (disk-full, init-failure, memory-leak).
+# Security spec locked via Kimi review 34 finding #9 + review 38 (fixed
+# 2 real errors in the first draft: raw Prometheus label leakage, and a
+# stale-SAFE_DEMO_CLASSES role-gating premise -- disk-full/init-failure/
+# memory-leak are ALL in SAFE_DEMO_CLASSES as of the 2026-08-1x reopen,
+# not just disk-full, so all 3 get the same demo-trigger+admin gate as
+# every other class's trigger permission, not a split).
+#
+# Every query below is a hardcoded template, verbatim from agent.py's
+# own real diagnosis path for these 3 classes -- target/namespace/pod
+# regex all come from FAULT_CONFIG, never from the request. Always
+# called WITHOUT snapshot_at (live "now" only, unlike the diagnosis
+# path's evidence-freezing mechanism) -- this is a live glance, not a
+# scored diagnosis.
+_LIVE_STATUS_CLASSES = {"disk-full", "init-failure", "memory-leak"}
+
+
+def _prom_query_safe(query: str) -> list:
+    """Same shape as _prom_query, but never lets a Prometheus failure
+    propagate as an uncaught 500 -- Kimi review 38 finding 2. Raises
+    HTTPException(503) instead, which the caller can catch per-query
+    so one flaky sub-query doesn't fail the whole readout."""
+    try:
+        resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+        resp.raise_for_status()
+        return resp.json()["data"]["result"]
+    except requests.RequestException:
+        raise HTTPException(503, "prometheus unavailable")
+
+
+def _disk_full_live_status(namespace: str, target: str) -> dict:
+    pod_re = f"{target}-[^-]+-[^-]+$"
+    evicted_query = f'kube_pod_status_reason{{namespace="{namespace}", pod=~"{pod_re}", reason="Evicted"}} == 1'
+    fresh_query = (
+        f'(kube_pod_status_phase{{namespace="{namespace}", pod=~"{pod_re}", phase="Running"}} == 1) '
+        f'and on(namespace, pod) ((time() - kube_pod_created{{namespace="{namespace}", pod=~"{pod_re}"}}) < 180)'
+    )
+    # Run concurrently -- Kimi review 38 finding 5B, sequential 2x10s
+    # timeouts would double real worst-case request latency.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        evicted_future = pool.submit(_prom_query_safe, evicted_query)
+        fresh_future = pool.submit(_prom_query_safe, fresh_query)
+        evicted_result = None
+        fresh_result = None
+        evicted_error = None
+        fresh_error = None
+        try:
+            evicted_result = evicted_future.result()
+        except HTTPException as exc:
+            evicted_error = exc.detail
+        try:
+            fresh_result = fresh_future.result()
+        except HTTPException as exc:
+            fresh_error = exc.detail
+
+    evicted_present = None if evicted_error else len(evicted_result) > 0
+    fresh_present = None if fresh_error else len(fresh_result) > 0
+
+    if evicted_present is None or fresh_present is None:
+        indication = "unavailable"
+    elif evicted_present and fresh_present:
+        indication = "evicted_replacement_starting"
+    elif evicted_present and not fresh_present:
+        indication = "evicted_awaiting_replacement"
+    else:
+        indication = "no_eviction_detected"
+
+    return {
+        "evicted_pod_present": evicted_present,
+        "fresh_replacement_present": fresh_present,
+        "indication": indication,
+        "warning": evicted_error or fresh_error,
+    }
+
+
+def _init_failure_live_status(namespace: str, target: str) -> dict:
+    query = (
+        f'max_over_time(kube_pod_status_ready{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$", '
+        f'condition="false"}}[2m]) == 1'
+    )
+    try:
+        result = _prom_query_safe(query)
+    except HTTPException as exc:
+        return {"ready_false_present": None, "warning": exc.detail}
+    return {"ready_false_present": len(result) > 0, "warning": None}
+
+
+def _memory_leak_live_status(namespace: str, target: str) -> dict:
+    query = (
+        f'max_over_time(container_memory_working_set_bytes{{namespace="{namespace}", '
+        f'pod=~"{target}-[^-]+-[^-]+$", container="{target}"}}[3m])'
+    )
+    try:
+        result = _prom_query_safe(query)
+    except HTTPException as exc:
+        return {"memory_working_set_mib": None, "warning": exc.detail}
+    if not result:
+        return {"memory_working_set_mib": None, "warning": None}
+    value_mib = round(float(result[0]["value"][1]) / (1024 * 1024), 1)
+    return {"memory_working_set_mib": value_mib, "warning": None}
+
+
+@app.get("/operator/fault-status/{fault_class}")
+def operator_fault_status(
+    fault_class: str, payload: dict = Depends(require_role("admin", "demo-trigger"))
+):
+    """Sanitized, read-only live-status readout for the 3 classes with
+    no other Operator-screen visibility. Named 'fault-status', not
+    'live-status', to avoid any semantic collision with the
+    episode-scoped /trigger/live-status above (Kimi review 38 finding
+    5C). Every field returned is server-computed (bool/number/string
+    only) -- the raw Prometheus response body is never passed through,
+    per Kimi review 38's real finding that these metrics' label sets
+    (pod, uid, id/container-runtime-id) would otherwise leak."""
+    if fault_class not in _LIVE_STATUS_CLASSES:
+        raise HTTPException(
+            404, f"live-status not available for '{fault_class}' (only {sorted(_LIVE_STATUS_CLASSES)})"
+        )
+    config = FAULT_CONFIG[fault_class]
+    namespace = config["namespace"]
+    target = config["target"]
+
+    if fault_class == "disk-full":
+        status = _disk_full_live_status(namespace, target)
+    elif fault_class == "init-failure":
+        status = _init_failure_live_status(namespace, target)
+    else:
+        status = _memory_leak_live_status(namespace, target)
+
+    return {"fault_class": fault_class, **status}
