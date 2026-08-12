@@ -1,10 +1,5 @@
 import LoadingDots from "../shared/LoadingDots";
-
-const CLASS_LABELS = {
-  "crash-loop": "Crash-loop Injection",
-  oom: "OOM (Out of Memory)",
-  "disk-full": "Disk-full Overflow",
-};
+import { CLASS_LABELS } from "../../constants/faultClasses";
 
 export default function AdminOverrides({ autoFixClasses, trustMap, highlightClass, busyClass, onPromote, onDemote }) {
   return (

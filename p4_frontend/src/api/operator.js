@@ -78,6 +78,42 @@ export function resolveFault(episodeId, token) {
   return request("/trigger/resolve", { method: "POST", token, params: { episode_id: episodeId } });
 }
 
+// Real async state-machine build (Phase 1/2, 2026-08-1x/13) -- inject and
+// resolve above both now return almost immediately; this is what the
+// frontend polls for real progress (episode_state: injecting -> holding ->
+// awaiting_fix -> resolving -> resolved/failed). See operator_api.py's own
+// docstring on GET /trigger/live-status for the full field meaning.
+export function fetchLiveStatus(episodeId, token) {
+  return request("/trigger/live-status", { token, params: { episode_id: episodeId } });
+}
+
+// Crash-loop/cpu-throttling's (and, per the same mechanism, all 6
+// report-only classes') early-exit click -- only valid once live-status's
+// own can_stop_hold_early flips true. A 409 here means the window closed
+// between the poll and the click (e.g. it just naturally finished); the
+// caller should treat that as "already moving on," not a real error.
+export function stopHold(episodeId, token) {
+  return request("/trigger/stop-hold", { method: "POST", token, params: { episode_id: episodeId } });
+}
+
+// Sanitized live readout for the 3 classes with no other Operator-screen
+// visibility (disk-full/init-failure/memory-leak -- their active fault
+// window is invisible on the real storefront by mechanism design, see
+// wardence_frontend.md's "customer-visibility audit"). Real Prometheus
+// data, server-projected down to derived fields only -- never raw label
+// data. Safe to call for any class; only meaningful for these 3.
+export function fetchFaultStatus(faultClass, token) {
+  return request(`/operator/fault-status/${faultClass}`, { token });
+}
+
+// Best-effort abandon-signal (Kimi review 36 finding 8) -- never a hard
+// dependency, the 5-minute abandonment ceiling is the real backstop
+// regardless of whether this call ever completes. Caller should fire this
+// and clear local session state without waiting on it.
+export function apiLogout(token) {
+  return request("/logout", { method: "POST", token });
+}
+
 export function promoteClass(faultClass, token) {
   return request("/promote", { method: "POST", token, params: { fault_class: faultClass } });
 }

@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useCallback } from "react";
-import { login as apiLogin } from "../api/operator";
+import { login as apiLogin, apiLogout } from "../api/operator";
 
 // Persisted across refresh -- deliberate tradeoff (JWT sits in localStorage,
 // not just memory) noted in wardence_frontend.md's known gaps. No client-side
@@ -60,11 +60,18 @@ export function AuthProvider({ children }) {
   }, []);
 
   const logout = useCallback(() => {
+    // Best-effort abandon-signal (wardence_frontend.md's Operator redesign
+    // arc) -- fire and forget, never awaited. If this account triggered an
+    // episode that's still in flight, it lets the backend wind down sooner
+    // than the 5-minute abandonment ceiling; if the call never completes
+    // (tab closing, network hiccup), that ceiling is still the real
+    // backstop, so local logout must never wait on this.
+    if (token) apiLogout(token).catch(() => {});
     setToken(null);
     setUser(null);
     setRole(null);
     localStorage.removeItem(STORAGE_KEY);
-  }, []);
+  }, [token]);
 
   return (
     <AuthCtx.Provider value={{ user, token, role, loading, error, login, logout }}>

@@ -50,6 +50,42 @@
   --font-label-caps: "JetBrains Mono", ui-monospace, monospace;
 }
 
+/* TEMP, orange-accent test (Replay Viewer only, per Stitch export 8's
+   sparing-orange-accent treatment) -- scoped override, not a global
+   theme change. Remove this block (and the .theme-orange-test class on
+   ReplayViewer's root div) once the color decision is made either way.
+   Real cause of the first attempt doing nothing: the compiled `.text-
+   primary`/`.bg-primary` utilities reference `--primary` (the shadcn
+   semantic token, aliased in via the later `@theme inline` block), not
+   the earlier `--color-primary` this file also defines -- confirmed via
+   live `getComputedStyle` before rewriting this, not guessed. Both
+   tokens get overridden here so nothing depending on either is missed. */
+.theme-orange-test {
+  --color-primary: #f97316;
+  --color-primary-container: #f97316;
+  --color-primary-fixed-dim: #fdba74;
+  --color-on-primary: #1a1206;
+  --color-on-primary-container: #431407;
+
+  --primary: #f97316;
+  --primary-foreground: #1a1206;
+  --ring: #f97316;
+
+  /* Darker base background from export 9 (#0A0A0B vs the current
+     #0b0e14 -- neutral black instead of a slight blue tint, real
+     contrast difference, not just a lighter/darker read), no grid
+     (per explicit ask -- the earlier `::before` attempt kept the grid
+     and also broke the sidebar: it used `position:relative;z-index:0`
+     on this div plus a `position:fixed` pseudo-element, which turned
+     this div into its own stacking context -- a positioned element
+     with an explicit z-index paints ABOVE plain non-positioned in-flow
+     siblings regardless of DOM order, so the fixed full-viewport layer
+     rendered on top of the plain, non-positioned `<Sidebar>` and
+     covered it. Plain background-color needs none of that -- it just
+     paints this div's own box, no stacking-context side effects. */
+  background-color: #0a0a0b;
+}
+
 body {
   background-color: var(--color-surface-container-lowest);
   color: var(--color-on-surface);
@@ -71,6 +107,47 @@ body {
 .material-symbols-outlined {
   font-variation-settings: 'FILL' 0, 'wght' 300, 'GRAD' 0, 'opsz' 20;
   font-family: 'Material Symbols Outlined';
+}
+
+/* Operator topology map -- exact technique from the Stitch export
+   (stitch_wardence_casefile_incident_detail_8), colors mapped onto this
+   project's real theme tokens instead of the export's hardcoded hex. */
+.hud-bracket { position: relative; }
+.hud-bracket::before, .hud-bracket::after {
+  content: '';
+  position: absolute;
+  width: 10px; height: 10px;
+  border-color: var(--color-outline-variant);
+  border-style: solid;
+}
+.hud-bracket::before { top: -1px; left: -1px; border-width: 1px 0 0 1px; }
+.hud-bracket::after { bottom: -1px; right: -1px; border-width: 0 1px 1px 0; }
+
+.tactical-btn {
+  background-color: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--color-primary);
+  transition: all 0.2s ease;
+}
+.tactical-btn:hover:not(:disabled) {
+  box-shadow: 0 0 10px color-mix(in srgb, var(--color-primary) 50%, transparent);
+  background-color: color-mix(in srgb, var(--color-primary) 10%, transparent);
+}
+
+/* Real glassmorphism + pulsing active-fault glow, exact technique from
+   the Stitch export's .glass-module/.active-fault-glow, colors mapped
+   onto this project's real theme tokens. */
+.glass-module {
+  background-color: color-mix(in srgb, var(--color-surface-container) 80%, transparent);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+.active-fault-glow {
+  animation: pulse-border 2s infinite;
+}
+@keyframes pulse-border {
+  0% { border-color: color-mix(in srgb, var(--color-primary) 50%, transparent); box-shadow: 0 0 10px color-mix(in srgb, var(--color-primary) 20%, transparent) inset; }
+  50% { border-color: var(--color-primary); box-shadow: 0 0 20px color-mix(in srgb, var(--color-primary) 50%, transparent) inset; }
+  100% { border-color: color-mix(in srgb, var(--color-primary) 50%, transparent); box-shadow: 0 0 10px color-mix(in srgb, var(--color-primary) 20%, transparent) inset; }
 }
 
 /* Trust badges -- exact classes from the export. */

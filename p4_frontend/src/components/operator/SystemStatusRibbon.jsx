@@ -16,8 +16,11 @@ export default function SystemStatusRibbon({ status }) {
   const running = status.pods_by_phase?.Running ?? 0;
   const failed = status.pods_by_phase?.Failed ?? 0;
 
+  // No own grid wrapper -- rendered as siblings inside Operator's shared
+  // top status grid (alongside TriggerBudget), per explicit ask to move
+  // trigger budget up next to pod health/etc. rather than a separate row.
   return (
-    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+    <>
       <div className="bg-surface-container border border-outline p-4 flex flex-col justify-between">
         <p className="font-label-caps text-[11px] text-on-surface-variant mb-2">REQUEST RATE</p>
         <div className="flex items-baseline gap-2">
@@ -52,6 +55,6 @@ export default function SystemStatusRibbon({ status }) {
           </div>
         </div>
       </div>
-    </div>
+    </>
   );
 }

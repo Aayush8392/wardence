@@ -1,165 +1,66 @@
-import { useEffect, useState } from "react";
+import { CLASS_LABELS } from "../../constants/faultClasses";
 
-// Real target mapping (p2_readonly_loop/injector.py's FAULT_CONFIG), not
-// guessed -- only classes whose target maps to something a visitor
-// actually browses on the storefront get a specific hint. disk-full's
-// target (queue-master) is a backend order-processing consumer with no
-// direct customer-facing page, so it deliberately falls through to the
-// generic message rather than pointing at a page that won't show anything.
-const LANDED_HINTS = {
-  "crash-loop": "Try opening the Cart page on the storefront -- it may briefly fail to load while the pod restarts.",
-  oom: "Try browsing the product catalogue/homepage -- it may briefly fail to load while the pod restarts.",
+const STEPS = ["injecting", "holding", "awaiting_fix", "resolving", "resolved"];
+
+const STATE_COPY = {
+  injecting: "Injecting…",
+  holding: "Fault live — check storefront tab",
+  awaiting_fix: "Confirmed — use topology node to fix",
+  resolving: "Diagnosing & applying fix…",
+  resolved: "Complete",
+  failed: "Failed — see server log",
 };
 
-// M:SS, no cap -- neither the injecting nor resolving phase has a known
-// duration bound worth showing a progress bar against (resolving
-// especially: it may be genuinely diagnosing, or it may still be padding
-// out the hidden settle wait -- see wardence_frontend.md's "Two-Phase
-// Trigger Flow" section for why those two cases are deliberately never
-// distinguished to the user). This just counts up plainly so it's
-// visibly alive, not frozen.
-function formatMinSec(ms) {
-  const totalSeconds = Math.floor(ms / 1000);
-  const m = Math.floor(totalSeconds / 60);
-  const s = totalSeconds % 60;
-  return `${m}:${String(s).padStart(2, "0")}`;
-}
+// Compact single-row status card -- lives in the top status strip now,
+// not a tall sidebar. The real action buttons (inject, stop-hold,
+// diagnose & fix) live on the topology node itself (matches Stitch's own
+// disk-full/queue-master example: the action happens where the fault was
+// injected). `live` is polled once, by the parent, shared with
+// TopologyMap so the two never duplicate requests for the same episode.
+export default function ActiveSession({ episodeId, faultClass, live, onViewReplay }) {
+  // No placeholder card when nothing's active -- every bead on the
+  // topology ring already shows its own live status inline, so an empty
+  // "No active episode" card here was pure redundancy.
+  if (!episodeId) return null;
 
-function useElapsed(startedAt) {
-  const [elapsedMs, setElapsedMs] = useState(0);
-
-  // Reset during render when startedAt changes (a new phase began), rather
-  // than synchronously in the effect body -- see TriggerBudget.jsx for the
-  // same pattern and reasoning.
-  const [syncedStartedAt, setSyncedStartedAt] = useState(startedAt);
-  if (startedAt !== syncedStartedAt) {
-    setSyncedStartedAt(startedAt);
-    setElapsedMs(0);
-  }
-
-  useEffect(() => {
-    if (!startedAt) return;
-    const id = setInterval(() => setElapsedMs(Date.now() - startedAt), 250);
-    return () => clearInterval(id);
-  }, [startedAt]);
-
-  return elapsedMs;
-}
-
-// Two-phase trigger flow (2026-07-24, see wardence_frontend.md): replaces
-// the old single-call model's fake, elapsed-time-inferred phase timeline
-// with real, distinct states driven directly by which real backend call
-// is in flight. "resolving" deliberately covers BOTH the hidden
-// settle-wait pad and the real diagnosis call with one indistinguishable
-// label -- that's the whole point of the design, not an oversight.
-export default function ActiveSession({
-  injectingClass,
-  injectStartedAt, // timestamp, set once by the parent when the inject call fires
-  injectedEpisode, // { faultClass, episodeId, t0 } once landed, awaiting user's Diagnose & Fix click
-  resolvingClass,
-  resolveStartedAt, // timestamp, set once by the parent when the resolve call fires
-  lastResult,
-  onViewReplay,
-}) {
-  // Both startedAt values must come from the PARENT as stable state (set
-  // once when the call fires, not recomputed here) -- computing Date.now()
-  // inline on every render would reset useElapsed's internal clock every
-  // render instead of once per phase. Same pattern the old single-phase
-  // version already used for this exact reason.
-  const injectElapsedMs = useElapsed(injectingClass ? injectStartedAt : null);
-  const resolveElapsedMs = useElapsed(resolvingClass ? resolveStartedAt : null);
-
-  const phase = injectingClass
-    ? "injecting"
-    : resolvingClass
-    ? "resolving"
-    : injectedEpisode
-    ? "awaiting-fix"
-    : lastResult
-    ? "done"
-    : "idle";
+  const state = live?.episode_state ?? "injecting";
+  const stepIndex = STEPS.indexOf(state);
 
   return (
-    <div className="bg-surface-container-low border border-outline min-h-[320px] flex flex-col">
-      <div className="p-4 border-b border-outline bg-surface-container-high flex items-center justify-between">
-        <h2 className="font-label-caps text-[11px]">ACTIVE SESSION</h2>
-        {(injectedEpisode?.episodeId || lastResult?.episode_id) && (
-          <span className="font-data-mono text-[10px] text-primary">
-            ID: {(injectedEpisode?.episodeId ?? lastResult?.episode_id).slice(0, 8)}
-          </span>
-        )}
+    <div className="glass-module hud-bracket border border-outline-variant/30 p-3 flex items-center gap-4 flex-wrap">
+      <div className="flex items-center gap-2 shrink-0">
+        <span className="material-symbols-outlined text-primary text-base">route</span>
+        <span className="font-data-mono text-sm">{CLASS_LABELS[faultClass] ?? faultClass}</span>
       </div>
 
-      <div className="p-4 flex-1 font-data-mono text-xs space-y-4">
-        {phase === "idle" && (
-          <p className="text-on-surface-variant opacity-60">No active session. Trigger a fault to see it here.</p>
-        )}
-
-        {phase === "injecting" && (
-          <div className="flex items-center gap-2 text-primary">
-            <span className="material-symbols-outlined text-xs animate-spin">refresh</span>
-            <span>[RUNNING] Injecting fault: {injectingClass}</span>
-            <span className="ml-auto">{formatMinSec(injectElapsedMs)}</span>
-          </div>
-        )}
-
-        {phase === "awaiting-fix" && (
-          <>
-            <div className="flex items-center gap-2 text-[#238636]">
-              <span className="material-symbols-outlined text-xs">check_circle</span>
-              <span>[LANDED] Fault injected: {injectedEpisode.faultClass}</span>
-            </div>
-            {LANDED_HINTS[injectedEpisode.faultClass] && (
-              <p className="text-on-surface-variant opacity-80">{LANDED_HINTS[injectedEpisode.faultClass]}</p>
-            )}
-            <p className="text-on-surface-variant opacity-80">
-              Confirm the fault is live, then click DIAGNOSE &amp; FIX on the matching card to start the
-              real fix.
-            </p>
-          </>
-        )}
-
-        {phase === "resolving" && (
-          <div className="flex items-center gap-2 text-primary">
-            <span className="material-symbols-outlined text-xs animate-spin">refresh</span>
-            <span>[RUNNING] Diagnosing &amp; fixing: {resolvingClass}</span>
-            <span className="ml-auto">{formatMinSec(resolveElapsedMs)}</span>
-          </div>
-        )}
-
-        {phase === "done" && (
-          <div className="space-y-2">
-            <div className={lastResult.correct ? "text-[#238636]" : "text-error"}>
-              [DONE] Predicted: {lastResult.predicted_class ?? "n/a"} — {lastResult.correct ? "correct" : "incorrect"}
-            </div>
-            {lastResult.target && (
-              <div className="text-on-surface-variant">Target: {lastResult.target}</div>
-            )}
-            {lastResult.confidence != null && (
-              <div className="text-on-surface-variant">Confidence: {lastResult.confidence.toFixed(2)}</div>
-            )}
-            {lastResult.action_taken && (
-              <div className="text-on-surface-variant">
-                Action: {lastResult.action_taken} ({lastResult.durability_verdict ?? "pending"})
-              </div>
-            )}
-            {lastResult.totalElapsedMs != null && (
-              <div className="text-on-surface-variant">Total elapsed: {formatMinSec(lastResult.totalElapsedMs)}</div>
-            )}
-            {lastResult.scorer_error && (
-              <div className="text-error">Scoring failed: {lastResult.scorer_error}</div>
-            )}
-            {lastResult.episode_id && (
-              <button
-                onClick={() => onViewReplay(lastResult.episode_id)}
-                className="mt-3 text-primary hover:underline font-label-caps text-[11px]"
-              >
-                VIEW FULL REPLAY →
-              </button>
-            )}
-          </div>
-        )}
+      <div className="flex items-center gap-1 shrink-0">
+        {STEPS.map((s, i) => (
+          <div
+            key={s}
+            className={`w-2.5 h-2.5 rounded-full ${
+              i < stepIndex ? "bg-[#238636]" : i === stepIndex ? "bg-primary animate-pulse" : "bg-outline-variant/30"
+            }`}
+            title={s.replace("_", " ").toUpperCase()}
+          />
+        ))}
       </div>
+
+      <p className="font-body-sm text-xs text-on-surface-variant flex-1 min-w-[140px]">
+        {STATE_COPY[state] ?? state}
+        {live?.elapsed_in_state_s != null && ` (${live.elapsed_in_state_s}s)`}
+      </p>
+
+      {state === "resolved" && live.republished_at && (
+        <button
+          onClick={() => onViewReplay?.(episodeId)}
+          className="px-3 py-1.5 border border-primary text-primary font-label-caps text-[10px] hover:bg-primary/10 shrink-0"
+        >
+          VIEW FULL REPLAY →
+        </button>
+      )}
+      {state === "resolved" && !live.republished_at && (
+        <span className="font-label-caps text-[10px] text-on-surface-variant shrink-0">Publishing…</span>
+      )}
     </div>
   );
 }

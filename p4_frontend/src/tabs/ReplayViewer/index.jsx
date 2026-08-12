@@ -128,7 +128,7 @@ export default function ReplayViewer() {
   if (episodeId && !selected) return <p className="text-on-surface-variant">Episode {episodeId} not found.</p>;
 
   return (
-    <div className="max-w-[1600px] mx-auto">
+    <div className="max-w-[1600px] mx-auto theme-orange-test">
       <div className="flex justify-between items-center mb-4 flex-wrap gap-3">
         <h1 className="font-display-lg text-2xl">Replay Viewer</h1>
         <div className="flex items-center gap-3">
