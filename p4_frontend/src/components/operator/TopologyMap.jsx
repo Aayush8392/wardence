@@ -1,5 +1,7 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import LoadingDots from "../shared/LoadingDots";
+import CentralThinkingHub from "./CentralThinkingHub";
+import { useTickingElapsed } from "../../hooks/useTickingElapsed";
 import { ALL_CLASSES, AUTO_FIX_CLASSES, CLASS_LABELS, FAULT_TARGETS } from "../../constants/faultClasses";
 
 // Real "necklace loop" -- 12 fault classes as oval nodes evenly spaced on
@@ -9,7 +11,12 @@ import { ALL_CLASSES, AUTO_FIX_CLASSES, CLASS_LABELS, FAULT_TARGETS } from "../.
 // uneven-node-height problem: every bead now holds exactly one fault, so
 // there's nothing left to be uneven.
 const PILL_W = 188;
-const PILL_H = 96;
+// Bumped from 96 -> 116, per real content need: an active episode now
+// shows up to 5 real lines (label, target, statusLine, button, and the
+// button's own icon+text row) -- 96px was sized before statusLine
+// existed. Does not affect ring spacing (RADIUS's chord-distance formula
+// only depends on PILL_W/GAP), only the pill's own visual height.
+const PILL_H = 116;
 
 // Real radius, computed from the real pill size, not copied from Stitch's
 // mockup (its spacing didn't account for real label lengths and produced
@@ -20,12 +27,47 @@ const GAP = 20;
 const RADIUS = Math.ceil((PILL_W + GAP) / (2 * Math.sin(Math.PI / 12))) + 20; // +20 margin
 const CONTAINER = RADIUS * 2 + PILL_W + 40;
 
-function Bead({ fc, token, role, trustMap, episodeInFlight, isActive, live, onTrigger, onResolve, onStopHold }) {
+// Real clear-zone sizing for the Central Thinking Hub, sitting in the
+// ring's empty center (wardence_frontend.md's own "reuses dead space"
+// framing) -- derived from the real bead geometry above (RADIUS minus
+// half a bead's width plus the real gap: the true unobstructed distance
+// from ring center to the nearest bead edge), not a guessed constant.
+// Real fix, per explicit "too small" feedback: the Hub is a RECTANGLE
+// (wider than tall), not a circle -- the old version capped itself to a
+// small circle diameter even though a rectangle inscribed in the same
+// clear zone can be meaningfully larger. Since the ring can rotate to
+// any angle, the safe rectangle must fit inside the clear zone from
+// EVERY angle -- i.e. its own half-diagonal must stay within the clear
+// radius (an 8% margin kept for real visual breathing room, not the
+// mathematical maximum).
+const HUB_CLEAR_RADIUS = RADIUS - PILL_W / 2 - GAP;
+const HUB_ASPECT = 1.4; // wider than tall
+const HUB_MAX_DIAG_HALF = HUB_CLEAR_RADIUS * 0.92;
+const HUB_H = Math.round((HUB_MAX_DIAG_HALF * 2) / Math.sqrt(1 + HUB_ASPECT * HUB_ASPECT));
+const HUB_W = Math.round(HUB_H * HUB_ASPECT);
+
+function Bead({ fc, token, role, trustMap, episodeInFlight, isActive, live, fixRequested, onTrigger, onDiagnoseAndFix }) {
   const isAutoFix = AUTO_FIX_CLASSES.includes(fc);
   const trustState = trustMap[fc];
   const canAct = Boolean(token) && (role === "admin" || role === "demo-trigger");
-  const state = isActive ? live?.episode_state : null;
+  // `live?.episode_state` is `undefined` (not `null`) whenever `live`
+  // itself is null -- normalized so "no real state yet" is always the
+  // same value, regardless of exactly why it's missing.
+  const state = isActive ? (live?.episode_state ?? null) : null;
   const target = FAULT_TARGETS[fc]?.target;
+
+  // Real, immediate optimistic "Inject Fault was clicked" flag -- only
+  // covers the brief window between the click and `isActive` actually
+  // becoming true (the parent confirming this bead's episode exists).
+  // Once isActive is true, real polled `state` takes over entirely --
+  // this does NOT try to track the fix-in-progress lifecycle at all
+  // (that's `fixRequested`, lifted to the parent -- see its own
+  // declaration comment in Operator/index.jsx for why a per-bead flag
+  // cleared by state-diffing alone was a real, confirmed bug).
+  const [injectPending, setInjectPending] = useState(false);
+  useEffect(() => {
+    if (isActive) setInjectPending(false);
+  }, [isActive]);
 
   let statusDot = null;
   if (isAutoFix && trustState) {
@@ -40,43 +82,135 @@ function Bead({ fc, token, role, trustMap, episodeInFlight, isActive, live, onTr
     statusDot = <span className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse shrink-0" title={state} />;
   }
 
+  // Real, smoothly-ticking elapsed time in the CURRENT state -- see
+  // useTickingElapsed's own docstring. Real base value comes straight
+  // from live-status's `elapsed_in_state_s`; only interpolates the
+  // seconds between polls, never invents a number the server hasn't
+  // confirmed.
+  const elapsedS = useTickingElapsed(isActive ? live?.elapsed_in_state_s : null, isActive && Boolean(state));
+
+  // Real, SEPARATE status line -- per explicit correction, this must
+  // never occupy the same slot as the action button (the two used to
+  // swap for each other, losing the "fault is live" signal the instant
+  // the button became clickable). Every number here is real: the
+  // fault's own real hold duration (live.hold_duration_s, a locked
+  // per-class constant the backend now includes) and the real 5-minute
+  // abandonment ceiling (live.abandon_ceiling_s), both minus the real
+  // ticking elapsed time above -- never guessed.
+  let statusLine = null;
+  if (isActive && state === "holding" && live?.hold_duration_s != null && elapsedS != null) {
+    const remaining = Math.max(0, live.hold_duration_s - elapsedS);
+    statusLine = `LIVE — ${remaining}s LEFT`;
+  } else if (
+    isActive && state === "awaiting_fix" && !fixRequested &&
+    live?.abandon_ceiling_s != null && elapsedS != null
+  ) {
+    const remaining = Math.max(0, live.abandon_ceiling_s - elapsedS);
+    statusLine = `AUTO-FIX IN ${remaining}s`;
+  } else if (isActive && fixRequested && state !== "resolved" && state !== "failed" && elapsedS != null) {
+    // Covers both the real ~10s wait for a holding class's stop-flag to
+    // land AND the real diagnosis/action/durability call once resolving
+    // genuinely starts -- one continuous count-up, since there's no
+    // real fixed total to count down to (a real fallback-chain cascade
+    // can genuinely take longer than the common case).
+    statusLine = `${elapsedS}s ELAPSED`;
+  }
+
   let button;
-  if (isActive && state === "holding") {
-    button = live?.can_stop_hold_early ? (
-      <button
-        onClick={onStopHold}
-        className="px-2.5 py-1 bg-primary border border-primary text-on-primary font-label-caps text-[9px] hover:brightness-110 font-bold"
-      >
-        STOP & FIX
-      </button>
-    ) : (
-      <span className="font-label-caps text-[9px] text-on-surface-variant">LIVE — CHECK TAB</span>
+  if (!isAutoFix) {
+    // Report-only classes have no fix action -- unchanged, just the same
+    // instant-disable treatment on the trigger click itself.
+    if (isActive && state && state !== "resolved" && state !== "failed") {
+      button = (
+        <span className="flex items-center gap-1 font-label-caps text-[9px] text-primary">
+          <LoadingDots /> {state.replace("_", " ").toUpperCase()}
+        </span>
+      );
+    } else {
+      const disabled = !canAct || episodeInFlight || injectPending;
+      button = (
+        <button
+          onClick={() => { setInjectPending(true); onTrigger(fc); }}
+          disabled={disabled}
+          title={!token ? "Sign in to trigger faults" : episodeInFlight ? "An episode is already in flight" : undefined}
+          className="tactical-btn px-2.5 py-1 font-label-caps text-[9px] text-primary disabled:opacity-40"
+        >
+          {injectPending && <LoadingDots />} TRIGGER
+        </button>
+      );
+    }
+  } else if (isActive && state === "resolved" && !live?.republished_at) {
+    // Real, honest intermediate label for the real ~12s R2-republish
+    // gap -- the episode really is resolved (the Hub's own Resolution
+    // frame already says so), but this button's own job (letting the
+    // user act again) genuinely isn't safe until the published data
+    // catches up. Named for what's actually happening, not hidden
+    // behind a generic spinner.
+    button = (
+      <span className="flex items-center gap-1 font-label-caps text-[9px] text-primary">
+        <LoadingDots /> DOCUMENTING EPISODE
+      </span>
     );
-  } else if (isActive && state === "awaiting_fix" && isAutoFix) {
+  } else if (injectPending || !isActive || !state || state === "resolved" || state === "failed") {
+    // Genuinely idle, the click just fired (injectPending), or fully
+    // terminal (resolved+republished, or failed) -- back to the real
+    // starting point.
+    const disabled = !canAct || episodeInFlight || injectPending;
     button = (
       <button
-        onClick={onResolve}
+        onClick={() => { setInjectPending(true); onTrigger(fc); }}
+        disabled={disabled}
+        title={!token ? "Sign in to trigger faults" : episodeInFlight ? "An episode is already in flight" : undefined}
+        className="tactical-btn px-2.5 py-1 font-label-caps text-[9px] text-primary disabled:opacity-40 flex items-center justify-center gap-1"
+      >
+        {injectPending && <LoadingDots />} {injectPending ? "INJECTING" : "INJECT FAULT"}
+      </button>
+    );
+  } else if (state === "injecting") {
+    button = (
+      <span className="flex items-center gap-1 font-label-caps text-[9px] text-primary">
+        <LoadingDots /> INJECTING
+      </span>
+    );
+  } else if (fixRequested) {
+    // Real, single "committed" state -- covers the whole real gap from
+    // the click through to resolution: the ~10s wait for a holding
+    // class's stop-flag to actually land, AND the real diagnosis/action
+    // call once resolving genuinely starts. Driven by the durable
+    // `fixRequested` flag, not by `state` alone -- this is what fixes
+    // the real "re-enabled for a couple seconds" bug (state flips
+    // holding->awaiting_fix before the chained resolve call has actually
+    // landed; fixRequested stays true straight through that gap).
+    button = (
+      <span className="flex items-center gap-1 font-label-caps text-[9px] text-primary">
+        <LoadingDots /> FIXING
+      </span>
+    );
+  } else if (state === "holding" && !live?.can_stop_hold_early) {
+    // Real, deliberate DISABLED placeholder -- the fault is genuinely
+    // live (statusLine above already says so, persistently), but
+    // there's no real fix decision to make yet (evidence hasn't
+    // confirmed). Kept as the same button shape/slot rather than
+    // disappearing, per explicit correction: the action button should
+    // always be present, never swapped out for a status line. Real
+    // correction: labeled "INJECTING", not a disabled "Diagnose & Fix"
+    // placeholder -- per explicit ask, the button should keep saying
+    // INJECTING for the WHOLE not-yet-ready window, not just the
+    // literal `injecting` DB state.
+    button = (
+      <button disabled className="px-2.5 py-1 bg-primary border border-primary text-on-primary font-label-caps text-[9px] font-bold opacity-40 cursor-not-allowed flex items-center justify-center gap-1">
+        <LoadingDots /> INJECTING
+      </button>
+    );
+  } else {
+    // Real, genuine decision point: holding+evidence-confirmed, or
+    // awaiting_fix -- the only two moments this button is ever enabled.
+    button = (
+      <button
+        onClick={onDiagnoseAndFix}
         className="px-2.5 py-1 bg-primary border border-primary text-on-primary font-label-caps text-[9px] hover:brightness-110 font-bold"
       >
         DIAGNOSE & FIX
-      </button>
-    );
-  } else if (isActive && (state === "resolving" || state === "awaiting_fix" || state === "injecting")) {
-    button = (
-      <span className="flex items-center gap-1 font-label-caps text-[9px] text-primary">
-        <LoadingDots /> {state.replace("_", " ").toUpperCase()}
-      </span>
-    );
-  } else {
-    const disabled = !canAct || episodeInFlight;
-    button = (
-      <button
-        onClick={() => onTrigger(fc)}
-        disabled={disabled}
-        title={!token ? "Sign in to trigger faults" : episodeInFlight ? "An episode is already in flight" : undefined}
-        className="tactical-btn px-2.5 py-1 font-label-caps text-[9px] text-primary disabled:opacity-40"
-      >
-        {isAutoFix ? "INJECT FAULT" : "TRIGGER"}
       </button>
     );
   }
@@ -95,12 +229,15 @@ function Bead({ fc, token, role, trustMap, episodeInFlight, isActive, live, onTr
         <span className="font-data-mono text-[11px] leading-tight text-on-surface line-clamp-2">{CLASS_LABELS[fc]}</span>
       </div>
       <span className="font-label-caps text-[9px] text-on-surface-variant">{target}</span>
+      {statusLine && (
+        <span className="font-label-caps text-[8px] text-warning-amber">{statusLine}</span>
+      )}
       {button}
     </div>
   );
 }
 
-export default function TopologyMap({ token, role, trustMap, episodeInFlight, activeEpisode, live, onTrigger, onResolve, onStopHold }) {
+export default function TopologyMap({ token, role, trustMap, episodeInFlight, activeEpisode, live, fixRequested, onTrigger, onDiagnoseAndFix }) {
   const center = CONTAINER / 2;
 
   // Drag-to-rotate, both directions -- no idle auto-spin (explicitly
@@ -274,13 +411,41 @@ export default function TopologyMap({ token, role, trustMap, episodeInFlight, ac
                     episodeInFlight={episodeInFlight}
                     isActive={activeEpisode?.faultClass === fc}
                     live={live}
+                    fixRequested={fixRequested}
                     onTrigger={onTrigger}
-                    onResolve={onResolve}
-                    onStopHold={onStopHold}
+                    onDiagnoseAndFix={onDiagnoseAndFix}
                   />
                 </div>
               );
             })}
+          </div>
+          {/* Real bug found + fixed: this used to render BEFORE ringRef
+              below, which is `absolute inset-0` (covers the WHOLE
+              container, not just the visible ring path) -- a later
+              sibling paints over an earlier one at the same stacking
+              level regardless of visual transparency, so ringRef was
+              silently swallowing every pointer event over this exact
+              region even though nothing was drawn there. Rendering the
+              hub AFTER ringRef in the DOM (not just relying on
+              pointer-events tricks) is what actually lets clicks/scroll
+              reach it -- confirmed the simplest real fix, no CSS
+              stacking-context juggling needed. Still not a child of
+              ringRef -- must stay upright regardless of ring rotation,
+              same reasoning as each bead's own counter-rotation. */}
+          <div
+            className="absolute pointer-events-none"
+            style={{ left: center, top: center, transform: "translate(-50%, -50%)" }}
+          >
+            <div className="pointer-events-auto">
+              <CentralThinkingHub
+                episodeId={activeEpisode?.episodeId}
+                episodeState={live?.episode_state}
+                live={live}
+                token={token}
+                width={HUB_W}
+                height={HUB_H}
+              />
+            </div>
           </div>
         </div>
       </div>

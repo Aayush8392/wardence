@@ -40,6 +40,31 @@ export default function Operator() {
   const [errorMsg, setErrorMsg] = useState(null);
   const doneRef = useRef(false);
 
+  // Real UX fix, 2026-08-1x: "Diagnose & Fix" is now ONE button that
+  // both stops an extended hold (crash-loop/cpu-throttling) AND kicks
+  // off the real fix, instead of two separate clicks ("Stop & Fix" then
+  // a second "Diagnose & Fix"). Stopping a hold doesn't move the
+  // episode to awaiting_fix instantly -- the hold loop only notices the
+  // stop-flag at its own ~10s tick -- so the actual /trigger/resolve
+  // call has to wait for that real transition. autoResolveRequestedRef
+  // records "the user already asked for this, fire resolve the moment
+  // it's real"; autoResolveFiredRef guards against firing it twice if
+  // more than one poll observes awaiting_fix before the request clears.
+  const autoResolveRequestedRef = useRef(false);
+  const autoResolveFiredRef = useRef(false);
+  // Real bug found via live testing, fixed here rather than in TopologyMap:
+  // the bead's OWN "pending" flag used to clear the instant `episode_state`
+  // changed at all -- but the real holding->awaiting_fix transition (fired
+  // by the hold loop noticing the stop request, NOT by the resolveFault()
+  // call landing yet) happens BEFORE the chained resolveFault() call above
+  // actually completes. That state change alone was enough to re-enable
+  // the button for the real gap between "awaiting_fix first observed" and
+  // "resolveFault() actually lands" -- a few real seconds, not a display
+  // glitch. Fixed by tracking "the user already committed to fixing this
+  // episode" as its own durable flag, independent of which raw state value
+  // is currently polled -- cleared only on a genuinely NEW episode.
+  const [fixRequested, setFixRequested] = useState(false);
+
   const [busyClass, setBusyClass] = useState(null); // promote/demote in flight
   const [lastOverride, setLastOverride] = useState(null); // { type: "promoted" | "demoted", faultClass }
   const [overrideBannerDismissed, setOverrideBannerDismissed] = useState(false);
@@ -95,6 +120,25 @@ export default function Operator() {
             doneRef.current = true;
             loadTriggerStatus();
             loadTrustMap();
+            setFixRequested(false); // defensive -- handleTrigger already resets this for the NEXT episode, this just keeps a just-finished episode's beads from lingering disabled
+          }
+          // Real chained "Diagnose & Fix" for a held episode -- the stop
+          // request already went out (autoResolveRequestedRef set in
+          // handleDiagnoseAndFix below); this poll is what actually
+          // notices the moment the hold loop's own ~10s tick genuinely
+          // moves the episode to awaiting_fix, and fires the real
+          // /trigger/resolve call the instant that's true -- never
+          // guessed off a fixed delay.
+          if (
+            autoResolveRequestedRef.current &&
+            !autoResolveFiredRef.current &&
+            d.episode_state === "awaiting_fix"
+          ) {
+            autoResolveFiredRef.current = true;
+            autoResolveRequestedRef.current = false;
+            resolveFault(activeEpisode.episodeId, token).catch((e) => {
+              if (!cancelled && e.status !== 409) setErrorMsg(e.message);
+            });
           }
         })
         .catch((e) => { if (!cancelled) setErrorMsg(e.message); });
@@ -108,6 +152,9 @@ export default function Operator() {
   const handleTrigger = async (faultClass) => {
     setErrorMsg(null);
     setLive(null);
+    autoResolveRequestedRef.current = false;
+    autoResolveFiredRef.current = false;
+    setFixRequested(false);
     try {
       const result = await injectFault(faultClass, token);
       setActiveEpisode({ episodeId: result.episode_id, faultClass });
@@ -134,6 +181,31 @@ export default function Operator() {
       await resolveFault(activeEpisode.episodeId, token);
     } catch (e) {
       setErrorMsg(e.message);
+    }
+  };
+
+  // Real, single "Diagnose & Fix" action -- replaces the old separate
+  // "Stop & Fix" (holding classes) + "Diagnose & Fix" (awaiting_fix
+  // classes) two-button flow, per explicit UX correction: one button,
+  // one click, whichever real transition the current state needs.
+  const handleDiagnoseAndFix = async () => {
+    if (!activeEpisode || !live) return;
+    // Set BEFORE either branch, BEFORE any await -- this is the durable
+    // "user already committed" flag that fixes the real re-enable race
+    // (see its own declaration comment above): it must be true for the
+    // entire window from this click through to the episode resolving,
+    // regardless of how many intermediate real state values get polled
+    // in between.
+    setFixRequested(true);
+    if (live.episode_state === "holding") {
+      // Real chain, not synchronous: stopping the hold only sets a
+      // flag the injector's own loop notices on its next ~10s tick --
+      // the actual resolve fires later, from the live-status poll
+      // above, the instant it genuinely observes awaiting_fix.
+      autoResolveRequestedRef.current = true;
+      await handleStopHold();
+    } else if (live.episode_state === "awaiting_fix") {
+      await handleResolve();
     }
   };
 
@@ -261,9 +333,9 @@ export default function Operator() {
           episodeInFlight={Boolean(triggerStatus?.episode_in_flight)}
           activeEpisode={activeEpisode}
           live={live}
+          fixRequested={fixRequested}
           onTrigger={handleTrigger}
-          onResolve={handleResolve}
-          onStopHold={handleStopHold}
+          onDiagnoseAndFix={handleDiagnoseAndFix}
         />
 
         {token && <LiveStatusDetail token={token} />}

@@ -29,6 +29,7 @@ Usage:
 """
 
 import datetime
+import json
 import os
 import subprocess
 import sys
@@ -42,6 +43,7 @@ import jwt
 import requests
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "p2_readonly_loop"))
@@ -413,6 +415,38 @@ STOP_FILE_DIR.mkdir(parents=True, exist_ok=True)
 # stop-file convention.
 LIVE_TRIGGER_LOG_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_trigger_logs"
 LIVE_TRIGGER_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+# Same real dir p3_agent.py's REASONING_STREAM_DIR resolves to (both
+# processes run on the same machine) -- kept as a literal duplicate of
+# that same fallback logic (not imported, to avoid a cross-service
+# import) rather than a shared constants module, matching this project's
+# existing "duplicated by hand, kept in sync" convention for the handful
+# of things genuinely shared between agent-side and API-side code
+# (FAULT_CLASSES, FIELD_GUIDANCE, DETERMINISTIC_ACTION_MAP).
+REASONING_STREAM_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_reasoning_streams"
+# Real polling cadence for tailing the reasoning-events file below --
+# fast enough to feel live (token-by-token gemma reasoning arrives in
+# a burst of small chunks), cheap enough not to matter (a few hundred
+# stat+read calls over a diagnosis call's real few-second lifetime).
+REASONING_STREAM_POLL_S = 0.15
+# Real safety ceiling -- if a "done" event never arrives (e.g. the
+# diagnosis subprocess itself crashed before writing one), the SSE
+# connection self-closes rather than holding a browser connection open
+# forever. Real, deliberately generous number: the frontend now opens
+# this connection right after inject (episodeId set), NOT when it first
+# observes episode_state=="resolving" -- fixed 2026-08-1x after a real,
+# live-confirmed race (a 4s live-status poll interval routinely missed
+# a diagnosis call that finished in 1-5s, so the browser connected to an
+# already-finished stream and burst-read everything at once instead of
+# watching it live). Opening early means this ceiling must now cover the
+# full real worst case BEFORE resolving even starts, not just the
+# diagnosis call itself: holding's own up-to-300s extended window +
+# awaiting_fix's 5-minute (300s) abandonment ceiling + a real diagnosis
+# call (well under 60s in practice). 700s gives real margin over that
+# ~660s worst case. Cheap to hold open this long -- the tail loop below
+# only polls for the file's existence/new lines every
+# REASONING_STREAM_POLL_S, negligible cost while nothing's been written.
+REASONING_STREAM_MAX_S = 700
 
 
 def _stop_file_path(episode_id: str) -> Path:
@@ -872,8 +906,14 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
         time.sleep(remaining_s + RESOLVE_SAFETY_BUFFER_S)
 
     try:
+        # --stream unconditional here: _attempt_resolve only ever runs
+        # for a live-triggered episode (batch runs call p3_scorer.py
+        # directly, never through this function) -- see this endpoint's
+        # own real "reasoning stream" file convention in p3_agent.py's
+        # REASONING_STREAM_DIR/_make_reasoning_event_writer.
         scorer_result = subprocess.run(
-            [sys.executable, str(SCORER_PATH), "--episode-id", episode_id, "--snapshot-at", snapshot_at],
+            [sys.executable, str(SCORER_PATH), "--episode-id", episode_id,
+             "--snapshot-at", snapshot_at, "--stream"],
             cwd=str(SCORER_CWD),
             capture_output=True,
             text=True,
@@ -1294,7 +1334,94 @@ def trigger_live_status(episode_id: str, payload: dict = Depends(require_role("a
         # non-null before re-fetching/navigating to Trust Ladder/Replay
         # Viewer's R2-sourced data for this episode.
         "republished_at": republished_at,
+        # Real timer constants, added so the frontend never has to
+        # hardcode/duplicate them (and risk drifting out of sync with
+        # the real values enforced here) -- both are the exact same
+        # constants this file itself already enforces, not new numbers.
+        # `hold_duration_s` is null for the 4 auto-fix classes with no
+        # real "fault-live" countdown concept: oom/disk-full self-heal
+        # their active mechanism almost immediately (their real
+        # signal is a STICKY k8s field, not a held-open window --
+        # see wardence_frontend.md's "Full locked state across all 12
+        # classes" table), and under-provisioned-replicas/bad-rollout
+        # never self-revert at all (standing until fixed), so neither
+        # has a real duration to count down from.
+        "hold_duration_s": LIVE_TRIGGER_DURATION_OVERRIDE_S.get(fault_class),
+        "abandon_ceiling_s": ABANDON_CEILING_S,
     }
+
+
+@app.get("/trigger/reasoning-stream/{episode_id}")
+def trigger_reasoning_stream(episode_id: str, token: str):
+    """
+    Real Server-Sent Events feed for the live Operator "Central Thinking
+    Hub" widget -- tails the JSONL file p3_agent.py's /diagnose (called
+    from inside _attempt_resolve's real scorer subprocess) writes real
+    events into as its diagnosis genuinely happens: "provider_attempt"
+    (a real chain-entry handoff), "turn_start", "reasoning_chunk" (real
+    streamed model reasoning text, gemma/nemotron only -- see
+    model_backend.py's STREAMING_CAPABLE_PROVIDERS), and a final "done".
+
+    Auth via `?token=` query param, NOT the standard require_role()
+    Authorization-header dependency every other endpoint uses -- real,
+    deliberate exception: the browser's native EventSource API (the only
+    real way to consume text/event-stream from JS without hand-rolling a
+    fetch-based SSE reader) cannot set custom request headers at all, so
+    a Bearer header is structurally unavailable here. Same real JWT
+    decode/role check as require_role(), just reading the token from a
+    different place -- not a weaker check, a differently-carried one.
+
+    Real, not fabricated: every event here is written by the actual
+    diagnosis call as it happens, not synthesized or replayed from a
+    template. Stale note, corrected: the connection is now opened by the
+    frontend right after inject (episodeId set), not when diagnosis
+    starts -- see CentralThinkingHub.jsx's own comment for the real race
+    this fixed (a polled episode_state could miss a fast "resolving"
+    window entirely). This endpoint's own tail loop already handled a
+    not-yet-existing file gracefully either way.
+
+    No episode_state/ownership check against `episode_id` beyond the
+    role gate -- same real trust boundary as every other admin/demo-
+    trigger endpoint; a nonexistent or already-finished episode_id just
+    yields an empty stream that self-closes at REASONING_STREAM_MAX_S,
+    never a 404 (avoids a real race against the file not existing yet in
+    the brief window between /trigger/inject returning and the scorer
+    subprocess actually reaching /diagnose).
+    """
+    try:
+        payload = decode_token(token)
+    except jwt.PyJWTError as e:
+        raise HTTPException(401, f"invalid token: {e}")
+    if payload["role"] not in ("admin", "demo-trigger"):
+        raise HTTPException(403, f"role '{payload['role']}' not permitted for this endpoint")
+
+    path = REASONING_STREAM_DIR / f"reasoning_{episode_id}.jsonl"
+
+    def _tail():
+        start = time.monotonic()
+        pos = 0
+        saw_done = False
+        while True:
+            if path.exists():
+                with path.open("r") as f:
+                    f.seek(pos)
+                    new_lines = f.readlines()
+                    pos = f.tell()
+                for line in new_lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    yield f"data: {line}\n\n"
+                    try:
+                        if json.loads(line).get("type") == "done":
+                            saw_done = True
+                    except json.JSONDecodeError:
+                        pass
+            if saw_done or (time.monotonic() - start) > REASONING_STREAM_MAX_S:
+                return
+            time.sleep(REASONING_STREAM_POLL_S)
+
+    return StreamingResponse(_tail(), media_type="text/event-stream")
 
 
 @app.post("/trigger/stop-hold")

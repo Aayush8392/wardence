@@ -68,7 +68,9 @@ NOT built here (Phase 2 IS built now, in a separate module):
 import json
 from typing import Callable, Optional
 
-from model_backend import PROVIDER_CHAIN, call_one, LLMFailure
+from model_backend import (
+    PROVIDER_CHAIN, STREAMING_CAPABLE_PROVIDERS, call_one, call_one_streaming, LLMFailure,
+)
 
 MAX_TURNS = 5
 
@@ -230,13 +232,29 @@ def _has_strong_signal(tool_name: str, observation) -> bool:
 
 def _run_episode_with_provider(
     entry: dict, target: str, namespace: str, tools: dict, episode_id: str | None = None,
+    on_event=None,
 ) -> dict:
     """
     One full attempt of the evidence loop against a SINGLE provider-chain
     entry, fresh transcript, no carryover from any prior provider. Returns
     a dict with status in {"diagnosed", "max_turns_exceeded",
     "invalid_tool_name", "provider_failure"}.
+
+    on_event: optional callable(dict), added 2026-08-1x for the live
+    Operator "Central Thinking Hub" widget. None everywhere else (every
+    batch-run/comparison-sampling caller) -- purely additive, zero
+    behavior change when omitted. Fires real events only, never
+    synthetic/fabricated ones: "provider_attempt" once per chain entry
+    tried (the real handoff moment), "turn_start" once per ReAct turn,
+    and "reasoning_chunk" carrying real streamed reasoning text (only for
+    STREAMING_CAPABLE_PROVIDERS; for other providers, at most one
+    "reasoning_chunk" fires post-hoc if the provider's own response
+    happened to include reasoning text, never fabricated).
     """
+    if on_event:
+        on_event({"type": "provider_attempt", "provider": entry["provider"],
+                   "model": entry["model"], "tier": entry["tier"]})
+
     transcript_lines = []
     parse_failures = 0
     called_tools = set()
@@ -251,6 +269,8 @@ def _run_episode_with_provider(
     observations = {}
 
     for turn_num in range(1, MAX_TURNS + 1):
+        if on_event:
+            on_event({"type": "turn_start", "turn": turn_num})
         prompt = SYSTEM_TEMPLATE.format(
             target=target, namespace=namespace,
             turns_left=MAX_TURNS - turn_num + 1,
@@ -261,7 +281,36 @@ def _run_episode_with_provider(
             transcript="\n".join(transcript_lines) if transcript_lines else "(none yet)",
             turn_num=turn_num,
         )
-        result = call_one(entry, prompt, timeout=30, episode_id=episode_id)
+        # Real streaming path, live Operator widget only (on_event set) --
+        # streams the SAME single real call this turn would make anyway,
+        # never a second parallel call. Every other caller (batch runs,
+        # comparison sampling, on_event=None) is completely unaffected.
+        if on_event and entry["provider"] in STREAMING_CAPABLE_PROVIDERS and entry["format"] == "openai_compat":
+            result = call_one_streaming(
+                entry, prompt, timeout=30, episode_id=episode_id,
+                on_reasoning_chunk=lambda chunk: on_event({"type": "reasoning_chunk", "text": chunk}),
+            )
+        else:
+            result = call_one(entry, prompt, timeout=30, episode_id=episode_id)
+            if on_event and not isinstance(result, LLMFailure):
+                # Best-effort, real-data-only post-hoc reasoning surface for
+                # a non-streaming-capable provider (e.g. gemini has none;
+                # deepinfra/nemotron always does -- confirmed live via
+                # check_stream_confidence_source.py). Never fabricated --
+                # only fires if the provider's own raw response actually
+                # included this field. Real bug found+fixed via that same
+                # live test: the openai_compat shape nests this field at
+                # raw["choices"][0]["message"]["reasoning_content"], NOT
+                # top-level raw["reasoning_content"] (the first version of
+                # this line always read None for every real openai_compat
+                # provider -- confirmed live, 0 chunks seen for nemotron).
+                reasoning_text = None
+                if isinstance(result.raw, dict):
+                    choices = result.raw.get("choices") or []
+                    if choices:
+                        reasoning_text = choices[0].get("message", {}).get("reasoning_content")
+                if reasoning_text:
+                    on_event({"type": "reasoning_chunk", "text": reasoning_text})
         if isinstance(result, LLMFailure):
             return {"status": "provider_failure", "detail": result, "transcript": transcript_lines}
 
@@ -338,6 +387,7 @@ def _run_episode_with_provider(
 def run_react_diagnosis(
     target: str, namespace: str, tools: dict[str, Callable[[], object]],
     chain: list[dict] | None = None, episode_id: str | None = None,
+    on_event=None,
 ) -> dict:
     """
     tools: {tool_name: zero_arg_callable} -- the caller's own real tool
@@ -360,10 +410,15 @@ def run_react_diagnosis(
     Never raises on a normal LLM/tool failure. COMPARISON-ONLY -- see
     this module's docstring; the caller decides where this result gets
     logged and must not feed it into trust_engine/ACTION_MAP.
+
+    on_event: optional callable(dict), threaded straight through to every
+    _run_episode_with_provider() attempt -- see that function's own
+    docstring for the real event shapes. None (every caller except the
+    live Operator widget) is a no-op, zero behavior change.
     """
     failed_attempts = []
     for entry in (chain if chain is not None else PROVIDER_CHAIN):
-        attempt = _run_episode_with_provider(entry, target, namespace, tools, episode_id=episode_id)
+        attempt = _run_episode_with_provider(entry, target, namespace, tools, episode_id=episode_id, on_event=on_event)
 
         if attempt["status"] == "diagnosed":
             parsed, result = attempt["parsed"], attempt["result"]

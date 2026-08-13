@@ -304,6 +304,233 @@ def _call_openai_compat(
     )
 
 
+# Real, live-confirmed streaming-capable subset of the chain.
+# check_stream_support.py (gitignored) originally confirmed both
+# cloudflare/deepinfra return genuine multi-chunk SSE at all -- but
+# check_stream_confidence_source.py (gitignored, run 2026-08-1x)
+# confirmed a real, disqualifying problem specific to deepinfra: its
+# streaming response does NOT carry usable per-chunk logprobs the way
+# its non-streaming response does, silently degrading
+# confidence_source away from "logprob" to "self_reported" -- and this
+# streaming call IS the real production diagnosis call for a live-
+# triggered episode (no separate non-streaming call happens
+# afterward), so this would have corrupted real logged confidence
+# quality, not just the widget display. deepinfra/nemotron was ALSO
+# confirmed (same test run) to only ever emit its reasoning as ONE
+# complete chunk anyway (1 real chunk seen, never incremental) -- so
+# nothing genuinely "live" is lost by excluding it here; it already
+# gets the correct "reveal as one block" treatment via the plain
+# call_one() fallback path in react_agent.py, which preserves real
+# logprobs. Only cloudflare (gemma) is included: confirmed live to
+# stream incrementally (326 real chunks in the same test) AND keep its
+# real per-chunk logprobs intact (confidence_source == "logprob").
+# Groq/OpenRouter/Gemini were never tested for streaming at all, not
+# included for that separate reason.
+STREAMING_CAPABLE_PROVIDERS = {"cloudflare"}
+
+
+def _call_openai_compat_streaming(
+    provider: str, base_url: str, model: str, prompt: str, timeout: int, max_tokens: int, tier: str,
+    system_prompt: str | None, on_reasoning_chunk, on_content_chunk,
+) -> Union[LLMResult, LLMFailure]:
+    """
+    Real token-by-token streaming variant of _call_openai_compat, built
+    for the live Operator "Central Thinking Hub" widget ONLY. This is the
+    SAME single real API call _call_openai_compat would make for this
+    chain entry (same body, same model, same temperature=0) -- never a
+    second, duplicate call alongside the real production one. Only ever
+    called for entries in STREAMING_CAPABLE_PROVIDERS (currently
+    cloudflare only -- see that constant's own comment for why
+    deepinfra was tested and excluded). Real reasoning text arrives
+    under EITHER `reasoning` or `reasoning_content`
+    depending on provider/params (gemma's key is conditional on
+    reasoning_effort being set) -- both keys are always checked here,
+    whichever is present wins, same fix as the probe script's own
+    root-caused bug.
+
+    Real, NOT YET LIVE-VERIFIED caveat, flagged rather than silently
+    assumed: whether Cloudflare/DeepInfra's STREAMING responses carry
+    real per-chunk `logprobs`/a final `usage` object the same way their
+    non-streaming responses do (requested here via the standard OpenAI-
+    compatible `stream_options: {"include_usage": true}` + `logprobs:
+    true` params) has only been confirmed for the non-streaming shape --
+    verify live before trusting this path's confidence/token numbers.
+    Defensive: if either is absent, confidence/token-count fall back the
+    same way the non-streaming path already does for a provider that
+    omits them (self_reported / 0), never crashes.
+    """
+    key_env = {"cloudflare": "CLOUDFLARE_API_KEY", "deepinfra": "DEEPINFRA_API_KEY"}[provider]
+    key = os.environ[key_env]
+    messages = ([{"role": "system", "content": system_prompt}] if system_prompt else []) + [
+        {"role": "user", "content": prompt}
+    ]
+    body = {
+        "model": model,
+        "messages": messages,
+        "temperature": TEMPERATURE,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "logprobs": True,
+        "top_logprobs": 1,
+    }
+    try:
+        resp = requests.post(
+            base_url,
+            headers={"Authorization": f"Bearer {key}"},
+            json=body,
+            timeout=timeout,
+            stream=True,
+        )
+    except requests.exceptions.Timeout:
+        return LLMFailure(provider, model, "timeout", f"timed out after {timeout}s (streaming)")
+    except requests.exceptions.RequestException as e:
+        return LLMFailure(provider, model, "bad_response", str(e))
+
+    if resp.status_code == 429:
+        # Same real Cloudflare-4006 pattern-match as _call_openai_compat's
+        # non-streaming path -- kept in sync by hand (see that function's
+        # own comment for the full reasoning).
+        body_text = resp.text[:500]
+        if provider == "cloudflare" and ("4006" in body_text or "daily free allocation" in body_text):
+            from quota_tracker import mark_exhausted
+            mark_exhausted(provider, model, reason="Cloudflare 4006: daily free Neuron allocation exhausted")
+        return LLMFailure(provider, model, "rate_limited", body_text)
+    if resp.status_code >= 500:
+        return LLMFailure(provider, model, "bad_response", f"HTTP {resp.status_code}: {resp.text[:500]}")
+    if resp.status_code != 200:
+        return LLMFailure(provider, model, "bad_response", f"HTTP {resp.status_code}: {resp.text[:500]}")
+
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    logprob_entries: list[dict] = []
+    final_usage: Optional[dict] = None
+    fingerprint: Optional[str] = None
+    try:
+        for line in resp.iter_lines(decode_unicode=True):
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                chunk = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            fingerprint = chunk.get("system_fingerprint", fingerprint)
+            if chunk.get("usage"):
+                final_usage = chunk["usage"]
+            choices = chunk.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            reasoning_delta = delta.get("reasoning_content") or delta.get("reasoning")
+            if reasoning_delta:
+                reasoning_parts.append(reasoning_delta)
+                if on_reasoning_chunk:
+                    on_reasoning_chunk(reasoning_delta)
+            content_delta = delta.get("content")
+            if content_delta:
+                content_parts.append(content_delta)
+                if on_content_chunk:
+                    on_content_chunk(content_delta)
+            chunk_logprobs = (choices[0].get("logprobs") or {}).get("content")
+            if chunk_logprobs:
+                logprob_entries.extend(chunk_logprobs)
+    except requests.exceptions.RequestException as e:
+        return LLMFailure(provider, model, "bad_response", f"stream read error: {e}")
+
+    text = "".join(content_parts)
+    if not text:
+        return LLMFailure(
+            provider, model, "bad_response",
+            f"empty streamed content (reasoning_chars={len(''.join(reasoning_parts))})",
+        )
+
+    parsed = _extract_json(text)
+    if parsed is None:
+        return LLMFailure(provider, model, "parse_failure", text[:500])
+
+    confidence = None
+    confidence_source = None
+    if logprob_entries:
+        avg_logprob = sum(t["logprob"] for t in logprob_entries) / len(logprob_entries)
+        confidence = math.exp(avg_logprob)
+        confidence_source = "logprob"
+    elif isinstance(parsed.get("confidence"), (int, float)):
+        confidence = parsed["confidence"]
+        confidence_source = "self_reported"
+
+    raw = {
+        "streamed": True,
+        "usage": final_usage or {},
+        "system_fingerprint": fingerprint,
+        "reasoning_text": "".join(reasoning_parts),
+    }
+    return LLMResult(
+        text=text, parsed=parsed, provider=provider, model=model, tier=tier,
+        confidence=confidence, confidence_source=confidence_source, raw=raw,
+        version_fingerprint=fingerprint,
+    )
+
+
+def call_one_streaming(
+    entry: dict, prompt: str, timeout: int = 30, system_prompt: str | None = None,
+    episode_id: str | None = None,
+    on_reasoning_chunk=None, on_content_chunk=None,
+) -> Union[LLMResult, LLMFailure]:
+    """
+    Streaming twin of call_one(), built ONLY for the live Operator
+    "Central Thinking Hub" widget -- lets a connected browser watch a
+    real diagnosis call's reasoning arrive live. NOT a second/parallel
+    call: this IS the one real production call for this chain entry,
+    made once, same as call_one() would make it -- a caller must use ONE
+    or the OTHER for a given entry/turn, never both (double-calling would
+    double real quota spend and risk two different real answers for one
+    logical attempt).
+
+    Only cloudflare/deepinfra are streaming-capable in this chain today
+    (STREAMING_CAPABLE_PROVIDERS above) -- callers MUST check
+    `entry["provider"] in STREAMING_CAPABLE_PROVIDERS` before calling
+    this and fall back to plain call_one() otherwise; raises ValueError
+    if called against an unsupported entry rather than silently
+    degrading to a non-streaming call the caller didn't ask for.
+
+    Shares call_one()'s real quota-check-before-send / record-usage-after
+    / clear-exhausted-on-success wiring, so this participates in the same
+    real budget accounting as every other real call in the chain -- not a
+    free/unaccounted side channel.
+    """
+    if entry["provider"] not in STREAMING_CAPABLE_PROVIDERS or entry["format"] != "openai_compat":
+        raise ValueError(
+            f"call_one_streaming: provider {entry['provider']!r} is not streaming-capable -- "
+            "caller must use call_one() for this entry"
+        )
+    from quota_tracker import check_quota, record_call, clear_exhausted
+
+    quota = check_quota(entry["provider"], entry["model"])
+    if quota["status"] == "exhausted":
+        detail = (
+            f"real daily limit reached ({quota['used']}/{quota['limit']}) -- no request sent"
+            if quota.get("limit") is not None
+            else f"{quota.get('reason', 'marked exhausted')} -- no request sent"
+        )
+        return LLMFailure(entry["provider"], entry["model"], "quota_exhausted", detail)
+
+    result = _call_openai_compat_streaming(
+        entry["provider"], entry["base_url"], entry["model"], prompt, timeout,
+        entry.get("max_tokens", 500), entry["tier"], system_prompt,
+        on_reasoning_chunk, on_content_chunk,
+    )
+    record_call(
+        entry["provider"], entry["model"], tokens=_extract_total_tokens(result),
+        neurons=_extract_neurons(result), episode_id=episode_id,
+    )
+    if isinstance(result, LLMResult):
+        clear_exhausted(entry["provider"], entry["model"])
+    return result
+
+
 # Real, FINAL provider chain -- locked 2026-07-30 after an extensive
 # real search across ~25 candidate providers (see wardence_context.md's
 # Model Strategy section for the full accounting: what was tested,

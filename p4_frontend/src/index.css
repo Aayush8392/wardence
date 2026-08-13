@@ -205,6 +205,74 @@ body {
   40% { transform: translateY(-3px); opacity: 1; }
 }
 
+/* Central Thinking Hub (Operator's necklace-ring center widget) -- real
+   keyframes only, driven by real events (provider_attempt/reasoning_chunk
+   from GET /trigger/reasoning-stream), never a fixed decorative loop that
+   runs regardless of real state. Merged from v0's real OrbitalPulse/
+   HandoffScan mechanics + Stitch's Obsidian-HUD visual language (see
+   wardence_frontend.md's Operator-tab "Central Thinking Hub" sessions).
+   Reuses this file's existing color tokens (--color-warning-amber for
+   the "in-progress" semantic, per the locked color-scheme decision) --
+   no new hardcoded hex values. */
+.hub-ripple {
+  position: absolute; inset: 0;
+  border-radius: 9999px;
+  border: 2px solid var(--color-primary);
+  opacity: 0;
+  animation: hub-ripple-expand 0.9s ease-out;
+}
+@keyframes hub-ripple-expand {
+  0% { transform: scale(0.3); opacity: 0.8; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+.hub-orbit {
+  position: absolute;
+  border: 1px solid color-mix(in srgb, var(--color-warning-amber) 45%, transparent);
+  border-radius: 9999px;
+  /* Real bug found + fixed: the `animation` SHORTHAND has no <time>
+     term here, which makes animation-duration implicitly 0s -- a
+     0-duration animation completes instantly and looks completely
+     static, which is exactly what was observed live. The real per-
+     element duration is set via inline style (React, driven by real
+     measured throughput) -- using the LONGHAND properties here instead
+     of the shorthand means that inline animation-duration is the only
+     thing setting it, with nothing in this class silently re-zeroing
+     it. */
+  animation-name: hub-orbit-spin;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+@keyframes hub-orbit-spin { to { transform: rotate(360deg); } }
+
+.hub-core {
+  border-radius: 9999px;
+  background: radial-gradient(circle at 40% 35%, color-mix(in srgb, var(--color-warning-amber) 70%, white),
+    var(--color-warning-amber) 45%, transparent 75%);
+  /* Same real fix as .hub-orbit above -- longhand, no shorthand
+     duration to silently override the inline one. */
+  animation-name: hub-core-pulse;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+}
+@keyframes hub-core-pulse {
+  0%, 100% { transform: scale(0.9); filter: saturate(0.85); }
+  50% { transform: scale(1.08); filter: saturate(1.3); }
+}
+
+.hub-beam {
+  position: absolute; top: 0; bottom: 0; width: 2px;
+  background: var(--color-warning-amber);
+  box-shadow: 0 0 12px 4px color-mix(in srgb, var(--color-warning-amber) 70%, transparent);
+  animation: hub-beam-sweep 1.4s ease-in-out;
+}
+@keyframes hub-beam-sweep {
+  0% { left: -4px; opacity: 0; }
+  10% { opacity: 1; }
+  90% { opacity: 1; }
+  100% { left: 100%; opacity: 0; }
+}
+
 .streak-block { width: 10px; height: 14px; margin-right: 2px; }
 .streak-green { background-color: #238636; }
 .streak-red { background-color: #f85149; }

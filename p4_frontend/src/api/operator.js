@@ -87,6 +87,21 @@ export function fetchLiveStatus(episodeId, token) {
   return request("/trigger/live-status", { token, params: { episode_id: episodeId } });
 }
 
+// Real SSE URL for the live Operator "Central Thinking Hub" widget.
+// NOT run through the shared request() helper above -- EventSource takes
+// a raw URL string and connects itself, it doesn't use fetch() at all.
+// Token travels as a query param, not an Authorization header (see
+// operator_api.py's trigger_reasoning_stream docstring for why --
+// EventSource structurally cannot set custom headers).
+export function reasoningStreamUrl(episodeId, token) {
+  if (!BASE_URL) {
+    throw new Error("VITE_OPERATOR_API_URL is not set (check p4_frontend/.env)");
+  }
+  const url = new URL(`${BASE_URL}/trigger/reasoning-stream/${episodeId}`);
+  url.searchParams.set("token", token);
+  return url.toString();
+}
+
 // Crash-loop/cpu-throttling's (and, per the same mechanism, all 6
 // report-only classes') early-exit click -- only valid once live-status's
 // own can_stop_hold_early flips true. A 409 here means the window closed

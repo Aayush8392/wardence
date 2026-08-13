@@ -400,6 +400,13 @@ class HandleRequest(BaseModel):
     # and threads it through p3_scorer.py --snapshot-at. None (every
     # batch-run episode) preserves today's live "now" query behavior.
     snapshot_at: str | None = None
+    # Live Operator "Central Thinking Hub" widget, 2026-08-1x -- when
+    # True (only ever set by operator_api.py's live-trigger path via
+    # p3_scorer.py --stream), real reasoning/provider-handoff events from
+    # this diagnosis are appended to a per-episode file for
+    # /trigger/reasoning-stream to tail. False for every batch-run
+    # episode (default) -- zero behavior change, zero file written.
+    stream: bool = False
 
 
 class ActRequest(BaseModel):
@@ -451,6 +458,34 @@ def _build_llm_tools(target: str, namespace: str, snapshot_at: str | None = None
     if target == "catalogue":
         tools["probe_catalogue_capacity"] = lambda: probe_catalogue_capacity(namespace)
     return tools
+
+
+# Live Operator "Central Thinking Hub" widget -- same real /tmp-file-tail
+# convention already established for progress logs
+# (operator_api.py's LIVE_TRIGGER_LOG_DIR), reused here rather than
+# inventing a second mechanism for the same "cross-process, low-latency,
+# no new infra" real need.
+REASONING_STREAM_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_reasoning_streams"
+REASONING_STREAM_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _make_reasoning_event_writer(episode_id: str):
+    """Real event writer for one live episode's diagnosis -- one JSON
+    object per line, appended as events genuinely happen (never
+    buffered/batched, so a tailing reader sees them close to real-time).
+    Truncates any stale file from a prior attempt against the same
+    episode_id first (there should never be one in practice -- Gate 2
+    already guarantees one resolve in flight per episode -- but starting
+    clean is cheap insurance). Caller is responsible for writing a final
+    {"type": "done"} event so a tailing reader knows when to stop."""
+    path = REASONING_STREAM_DIR / f"reasoning_{episode_id}.jsonl"
+    path.write_text("")
+
+    def _write(event: dict) -> None:
+        with path.open("a") as f:
+            f.write(json.dumps(event, default=str) + "\n")
+
+    return _write, path
 
 
 def _normalize_predicted_class(predicted: str) -> str | None:
@@ -539,8 +574,19 @@ def diagnose(req: HandleRequest):
                        "failed_attempts": [], "detail": "WARDENCE_STUB_ONLY set -- LLM call skipped"}
     else:
         llm_tools = _build_llm_tools(req.target, req.namespace, snapshot_at=req.snapshot_at)
+        on_event, reasoning_stream_path = (
+            _make_reasoning_event_writer(req.episode_id) if (req.stream and req.episode_id) else (None, None)
+        )
         _t0 = time.perf_counter()
-        llm_result = run_react_diagnosis(req.target, req.namespace, llm_tools, episode_id=req.episode_id)
+        llm_result = run_react_diagnosis(
+            req.target, req.namespace, llm_tools, episode_id=req.episode_id, on_event=on_event,
+        )
+        if on_event:
+            # Real terminal sentinel -- lets /trigger/reasoning-stream's
+            # tailing reader know the diagnosis genuinely finished (vs.
+            # still guessing off a timeout), regardless of which status
+            # run_react_diagnosis landed on.
+            on_event({"type": "done", "status": llm_result.get("status")})
         # Real wall-clock duration of the primary chain's own call
         # (2026-08-05, paired with the same field on comparison-sampling
         # rows below) -- lets all 4 models be compared on speed, not

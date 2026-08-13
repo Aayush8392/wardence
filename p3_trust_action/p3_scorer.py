@@ -379,6 +379,16 @@ def main():
             "run). Omitted for batch runs, which query live 'now' as before."
         ),
     )
+    parser.add_argument(
+        "--stream", action="store_true",
+        help=(
+            "Real live Operator 'Central Thinking Hub' widget flag, passed through "
+            "to p3_agent.py's /diagnose -- have it write real reasoning/provider-"
+            "handoff events to a per-episode file for /trigger/reasoning-stream to "
+            "tail. Only ever set by operator_api.py's live-trigger path; omitted "
+            "(default False) for every batch-run episode, zero behavior change."
+        ),
+    )
     args = parser.parse_args()
 
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
@@ -410,7 +420,7 @@ def main():
         DIAGNOSE_URL,
         json={
             "target": target, "namespace": namespace, "episode_id": episode_id,
-            "snapshot_at": args.snapshot_at,
+            "snapshot_at": args.snapshot_at, "stream": args.stream,
         },
         timeout=DIAGNOSE_TIMEOUT_S,
     )
