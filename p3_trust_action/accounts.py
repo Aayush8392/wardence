@@ -212,7 +212,10 @@ def totp_provisioning_uri(username: str, secret: str, issuer: str = "Wardence") 
 
 
 def verify_totp(secret: str, code: str) -> bool:
-    return pyotp.TOTP(secret).verify(code)
+    # valid_window=1 accepts the current 30s slot plus the one immediately
+    # before/after it -- real tolerance for clock drift/submission latency
+    # between client and server, without meaningfully weakening TOTP.
+    return pyotp.TOTP(secret).verify(code, valid_window=1)
 
 
 def verify_login(

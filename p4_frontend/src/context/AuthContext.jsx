@@ -1,4 +1,4 @@
-import { createContext, useContext, useState, useCallback } from "react";
+import { createContext, useContext, useState, useCallback, useEffect } from "react";
 import { login as apiLogin, apiLogout } from "../api/operator";
 
 // Persisted across refresh -- deliberate tradeoff (JWT sits in localStorage,
@@ -57,6 +57,26 @@ export function AuthProvider({ children }) {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  // Real, global stale-session handler (2026-08-14/15 finding): api/
+  // operator.js dispatches this the moment ANY authenticated call comes
+  // back 401 -- a JWT that expired or otherwise stopped being valid
+  // server-side. Clears local state directly rather than calling the
+  // full logout() above, since that would try apiLogout() with the
+  // already-known-bad token (harmless, just wasted -- but this is the
+  // more honest "the session is already gone" path, not a user-initiated
+  // logout). No apiLogin/apiLogout import needed here beyond what's
+  // already in scope.
+  useEffect(() => {
+    const onExpired = () => {
+      setToken(null);
+      setUser(null);
+      setRole(null);
+      localStorage.removeItem(STORAGE_KEY);
+    };
+    window.addEventListener("wardence:session-expired", onExpired);
+    return () => window.removeEventListener("wardence:session-expired", onExpired);
   }, []);
 
   const logout = useCallback(() => {

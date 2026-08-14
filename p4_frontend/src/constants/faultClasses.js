@@ -26,11 +26,15 @@ export const REPORT_ONLY_CLASSES = [
 
 export const ALL_CLASSES = [...AUTO_FIX_CLASSES, ...REPORT_ONLY_CLASSES];
 
-// The 3 classes whose active fault window is invisible on the real
+// The 4 classes whose active fault window is invisible on the real
 // storefront by mechanism design (see wardence_frontend.md's
 // "customer-visibility audit" session) -- the only ones the live-status
 // readout (GET /operator/fault-status/{class}) is meaningful for.
-export const INVISIBLE_CLASSES = ["disk-full", "init-failure", "memory-leak"];
+// bad-rollout added 2026-08-15 -- real correction, found live: front-end's
+// own rolling-update strategy + readiness probe keep the OLD healthy pod
+// serving the entire time the injected bad image sits failing to pull,
+// the same "old pod stays healthy" mechanism init-failure already used.
+export const INVISIBLE_CLASSES = ["disk-full", "init-failure", "memory-leak", "bad-rollout"];
 
 // target/namespace verbatim from injector.py's real FAULT_CONFIG.
 export const FAULT_TARGETS = {

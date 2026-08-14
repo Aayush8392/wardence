@@ -32,6 +32,16 @@ async function request(path, { method = "GET", token, body, params } = {}) {
     // will never be scored, which needs different handling (abandon it,
     // don't let the user retry) than a transient failure would.
     err.status = res.status;
+    // Real, deliberate global signal for a STALE session specifically --
+    // only fires when a call that carried a token still came back 401
+    // (a fresh/expired JWT, not e.g. /login's own credential failure,
+    // which never sends a token in the first place). AuthContext listens
+    // for this and clears local state, so the UI stops silently pretending
+    // the user is still logged in while every real request 401s underneath
+    // it (the exact gap found live 2026-08-14/15).
+    if (res.status === 401 && token) {
+      window.dispatchEvent(new Event("wardence:session-expired"));
+    }
     throw err;
   }
   return data;

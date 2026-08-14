@@ -724,19 +724,24 @@ def trust(request: Request, payload: dict = Depends(require_role("admin", "demo-
 LEGACY_EPISODE_IN_FLIGHT_MAX_AGE_MINUTES = 4
 
 
-def _episode_in_flight(conn) -> bool:
-    """Exact, not heuristic (Kimi review 35 finding 4): a live-triggered
-    episode is in flight iff its episode_state is one of the real
-    non-terminal states -- no age guessing involved. The legacy age
-    check below only ever applies to episode_state IS NULL rows (see
-    LEGACY_EPISODE_IN_FLIGHT_MAX_AGE_MINUTES's own comment)."""
+def _in_flight_episode_row(conn) -> tuple[str, str] | None:
+    """Real (episode_id, fault_class) for whichever episode is currently
+    in flight, or None -- added 2026-08-15 so the frontend can rehydrate
+    its local activeEpisode state after a page refresh (previously only a
+    bare bool was available anywhere, so a mid-episode refresh lost all
+    context: the grid/panel had no way to know WHICH class was actually
+    still running, just that triggering a new one was blocked). The
+    legacy age-based fallback intentionally has no real fault_class to
+    report (pre-migration rows never recorded one in a form this can
+    trust) -- returns None for the class in that rare path, callers must
+    handle it."""
     placeholders = ",".join("?" for _ in NON_TERMINAL_EPISODE_STATES)
     row = conn.execute(
-        f"SELECT 1 FROM episodes WHERE episode_state IN ({placeholders}) LIMIT 1",
+        f"SELECT episode_id, fault_class FROM episodes WHERE episode_state IN ({placeholders}) LIMIT 1",
         tuple(NON_TERMINAL_EPISODE_STATES),
     ).fetchone()
     if row is not None:
-        return True
+        return (row[0], row[1])
 
     legacy_row = conn.execute(
         """
@@ -748,11 +753,21 @@ def _episode_in_flight(conn) -> bool:
         """
     ).fetchone()
     if legacy_row is None:
-        return False
-    _, t0_str = legacy_row
+        return None
+    episode_id, t0_str = legacy_row
     t0 = datetime.datetime.fromisoformat(t0_str)
     age_minutes = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds() / 60
-    return age_minutes <= LEGACY_EPISODE_IN_FLIGHT_MAX_AGE_MINUTES
+    if age_minutes <= LEGACY_EPISODE_IN_FLIGHT_MAX_AGE_MINUTES:
+        return (episode_id, None)
+    return None
+
+
+def _episode_in_flight(conn) -> bool:
+    """Exact, not heuristic (Kimi review 35 finding 4): a live-triggered
+    episode is in flight iff its episode_state is one of the real
+    non-terminal states -- no age guessing involved. Thin wrapper over
+    _in_flight_episode_row so the two never drift out of sync."""
+    return _in_flight_episode_row(conn) is not None
 
 
 def _global_triggers_today(conn) -> int:
@@ -789,14 +804,21 @@ def trigger_status(request: Request):
         ).fetchone()[0]
         cooldown_remaining_s = max(COOLDOWN_S - elapsed, 0)
 
-    in_flight = _episode_in_flight(conn)
+    in_flight_row = _in_flight_episode_row(conn)
     conn.close()
     return {
         "global_cap": GLOBAL_DAILY_CAP,
         "global_used_today": global_used,
         "global_remaining_today": global_remaining,
         "your_cooldown_remaining_s": round(cooldown_remaining_s),
-        "episode_in_flight": in_flight,
+        "episode_in_flight": in_flight_row is not None,
+        # Real (2026-08-15): lets the frontend rehydrate activeEpisode
+        # after a page refresh instead of just knowing SOMETHING is
+        # blocking new triggers with no way to show what. Both null in
+        # the rare legacy-fallback-with-no-fault_class path -- frontend
+        # must handle that as "in flight but unknown," never crash on it.
+        "in_flight_episode_id": in_flight_row[0] if in_flight_row else None,
+        "in_flight_fault_class": in_flight_row[1] if in_flight_row else None,
     }
 
 
@@ -1961,7 +1983,7 @@ def system_status(payload: dict = Depends(require_role("admin", "demo-trigger"))
 # called WITHOUT snapshot_at (live "now" only, unlike the diagnosis
 # path's evidence-freezing mechanism) -- this is a live glance, not a
 # scored diagnosis.
-_LIVE_STATUS_CLASSES = {"disk-full", "init-failure", "memory-leak"}
+_LIVE_STATUS_CLASSES = {"disk-full", "init-failure", "memory-leak", "bad-rollout"}
 
 
 def _prom_query_safe(query: str) -> list:
@@ -2049,6 +2071,29 @@ def _memory_leak_live_status(namespace: str, target: str) -> dict:
     return {"memory_working_set_mib": value_mib, "warning": None}
 
 
+def _bad_rollout_live_status(namespace: str, target: str) -> dict:
+    """Real (2026-08-15): bad-rollout was found to be storefront-invisible
+    too, not just disk-full/init-failure/memory-leak -- front-end's own
+    rolling-update strategy (real, confirmed maxSurge=25%/maxUnavailable=25%,
+    which for a single replica means create-new-before-removing-old) plus
+    its existing readinessProbe means the OLD healthy pod keeps serving
+    100% of real traffic the entire time the NEW (broken-image) pod sits
+    unable to start -- injector.py's own _front_end_image_pull_failing
+    docstring already called this "the same old-pod-stays-healthy pattern
+    as init-failure," just never reflected in this readout or
+    INVISIBLE_CLASSES until now. Mirrors that exact same real Prometheus
+    signal, not a new detection mechanism."""
+    query = (
+        f'kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
+        f'pod=~"{target}.*", reason=~"ImagePullBackOff|ErrImagePull"}} == 1'
+    )
+    try:
+        result = _prom_query_safe(query)
+    except HTTPException as exc:
+        return {"image_pull_failing": None, "warning": exc.detail}
+    return {"image_pull_failing": len(result) > 0, "warning": None}
+
+
 @app.get("/operator/fault-status/{fault_class}")
 def operator_fault_status(
     fault_class: str, payload: dict = Depends(require_role("admin", "demo-trigger"))
@@ -2073,6 +2118,8 @@ def operator_fault_status(
         status = _disk_full_live_status(namespace, target)
     elif fault_class == "init-failure":
         status = _init_failure_live_status(namespace, target)
+    elif fault_class == "bad-rollout":
+        status = _bad_rollout_live_status(namespace, target)
     else:
         status = _memory_leak_live_status(namespace, target)
 

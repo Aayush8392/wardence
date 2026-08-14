@@ -14,11 +14,10 @@ import {
 } from "../../api/operator";
 import { AUTO_FIX_CLASSES } from "../../constants/faultClasses";
 import SystemStatusRibbon from "../../components/operator/SystemStatusRibbon";
-import TopologyMap from "../../components/operator/TopologyMap";
-import LiveStatusDetail from "../../components/operator/LiveStatusDetail";
+import FaultGrid from "../../components/operator/FaultGrid";
+import EpisodePanel from "../../components/operator/EpisodePanel";
 import AdminOverrides from "../../components/operator/AdminOverrides";
 import TriggerBudget from "../../components/operator/TriggerBudget";
-import ActiveSession from "../../components/operator/ActiveSession";
 
 const STATUS_POLL_MS = 15_000;
 const LIVE_POLL_MS = 4_000;
@@ -32,13 +31,24 @@ export default function Operator() {
   const [trustMap, setTrustMap] = useState({});
 
   // Real async state-machine episode (Phase 1/2, 2026-08-1x/13). Polled
-  // ONCE here and shared with both TopologyMap (node-level action
-  // buttons) and ActiveSession (progress panel) -- neither makes its own
+  // ONCE here and shared with both FaultGrid (card-level action buttons)
+  // and EpisodePanel (header/reasoning stream) -- neither makes its own
   // duplicate /trigger/live-status calls.
   const [activeEpisode, setActiveEpisode] = useState(null); // { episodeId, faultClass }
   const [live, setLive] = useState(null);
   const [errorMsg, setErrorMsg] = useState(null);
   const doneRef = useRef(false);
+
+  // Real slide-out panel state -- which class's panel is open, independent
+  // of whether that class has a live episode. Opened either by clicking a
+  // FaultGrid card body (dossier-only, set directly) or by triggering a
+  // fault (set in handleTrigger below). Per the locked design: the panel
+  // always auto-retargets to whichever class currently has the live
+  // episode, on whatever section (reasoning/dossier-open) is currently
+  // shown -- so triggering a NEW class while a different class's panel is
+  // open just reassigns this value, EpisodePanel re-renders for the new
+  // faultClass/episodeId/live combination.
+  const [openPanelClass, setOpenPanelClass] = useState(null);
 
   // Real UX fix, 2026-08-1x: "Diagnose & Fix" is now ONE button that
   // both stops an extended hold (crash-loop/cpu-throttling) AND kicks
@@ -52,7 +62,7 @@ export default function Operator() {
   // more than one poll observes awaiting_fix before the request clears.
   const autoResolveRequestedRef = useRef(false);
   const autoResolveFiredRef = useRef(false);
-  // Real bug found via live testing, fixed here rather than in TopologyMap:
+  // Real bug found via live testing, fixed here rather than in FaultGrid:
   // the bead's OWN "pending" flag used to clear the instant `episode_state`
   // changed at all -- but the real holding->awaiting_fix transition (fired
   // by the hold loop noticing the stop request, NOT by the resolveFault()
@@ -72,8 +82,23 @@ export default function Operator() {
 
   const highlightClass = currentContext?.type === "promoteClass" ? currentContext.faultClass : null;
 
+  // Real rehydration, added 2026-08-15: a page refresh mid-episode used
+  // to lose ALL local knowledge of which class was running -- the grid
+  // just showed every card as a bare disabled IDLE/TRIGGER with no
+  // explanation, even though the backend knew exactly what was live.
+  // /trigger/status now carries the real in-flight episode's id/class;
+  // `prev ?? ...` never clobbers activeEpisode if it's already known
+  // (e.g. this tab is the one that triggered it) -- only fills it in
+  // when it's genuinely missing.
   const loadTriggerStatus = useCallback(() => {
-    fetchTriggerStatus().then(setTriggerStatus).catch((e) => setErrorMsg(e.message));
+    fetchTriggerStatus()
+      .then((data) => {
+        setTriggerStatus(data);
+        if (data.episode_in_flight && data.in_flight_episode_id && data.in_flight_fault_class) {
+          setActiveEpisode((prev) => prev ?? { episodeId: data.in_flight_episode_id, faultClass: data.in_flight_fault_class });
+        }
+      })
+      .catch((e) => setErrorMsg(e.message));
   }, []);
 
   useEffect(() => {
@@ -103,7 +128,7 @@ export default function Operator() {
 
   useEffect(() => { loadTrustMap(); }, [loadTrustMap]);
 
-  // Real episode-state-machine poll, shared by TopologyMap + ActiveSession.
+  // Real episode-state-machine poll, shared by FaultGrid + EpisodePanel.
   useEffect(() => {
     if (!activeEpisode || !token) return;
     doneRef.current = false;
@@ -149,6 +174,14 @@ export default function Operator() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- loadTriggerStatus/loadTrustMap are stable useCallbacks, re-including them would just re-run this identically on every render
   }, [activeEpisode, token]);
 
+  // Real toggle: clicking the card that's already the open panel's target
+  // closes it instead of re-opening the same panel -- per explicit ask.
+  // Triggering a fault always opens/retargets regardless (handleTrigger
+  // below calls setOpenPanelClass directly, never through this toggle).
+  const handleCardClick = (faultClass) => {
+    setOpenPanelClass((current) => (current === faultClass ? null : faultClass));
+  };
+
   const handleTrigger = async (faultClass) => {
     setErrorMsg(null);
     setLive(null);
@@ -158,6 +191,7 @@ export default function Operator() {
     try {
       const result = await injectFault(faultClass, token);
       setActiveEpisode({ episodeId: result.episode_id, faultClass });
+      setOpenPanelClass(faultClass); // real auto-retarget -- a newly-triggered fault always takes the panel
       loadTriggerStatus();
     } catch (e) {
       setErrorMsg(e.message);
@@ -239,9 +273,25 @@ export default function Operator() {
     }
   };
 
+  const storefrontUrl = import.meta.env.VITE_STOREFRONT_URL || "http://localhost:8079";
+
   return (
-    <div className="max-w-[1600px] mx-auto">
+    <div className="flex items-start gap-0">
+    <div className="min-w-0 flex-1 max-w-[1600px] mx-auto">
       <div className="sticky top-0 z-40 bg-surface-container-lowest">
+        <div className="flex items-center justify-between pt-2 pb-1">
+          <span className="font-label-caps text-[10px] text-on-surface-variant">
+            Every trigger's real effect (or lack of one, for the 3 invisible classes) can be verified live here.
+          </span>
+          <a
+            href={storefrontUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-label-caps text-[10px] text-primary hover:underline flex items-center gap-1 shrink-0"
+          >
+            OPEN STOREFRONT <span className="material-symbols-outlined text-xs">open_in_new</span>
+          </a>
+        </div>
         {highlightClass && !bannerDismissed && (
           <div className="bg-primary/10 border border-primary/30 px-4 py-2 mb-4 flex items-center justify-between">
             <p className="font-body-sm text-sm text-primary flex items-center gap-2">
@@ -314,31 +364,20 @@ export default function Operator() {
         <TriggerBudget status={triggerStatus} />
       </div>
 
-      {activeEpisode && (
-        <div className="mb-6">
-          <ActiveSession
-            episodeId={activeEpisode.episodeId}
-            faultClass={activeEpisode.faultClass}
-            live={live}
-            onViewReplay={(episodeId) => navigateTo(`/replay/${episodeId}`, null, "Operator")}
-          />
-        </div>
-      )}
-
       <div className="space-y-6">
-        <TopologyMap
+        <FaultGrid
           token={token}
           role={role}
           trustMap={trustMap}
           episodeInFlight={Boolean(triggerStatus?.episode_in_flight)}
           activeEpisode={activeEpisode}
+          selectedFaultClass={openPanelClass}
           live={live}
           fixRequested={fixRequested}
           onTrigger={handleTrigger}
           onDiagnoseAndFix={handleDiagnoseAndFix}
+          onOpenPanel={handleCardClick}
         />
-
-        {token && <LiveStatusDetail token={token} />}
 
         {role === "admin" && (
           <AdminOverrides
@@ -351,6 +390,18 @@ export default function Operator() {
           />
         )}
       </div>
+    </div>
+
+      {openPanelClass && (
+        <EpisodePanel
+          faultClass={openPanelClass}
+          episodeId={activeEpisode?.faultClass === openPanelClass ? activeEpisode.episodeId : null}
+          live={activeEpisode?.faultClass === openPanelClass ? live : null}
+          token={token}
+          onClose={() => setOpenPanelClass(null)}
+          onViewReplay={(episodeId) => navigateTo(`/replay/${episodeId}`, null, "Operator")}
+        />
+      )}
     </div>
   );
 }
