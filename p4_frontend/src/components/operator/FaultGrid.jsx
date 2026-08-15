@@ -98,6 +98,19 @@ function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, isActiv
       DIAGNOSE & FIX
     </button>
   );
+  // Report-only equivalent of diagnoseButton -- same handler underneath
+  // (onDiagnoseAndFix -> handleStopHold for the "holding" state, works
+  // identically for report-only classes since the backend's evidence-file
+  // early-exit mechanism already covers all 6 of them), just a label that
+  // doesn't imply a fix ever gets dispatched.
+  const revertButton = (
+    <button
+      onClick={(e) => { e.stopPropagation(); onDiagnoseAndFix(); }}
+      className="px-2.5 py-1 bg-primary border border-primary text-on-primary font-label-caps text-[9px] hover:brightness-110 font-bold"
+    >
+      REVERT
+    </button>
+  );
 
   if (injectPending || !isActive || !state || (state === "resolved" && live?.republished_at) || state === "failed") {
     stateLabel = injectPending ? "INJECTING" : "IDLE";
@@ -111,11 +124,13 @@ function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, isActiv
   } else if (state === "injecting") {
     stateLabel = "INJECTING";
     actionButton = waitingButton("INJECTING");
-  } else if (isAutoFix && fixRequested) {
-    // Report-only classes never set fixRequested (no manual dispatch to
-    // commit to) -- this branch only ever fires for auto-fix.
-    stateLabel = "FIXING";
-    actionButton = waitingButton("FIXING");
+  } else if (fixRequested) {
+    // Real for both buckets now: report-only classes can also set
+    // fixRequested (clicking REVERT during "holding"), and need their own
+    // honest label for the ~10s gap before the backend's hold loop
+    // actually notices the stop request and flips episode_state.
+    stateLabel = isAutoFix ? "FIXING" : "REVERTING";
+    actionButton = waitingButton(isAutoFix ? "FIXING" : "REVERTING");
   } else if (state === "holding") {
     // Real, deliberate correction: the fault is genuinely LIVE (and the
     // statusLine's own countdown above already says so) for the WHOLE
@@ -123,12 +138,13 @@ function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, isActiv
     // never contradict the countdown by still saying INJECTING here.
     // Only the BUTTON's enabled/disabled state depends on
     // live.can_stop_hold_early (evidence confirmed enough to act), never
-    // the label text.
+    // the label text. Report-only classes get the same early-exit option
+    // as auto-fix (REVERT instead of DIAGNOSE & FIX) -- the backend's
+    // evidence-file mechanism already covers all 6 report-only classes,
+    // this was previously frontend-only-disabled with no real reason.
     stateLabel = "LIVE FAULT";
-    if (!isAutoFix) {
-      actionButton = waitingButton("LIVE");
-    } else if (live?.can_stop_hold_early) {
-      actionButton = diagnoseButton;
+    if (live?.can_stop_hold_early) {
+      actionButton = isAutoFix ? diagnoseButton : revertButton;
     } else {
       actionButton = waitingButton("CONFIRMING");
     }

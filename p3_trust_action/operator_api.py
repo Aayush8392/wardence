@@ -320,6 +320,26 @@ STATUS_NAMESPACE = "sock-shop"
 # fault as "no anomaly"). Never skip this, even here.
 SETTLE_SECONDS = 35
 
+# Real bug found and fixed 2026-08-1x (episode a0e27f54, network-partition):
+# snapshot_at = t0 + SETTLE_SECONDS is computed from INJECTION START, not
+# fault-end -- fine for batch mode (duration_s=60s, diagnosis naturally
+# happens at fault-end+35s=~95s past t0) but wrong for a live-triggered
+# holding episode, where snapshot_at fires mid-fault regardless of how
+# long the real hold (duration override) runs. Most classes are immune
+# (max_over_time-for-a-spike signals register correctly whenever queried
+# mid-fault; min_over_time-for-a-drop signals like session-cart-failure's
+# scale-to-0 manifest instantly). network-partition is the one exception:
+# its min_over_time-for-a-drop signal depends on the underlying iptables
+# block itself, which injector.py's own docstring confirms takes ~30-40s
+# of real propagation before traffic is reliably near-zero -- the fixed
+# 35s settle lands right at that boundary, sometimes before it's clean.
+# This override gives network-partition a wider margin so snapshot_at
+# reliably lands past the documented worst case; every other class keeps
+# the original 35s via .get()'s default.
+SETTLE_SECONDS_OVERRIDE = {
+    "network-partition": 60,
+}
+
 # Extra margin added on top of whatever's left of SETTLE_SECONDS when
 # /trigger/resolve is called before the full settle window has naturally
 # elapsed (2026-07-24, two-phase trigger flow). Not a new race-condition
@@ -919,11 +939,14 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     if timer is not None:
         timer.cancel()
 
-    t0_row = conn.execute("SELECT t0 FROM episodes WHERE episode_id = ?", (episode_id,)).fetchone()
+    t0_row = conn.execute(
+        "SELECT t0, fault_class FROM episodes WHERE episode_id = ?", (episode_id,)
+    ).fetchone()
     conn.close()
     t0 = datetime.datetime.fromisoformat(t0_row[0])
+    settle_seconds = SETTLE_SECONDS_OVERRIDE.get(t0_row[1], SETTLE_SECONDS)
     # Real evidence-freezing timestamp -- the moment evidence was
-    # genuinely ready (t0 + SETTLE_SECONDS), computed here regardless of
+    # genuinely ready (t0 + settle_seconds), computed here regardless of
     # how much real wall-clock time passes AFTER this point waiting for
     # a manual resolve click or the abandonment ceiling. This is the
     # actual fix for a genuine live-tested bug: a real crash-loop
@@ -935,9 +958,9 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     # through to p3_scorer.py --snapshot-at -> p3_agent.py /diagnose ->
     # every PromQL query in agent.py's query_prometheus, all of which
     # now evaluate against this fixed point instead of live "now".
-    snapshot_at = (t0 + datetime.timedelta(seconds=SETTLE_SECONDS)).isoformat()
+    snapshot_at = (t0 + datetime.timedelta(seconds=settle_seconds)).isoformat()
     elapsed_s = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds()
-    remaining_s = SETTLE_SECONDS - elapsed_s
+    remaining_s = settle_seconds - elapsed_s
     if remaining_s > 0:
         time.sleep(remaining_s + RESOLVE_SAFETY_BUFFER_S)
 

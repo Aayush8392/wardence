@@ -194,3 +194,4 @@ p2_readonly_loop/check_fault_class_configurability.py
 p2_readonly_loop/check_upr_intensity_tuning.py
 p2_readonly_loop/check_upr_sustained_hold_test.py
 p2_readonly_loop/poll_orders_real_ready.sh
+p2_readonly_loop/check_network_latency_scoped_target.sh
