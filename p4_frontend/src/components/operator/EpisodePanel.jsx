@@ -1,9 +1,16 @@
 import { Fragment, useEffect, useRef, useState } from "react";
 import { reasoningStreamUrl, fetchFaultStatus } from "../../api/operator";
-import { fetchEpisodes } from "../../api/r2";
+import { fetchEpisodes, fetchRadarDossier } from "../../api/r2";
 import { useTickingElapsed } from "../../hooks/useTickingElapsed";
 import { CLASS_LABELS, INVISIBLE_CLASSES } from "../../constants/faultClasses";
 import LoadingDots from "../shared/LoadingDots";
+import RadarChart from "../charts/RadarChart";
+
+// Axis keys pulled straight from publish_to_r2.py's build_radar_dossier
+// output -- kept here (not imported) since RadarChart.jsx already
+// defines its own AXES list; this is only used to build the
+// allDossierValuesByAxis min-max input for the two unbounded axes.
+const RADAR_MINMAX_AXES = ["avg_response_time_ms", "confidence_stdev"];
 
 // Real per-class slide-out panel. Replaces the ring-center Central
 // Thinking Hub (shelved in ./_shelved/CentralThinkingHub.jsx) + the
@@ -166,6 +173,32 @@ export default function EpisodePanel({ faultClass, episodeId, live, token, onClo
   const elapsedS = useTickingElapsed(live?.elapsed_in_state_s, Boolean(episodeId) && episodeState != null);
 
   const [dossierOpen, setDossierOpen] = useState(!episodeId);
+
+  // Real Trust Dossier radar data -- fetched once, lazily, the first
+  // time the collapsible section is actually opened (not on mount --
+  // most episode panel opens are reasoning-first per the class's own
+  // default, so fetching this unconditionally would be wasted for the
+  // common case). radarDossier holds the FULL per-class object (every
+  // fault class), not just this one, since the two unbounded axes
+  // (response time / confidence spread) are normalized relative to the
+  // real range observed across the whole roster, not a guessed fixed
+  // ceiling -- see RadarChart.jsx's own normalize() docstring.
+  const [radarDossier, setRadarDossier] = useState(null);
+  const [radarError, setRadarError] = useState(null);
+  useEffect(() => {
+    if (!dossierOpen || radarDossier || radarError) return;
+    let cancelled = false;
+    fetchRadarDossier()
+      .then((data) => {
+        if (!cancelled) setRadarDossier(data);
+      })
+      .catch((err) => {
+        if (!cancelled) setRadarError(err.message || "failed to load");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [dossierOpen, radarDossier, radarError]);
 
   // Real reasoning-stream state, ported from the shelved CentralThinkingHub
   // -- same phase machine (idle/ripple/ignition/handshake/resolution),
@@ -437,10 +470,35 @@ export default function EpisodePanel({ faultClass, episodeId, live, token, onClo
             <span className="material-symbols-outlined text-base">{dossierOpen ? "expand_less" : "expand_more"}</span>
           </button>
           {dossierOpen && (
-            <div className="mt-3 border border-outline-variant/20 p-6 flex items-center justify-center">
-              <span className="font-label-caps text-[10px] text-on-surface-variant opacity-60">
-                Radar dossier — coming soon
-              </span>
+            <div className="mt-3 border border-outline-variant/20 p-2 flex flex-col items-center justify-center gap-2">
+              {radarError && (
+                <span className="font-label-caps text-[10px] text-on-surface-variant opacity-60">
+                  Failed to load dossier — {radarError}
+                </span>
+              )}
+              {!radarError && !radarDossier && <LoadingDots />}
+              {!radarError && radarDossier && (
+                <RadarChart
+                  // Keyed on faultClass so switching classes (the panel
+                  // auto-retargets without unmounting itself) remounts
+                  // RadarChart fresh -- otherwise its entrance animation
+                  // fires once, on this component's first mount, and
+                  // never again for subsequent classes viewed in the
+                  // same panel session.
+                  key={faultClass}
+                  dossierEntry={radarDossier[faultClass] ?? null}
+                  allDossierValuesByAxis={RADAR_MINMAX_AXES.reduce((acc, axis) => {
+                    acc[axis] = Object.values(radarDossier).map((entry) => entry?.[axis] ?? null);
+                    return acc;
+                  }, {})}
+                />
+              )}
+              {!radarError && radarDossier && (
+                <span className="font-label-caps text-[8px] text-on-surface-variant opacity-50 text-center">
+                  * response speed / confidence spread ticks are relative to the fastest/lowest
+                  seen across the current roster, not a fixed target like the other axes
+                </span>
+              )}
             </div>
           )}
         </div>

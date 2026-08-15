@@ -45,6 +45,10 @@ Produces four objects in the bucket:
                              cost-per-correct-diagnosis, real avg response
                              time, and real auto-fix-class action
                              durability rate.
+  - radar_dossier.json    -- per-fault-class 6-axis data for the Operator
+                             tab's Trust Dossier radar chart (see
+                             build_radar_dossier's own docstring for the
+                             locked axis set and what was rejected).
 
 Rewritten 2026-08-06 for the new Trust Ladder frontend (mission-control
 table, all 3 dimensions, max-streak, provider badge, recent-outcome bit
@@ -886,6 +890,157 @@ def build_trust_ladder(conn: sqlite3.Connection) -> list[dict]:
     return ladder
 
 
+def build_action_accuracy_by_class(conn: sqlite3.Connection, auto_fix_classes: set) -> dict:
+    """Real % of Dimension-C outcome recordings that were "correct" (per
+    record_action_outcome's own `correct` column -- diagnosis AND action
+    both correct, exact-match for the 3 magnitude-sensitive actions,
+    tool-only-match for the other 3, per the split already applied by
+    p3_agent.py before calling it) per fault class. Auto-fix classes
+    only -- report-only classes never call record_action_outcome at all,
+    so action_trust_history has zero rows for them; None (never 0), same
+    "None means never measured" convention used everywhere else in this
+    file (e.g. dimension_a fields for report-only classes in
+    build_trust_ladder)."""
+    rows = conn.execute(
+        "SELECT fault_class, COUNT(*), SUM(correct) FROM action_trust_history GROUP BY fault_class"
+    ).fetchall()
+    tally = {fc: (n, c or 0) for fc, n, c in rows}
+    out = {}
+    for fc in REAL_FAULT_CLASSES:
+        if fc not in auto_fix_classes:
+            out[fc] = None
+            continue
+        n, c = tally.get(fc, (0, 0))
+        out[fc] = round(c / n, 4) if n else None
+    return out
+
+
+def build_response_time_by_class(conn: sqlite3.Connection) -> dict:
+    """Real avg response_time_ms per fault class, collapsed across every
+    provider -- same _model_rows source as the rest of this file's
+    per-model metrics, just regrouped by actual_class instead of
+    provider:model. Universal: every diagnosis call has a response time
+    regardless of whether the class is auto-fix or report-only."""
+    times: dict[str, list[float]] = {}
+    for r in _model_rows(conn):
+        if r["response_time_ms"] is None:
+            continue
+        times.setdefault(r["actual_class"], []).append(r["response_time_ms"])
+    return {
+        fc: (round(sum(times[fc]) / len(times[fc]), 1) if times.get(fc) else None)
+        for fc in REAL_FAULT_CLASSES
+    }
+
+
+def build_confidence_variance_by_class(conn: sqlite3.Connection) -> dict:
+    """Real logprob-source confidence stdev per fault class -- Operator
+    Trust Dossier radar axis, locked 2026-08-1x after a direct real-data
+    check (check_confidence_variance_by_class.py, one-off, not committed)
+    found genuine per-class spread on the logprob side (stdev ranged
+    0.035-0.062 across classes) versus a near-flat self-reported side
+    (~0.98 everywhere, two outliers) that alone would've been as
+    uninformative as the durability-rate axis this replaced. Locked:
+    logprob source only, never blended with self-reported -- same rule
+    already used for build_calibration_error/build_confidence_variance
+    elsewhere in this file. None for a class with <2 real logprob
+    observations (a variance over 0-1 points isn't a real signal, same
+    guard as the existing per-model version)."""
+    import statistics
+
+    groups: dict[str, list[float]] = {}
+    for r in _model_rows(conn):
+        if r["confidence"] is None or r["confidence_source"] != "logprob":
+            continue
+        groups.setdefault(r["actual_class"], []).append(r["confidence"])
+    return {
+        fc: (round(statistics.pstdev(groups[fc]), 4) if len(groups.get(fc, [])) >= 2 else None)
+        for fc in REAL_FAULT_CLASSES
+    }
+
+
+def build_calibration_deviation_by_class(conn: sqlite3.Connection, diagnosis_accuracy: dict) -> dict:
+    """Real |mean(logprob confidence) - real diagnostic accuracy| per
+    fault class -- logprob-source only, same reasoning and same rule as
+    build_confidence_variance_by_class above (self-reported is flat
+    ~0.98 everywhere, would just measure "distance from 0.98" per class
+    rather than real calibration behavior). Compared against the
+    canonical per-class scores-table accuracy passed in (the same value
+    the radar's own diagnosis_accuracy axis uses), not
+    build_calibration_error's confusion-matrix-derived accuracy -- kept
+    internally consistent within this one chart rather than reusing that
+    function's slightly different source."""
+    import statistics
+
+    groups: dict[str, list[float]] = {}
+    for r in _model_rows(conn):
+        if r["confidence"] is None or r["confidence_source"] != "logprob":
+            continue
+        groups.setdefault(r["actual_class"], []).append(r["confidence"])
+
+    out = {}
+    for fc in REAL_FAULT_CLASSES:
+        acc = diagnosis_accuracy.get(fc)
+        values = groups.get(fc)
+        if not values or acc is None:
+            out[fc] = None
+            continue
+        out[fc] = round(abs(statistics.mean(values) - acc), 4)
+    return out
+
+
+def build_radar_dossier(conn: sqlite3.Connection) -> dict:
+    """Real per-class 6-axis data for the Operator tab's Trust Dossier
+    radar chart (EpisodePanel.jsx's currently-placeholder collapsible
+    section). Locked axis set, 2026-08-1x, after ruling out: durability
+    rate (near-always 100% -- flapping is rare, would read as a flat
+    spike on every class); time-to-verified (structurally computed only
+    when an action is dispatched -- verify_durability never runs for
+    report-only classes, whose faults are reverted by the injector
+    script, not verified as a trustworthy agent fix -- would have made 2
+    of 6 axes auto-fix-only); tier reliance (rejected as redundant --
+    fallback tiers are rarely exercised now that overnight batches have
+    stopped, Cloudflare primary handles nearly everything); evidence-
+    gathering tool-call depth (real but coarse, MAX_TURNS=5 caps it at
+    1-5 discrete values, expected clustered at 1-2 for most classes).
+    Final 6 axes, 5 universal + exactly 1 auto-fix-only:
+      - diagnosis_accuracy     universal, canonical scores-table accuracy
+      - action_accuracy        auto-fix only, None for report-only classes
+      - calibration_deviation  universal, logprob-source only
+      - dimension_b_streak     universal (Dimension B tracks every class)
+      - avg_response_time_ms   universal
+      - confidence_stdev       universal, logprob-source only
+    """
+    diagnosis_accuracy: dict[str, "float | None"] = {}
+    for fc in REAL_FAULT_CLASSES:
+        row = conn.execute(
+            "SELECT COUNT(*), SUM(correct) FROM scores "
+            "WHERE actual_class = ? AND (phase_e_status IS NULL OR phase_e_status != 'excluded')",
+            (fc,),
+        ).fetchone()
+        total, correct = row[0], row[1] or 0
+        diagnosis_accuracy[fc] = round(correct / total, 4) if total else None
+
+    action_accuracy = build_action_accuracy_by_class(conn, AUTO_FIX_CLASSES)
+    calibration_deviation = build_calibration_deviation_by_class(conn, diagnosis_accuracy)
+    response_time = build_response_time_by_class(conn)
+    confidence_stdev = build_confidence_variance_by_class(conn)
+    b_max, b_cur = _max_and_current(conn, "diagnoser_mode_history", "diagnoser_mode", "streak")
+
+    dossier = {}
+    for fc in REAL_FAULT_CLASSES:
+        dossier[fc] = {
+            "tier": "auto-fix" if fc in AUTO_FIX_CLASSES else "report-only",
+            "diagnosis_accuracy": diagnosis_accuracy.get(fc),
+            "action_accuracy": action_accuracy.get(fc),
+            "calibration_deviation": calibration_deviation.get(fc),
+            "dimension_b_streak": b_cur.get(fc, 0),
+            "dimension_b_max_streak": b_max.get(fc, 0),
+            "avg_response_time_ms": response_time.get(fc),
+            "confidence_stdev": confidence_stdev.get(fc),
+        }
+    return dossier
+
+
 def build_trust_history(conn: sqlite3.Connection) -> list[dict]:
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -1030,6 +1185,7 @@ def main():
     calibration_curves = _load_calibration_curves()
     model_scorecard = build_model_scorecard(conn)
     comparison_episodes = build_comparison_episodes(conn)
+    radar_dossier = build_radar_dossier(conn)
 
     conn.close()
 
@@ -1039,6 +1195,7 @@ def main():
     upload_json(client, bucket, "system_status.json", system_status)
     upload_json(client, bucket, "model_scorecard.json", model_scorecard)
     upload_json(client, bucket, "comparison_episodes.json", comparison_episodes)
+    upload_json(client, bucket, "radar_dossier.json", radar_dossier)
     if calibration_curves:
         upload_json(client, bucket, "calibration_curves.json", calibration_curves)
     else:

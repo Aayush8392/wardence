@@ -57,3 +57,11 @@ export async function fetchComparisonEpisodes() {
   const rows = await fetchJson("comparison_episodes.json");
   return rows.filter((r) => !INTERNAL_ONLY_CLASSES.has(r.fault_class));
 }
+
+// Real per-class 6-axis data for the Operator tab's Trust Dossier radar
+// chart -- object keyed by fault_class, not an array, so no
+// INTERNAL_ONLY_CLASSES filtering is needed here (radar_dossier.json is
+// built directly from REAL_FAULT_CLASSES, "none" was never a key).
+export async function fetchRadarDossier() {
+  return fetchJson("radar_dossier.json");
+}

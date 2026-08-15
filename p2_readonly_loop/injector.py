@@ -339,7 +339,31 @@ SESSION_FAILURE_SCALE_TIMEOUT_S = 60  # matches disk-full's own hard-won lesson:
 # ~9m under light traffic (both confirmed via direct Prometheus query,
 # 2026-07-24, not assumed) -- enormous headroom, so a 1-worker 100%-load
 # stressor overshoots the limit trivially and reliably.
-CPU_THROTTLE_STRESS_WORKERS = 1
+#
+# Raised 1 -> 6 workers, 2026-08-1x: 1 worker reliably tripped the real
+# detection threshold below (confirmed via cfs_throttled_periods delta)
+# but produced no human-perceptible request-latency change on live
+# storefront testing -- a real, measured finding, not assumed. Root
+# cause reasoned through: login/account requests are mostly I/O-bound
+# (waiting on MongoDB), so even with the cgroup's CFS bandwidth quota
+# fully saturated by 1 worker, a request's own tiny CPU burst could
+# still slip into the next ~100ms period with little visible delay.
+# More workers doesn't increase the bandwidth throttling further (quota
+# was already saturated at 1) -- it increases real OS-level scheduling
+# CONTENTION, i.e. the app thread has more competing runnable workers
+# to wait behind even once it IS scheduled. Still fully contained
+# within user's own 300m cgroup ceiling (the quota is a hard cap on
+# total CPU-time for everything in that cgroup combined, workers
+# included) -- no node-wide blast-radius change, confirmed by the
+# mechanism itself, not assumed. 6 chosen against the real machine's
+# 8-core/12-thread spec (Local Infra Strategy, wardence_context.md) --
+# substantial real contention, not an attempt to starve the whole node.
+# NOTE: this changes what "cpu-throttling" actually IS as an injected
+# fault -- episodes recorded before this change are a different real
+# fault intensity than episodes after it, same methodology-continuity
+# note this project already logged for connection-pool-exhaustion's
+# flood-size retuning and disk-full's ephemeral-limit retuning.
+CPU_THROTTLE_STRESS_WORKERS = 6
 CPU_THROTTLE_STRESS_LOAD = 100  # percent
 # container_cpu_cfs_throttled_periods_total is non-resetting and
 # already nonzero under light idle traffic (553 at measurement time) --
