@@ -578,6 +578,15 @@ HOLDING_CLASSES = {
     "crash-loop", "cpu-throttling",
     "network-latency", "network-partition", "memory-leak",
     "connection-pool-exhaustion", "init-failure", "session-cart-failure",
+    # Added 2026-08-15 -- under-provisioned-replicas' own real sustained
+    # k6-burst hold (see injector.py's _inject_and_verify_under_provisioned).
+    # First AUTO-FIX class to land in the evidence-file group rather than
+    # WRAPPER_POLLED_EVIDENCE_CLASSES -- confirmed safe: AUTO_FIX_CLASSES/
+    # HOLDING_CLASSES are already independent set-membership checks
+    # everywhere this matters (real-dispatch branch, evidence routing),
+    # not coupled the way SAFE_DEMO_CLASSES/AUTO_FIX_CLASSES used to be
+    # before that was deliberately fixed.
+    "under-provisioned-replicas",
 }
 
 # Real bug found and fixed the same session: FAULT_CONFIG's own
@@ -604,6 +613,11 @@ LIVE_TRIGGER_DURATION_OVERRIDE_S = {
     "session-cart-failure": 180,
     "memory-leak": 180,
     "init-failure": 180,
+    # Real, live-measured 2026-08-15 (95/100/105 VUS all clean across full
+    # 180s sustained runs, see injector.py's UNDER_PROVISIONED_LIVE_TRIGGER_VUS
+    # docstring for the real data) -- batch runs are unaffected, this dict
+    # is only ever consulted for live triggers.
+    "under-provisioned-replicas": 180,
 }
 
 # Two different real evidence SOURCES for the 8 holding classes, not

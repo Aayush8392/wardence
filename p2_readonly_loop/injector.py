@@ -413,6 +413,35 @@ UNDER_PROVISIONED_BASELINE_REPLICAS = 1
 # than broken."
 UNDER_PROVISIONED_VALIDATED_SAFE_REPLICAS = 3
 
+# Live-trigger-only hold intensity, locked 2026-08-15 after real escalating
+# (20/40/60/80/100 VUS, 20s each) then sustained (95/100/105/130/260 VUS,
+# full 180s) measurement -- see wardence_context.md/wardence_buildlog.md for
+# the full real data. A real, serious methodology gap was found and fixed
+# mid-investigation: the sustained tests' own health-check monitor sampled
+# /health, NOT /catalogue -- so "clean" verdicts up through the first 130
+# VUS run never actually checked whether the real /catalogue?size=10
+# requests (the endpoint that matters) were succeeding, only whether
+# catalogue's own health endpoint stayed responsive. Fixed by also
+# capturing k6's own real http_req_failed rate. Real result: 100/105/130 VUS
+# all showed a genuine 0.00% real request-failure rate (130's own run: 0 out
+# of 53,364 real requests failed) -- the earlier /health-based "clean"
+# verdicts happened to be correct, just not fully verified until this fix.
+# 180 VUS and 260 VUS both showed near-total real request-failure rates
+# (98.51% and 99.24% respectively) -- not a slowdown, a near-total
+# connection-layer failure, a categorically different (and undesired)
+# failure shape than this class is meant to represent. The real cliff is
+# therefore somewhere between 130 (clean) and 180 (98.51% failed) -- much
+# narrower than first assumed from the 130-vs-260 gap alone. 130 VUS locked
+# as the real, largest CONFIRMED-safe value (0.00% failures, real
+# p95=841.72ms) -- the exact cliff point was deliberately NOT bisected
+# further (real, unmapped territory, diminishing value vs. real risk of
+# landing in the failure zone on the live cluster). Never used for batch
+# runs (UNDER_PROVISIONED_VUS/DURATION_S
+# above stay exactly as originally validated for those, zero risk to
+# existing trust-ladder data) -- only when a live trigger's
+# stop_file/evidence_file are present.
+UNDER_PROVISIONED_LIVE_TRIGGER_VUS = 130
+
 # bad-rollout: NOT Chaos Mesh, NOT exec-based -- a direct kubectl patch
 # of front-end's image to a nonexistent tag, simulating a real bad
 # deploy. Real config confirmed before writing this (2026-07-25):
@@ -1665,15 +1694,115 @@ def _ensure_catalogue_replica_baseline(cfg: dict):
     )
 
 
-def _inject_and_verify_under_provisioned(cfg: dict) -> str | None:
-    """Fires a real k6 burst (20 VUs, 20s, matching the validated
-    Phase C2 measurement) directly against catalogue and confirms via
-    k6's own real p95 output that it lands above
+def _launch_sustained_catalogue_burst(namespace: str, vus: int, duration_s: int):
+    """Non-blocking (Popen) launch of the real sustained k6 burst used
+    ONLY by the live-trigger hold path below -- same real script shape
+    as _catalogue_burst_p95_ms, just started in the background so it
+    can run concurrently with the real-time sampler and the stop_file
+    poll loop for the full hold duration. Returns (pod_name, Popen) --
+    caller is responsible for reaping it (communicate/kill)."""
+    pod_name = f"wardence-underprov-hold-{uuid.uuid4().hex[:8]}"
+    script = f"""
+import http from 'k6/http';
+export const options = {{
+  scenarios: {{
+    burst: {{
+      executor: 'constant-vus',
+      vus: {vus},
+      duration: '{duration_s}s',
+    }},
+  }},
+}};
+export default function () {{
+  http.get('http://catalogue.{namespace}.svc.cluster.local/catalogue?size=10');
+}}
+"""
+    proc = subprocess.Popen(
+        [
+            "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
+            "-n", namespace, f"--image={K6_IMAGE}", "--image-pull-policy=IfNotPresent",
+            "--", "run", "--quiet", "-",
+        ],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    proc.stdin.write(script)
+    proc.stdin.close()
+    return pod_name, proc
+
+
+def _launch_catalogue_live_sampler(namespace: str, duration_s: int) -> str:
+    """Launches a real, separate pod that curls catalogue's own
+    real /catalogue?size=10 endpoint directly every 2s for the hold's
+    duration, printing one real elapsed-seconds value per line.
+
+    Why this exists, not just k6's own summary: k6 only reports a real
+    p95 once its ENTIRE run finishes -- for a 180s sustained hold that
+    means no real confirmation signal for up to 3 minutes, which would
+    break the same early-stop/evidence-file UX every other holding
+    class already has. This sampler gives a real, individually-timed
+    reading every 2s that the poll loop below can check against
+    UNDER_PROVISIONED_MIN_P95_MS immediately, well before the burst
+    itself finishes."""
+    pod_name = f"wardence-underprov-sample-{uuid.uuid4().hex[:8]}"
+    iterations = int(duration_s / 2) + 10  # real margin past the hold's own end
+    script = (
+        f"for i in $(seq 1 {iterations}); do "
+        f"curl -s -o /dev/null -m 2 -w '%{{time_total}}\\n' "
+        f"http://catalogue.{namespace}.svc.cluster.local/catalogue?size=10 "
+        f"|| echo '2.000'; "
+        f"sleep 2; "
+        f"done"
+    )
+    subprocess.run(
+        [
+            "kubectl", "run", pod_name, "--restart=Never", "-n", namespace,
+            f"--image={LATENCY_PROBE_IMAGE}", "--image-pull-policy=IfNotPresent",
+            "--command", "--", "sh", "-c", script,
+        ],
+        capture_output=True, text=True, timeout=15,
+    )
+    return pod_name
+
+
+def _sampler_confirmed_real_degradation(namespace: str, pod_name: str) -> bool:
+    """Real, cheap poll of the sampler pod's own logs so far -- returns
+    True the first time ANY real logged sample is >= UNDER_PROVISIONED_MIN_P95_MS,
+    False otherwise (including if the pod/logs aren't available yet).
+    Called repeatedly on a tick from the hold loop below, not once."""
+    result = subprocess.run(
+        ["kubectl", "logs", pod_name, "-n", namespace],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return False
+    threshold_s = UNDER_PROVISIONED_MIN_P95_MS / 1000.0
+    for line in result.stdout.strip().splitlines():
+        try:
+            if float(line.strip()) >= threshold_s:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _kill_pod_now(namespace: str, pod_name: str):
+    subprocess.run(
+        ["kubectl", "delete", "pod", pod_name, "-n", namespace,
+         "--grace-period=0", "--force", "--wait=false", "--ignore-not-found=true"],
+        capture_output=True, text=True, timeout=15,
+    )
+
+
+def _inject_and_verify_under_provisioned(
+    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+) -> str | None:
+    """Fires a real k6 burst directly against catalogue and confirms
+    via a real observed p95 that it lands above
     UNDER_PROVISIONED_MIN_P95_MS -- mechanism assertion via a real
     active probe, not Chaos Mesh, not Prometheus. No persistent chaos
-    resource to hold/delete -- see the constants' docstring above for
-    why (the fault is a standing config state, not a transient
-    condition).
+    resource to hold/delete on its own -- see the constants' docstring
+    above for why (the fault is a standing config state, not a
+    transient condition).
 
     Real bug found 2026-08-06, live: also resets oom's own baseline
     (memory limit) here, symmetric to the fix in main()'s oom branch --
@@ -1683,22 +1812,92 @@ def _inject_and_verify_under_provisioned(cfg: dict) -> str | None:
     it" reasoning _ensure_oom_baseline's own docstring already states.
     Passes FAULT_CONFIG["oom"] explicitly, not this function's own cfg
     -- under-provisioned-replicas' FAULT_CONFIG entry has no
-    "container" key, which _ensure_oom_baseline requires."""
+    "container" key, which _ensure_oom_baseline requires.
+
+    stop_file/evidence_file, added 2026-08-15: when either is given
+    (a live trigger), branches into a real SUSTAINED hold -- a real
+    UNDER_PROVISIONED_LIVE_TRIGGER_VUS-VU k6 burst run for the full
+    (--duration-override'd) cfg['duration_s'], with a real, separate
+    live sampler confirming the fault landed well before k6's own
+    end-of-run summary would (see _launch_catalogue_live_sampler's
+    docstring). Single attempt only -- no MAX_INJECT_ATTEMPTS retry
+    loop here, since retrying a real 180s sustained burst 3x would cost
+    up to 9 real minutes; every other holding class also runs its hold
+    once, not on a retry loop. Batch runs (both None) are completely
+    untouched -- same original one-shot 20-VU/20s burst + 3-attempt
+    retry loop as before, zero behavior change."""
     _ensure_catalogue_replica_baseline(cfg)
     _ensure_oom_baseline(FAULT_CONFIG["oom"])
     namespace = cfg["namespace"]
 
-    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
-        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: firing a real "
-              f"{UNDER_PROVISIONED_VUS}-VU/{UNDER_PROVISIONED_DURATION_S}s burst against catalogue...")
-        p95_ms = _catalogue_burst_p95_ms(
-            namespace, UNDER_PROVISIONED_VUS, UNDER_PROVISIONED_DURATION_S, "inject"
-        )
-        if p95_ms is not None and p95_ms >= UNDER_PROVISIONED_MIN_P95_MS:
-            return "k6-burst"
-        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
-        print(f"  attempt {attempt}: p95={p95_ms}ms, below {UNDER_PROVISIONED_MIN_P95_MS}ms threshold{suffix}")
-    return None
+    if stop_file is None and evidence_file is None:
+        # Original, untouched batch-run path.
+        for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
+            print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: firing a real "
+                  f"{UNDER_PROVISIONED_VUS}-VU/{UNDER_PROVISIONED_DURATION_S}s burst against catalogue...")
+            p95_ms = _catalogue_burst_p95_ms(
+                namespace, UNDER_PROVISIONED_VUS, UNDER_PROVISIONED_DURATION_S, "inject"
+            )
+            if p95_ms is not None and p95_ms >= UNDER_PROVISIONED_MIN_P95_MS:
+                return "k6-burst"
+            suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+            print(f"  attempt {attempt}: p95={p95_ms}ms, below {UNDER_PROVISIONED_MIN_P95_MS}ms threshold{suffix}")
+        return None
+
+    # Live-trigger sustained-hold path.
+    duration_s = cfg["duration_s"]
+    print(f"  starting a real sustained {UNDER_PROVISIONED_LIVE_TRIGGER_VUS}-VU burst against "
+          f"catalogue, held for the full {duration_s}s window...")
+    burst_pod, burst_proc = _launch_sustained_catalogue_burst(
+        namespace, UNDER_PROVISIONED_LIVE_TRIGGER_VUS, duration_s
+    )
+    sampler_pod = _launch_catalogue_live_sampler(namespace, duration_s)
+
+    evidence_written = False
+    interrupted = False
+    elapsed = 0
+    tick_s = 5
+    try:
+        while elapsed < duration_s:
+            if stop_file is not None and os.path.exists(stop_file):
+                interrupted = True
+                break
+            if not evidence_written and _sampler_confirmed_real_degradation(namespace, sampler_pod):
+                evidence_written = True
+                _write_evidence_file_once(evidence_file)
+                print(f"  real degradation confirmed at ~{elapsed}s (sampler observed a sample "
+                      f">= {UNDER_PROVISIONED_MIN_P95_MS}ms)")
+            time.sleep(tick_s)
+            elapsed += tick_s
+
+        # Real full-window case (not interrupted): one last check for a
+        # confirming sample that landed inside the final tick_s gap,
+        # BEFORE the sampler pod gets torn down in finally below --
+        # checking after it's deleted would be racy/wrong.
+        if not interrupted and not evidence_written:
+            evidence_written = _sampler_confirmed_real_degradation(namespace, sampler_pod)
+    finally:
+        _kill_pod_now(namespace, sampler_pod)
+        if interrupted:
+            _kill_pod_now(namespace, burst_pod)
+            try:
+                burst_proc.kill()
+            except Exception:
+                pass
+        else:
+            try:
+                burst_proc.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                burst_proc.kill()
+
+    if interrupted:
+        print("  early-stop requested -- not retrying")
+        # Still return the real outcome if evidence was already confirmed
+        # before the stop request landed -- an early stop shouldn't erase
+        # a real, already-observed fault.
+        return "k6-burst-sustained" if evidence_written else None
+
+    return "k6-burst-sustained" if evidence_written else None
 
 
 def _patch_front_end_image(cfg: dict, image: str):
@@ -2870,21 +3069,25 @@ def main():
             "plus the 6 report-only classes) -- the hold loop checks "
             "os.path.exists(stop_file) once per tick and exits cleanly, "
             "running its own finally-block cleanup, if the file appears. "
-            "Ignored by disk-full/under-provisioned-replicas/bad-rollout/"
-            "oom (no extendable hold to interrupt). Omit for batch runs."
+            "Ignored by disk-full/bad-rollout/oom (no extendable hold to "
+            "interrupt). Also honored by under-provisioned-replicas as of "
+            "2026-08-15 (its own real sustained-load hold, see "
+            "_inject_and_verify_under_provisioned). Omit for batch runs."
         ),
     )
     parser.add_argument(
         "--evidence-file", dest="evidence_file", default=None,
         help=(
-            "Report-only classes only -- written the moment this "
-            "script's own real verification first confirms the fault "
-            "landed, so Operator's wrapper can unlock an early-stop "
-            "button without re-running the same active probe/mysql-exec "
-            "a second time in parallel. Ignored by every other class "
-            "(crash-loop/cpu-throttling's evidence check is a cheap "
-            "Prometheus read the wrapper re-runs independently instead). "
-            "Omit for batch runs."
+            "Written the moment this script's own real verification "
+            "first confirms the fault landed, so Operator's wrapper can "
+            "unlock an early-stop button without re-running the same "
+            "active probe/mysql-exec a second time in parallel. Used by "
+            "the 6 report-only classes AND, as of 2026-08-15, "
+            "under-provisioned-replicas (its own real active probe -- a "
+            "k6 burst, not a cheap Prometheus read, hence the same "
+            "evidence-file pattern, not crash-loop/cpu-throttling's "
+            "cheap-read wrapper-polled pattern). Ignored by every other "
+            "class. Omit for batch runs."
         ),
     )
     args = parser.parse_args()
@@ -2956,7 +3159,9 @@ def main():
         elif fault_class == "cpu-throttling":
             chaos_name = _inject_and_verify_cpu_throttling(cfg, stop_file=args.stop_file)
         elif fault_class == "under-provisioned-replicas":
-            chaos_name = _inject_and_verify_under_provisioned(cfg)
+            chaos_name = _inject_and_verify_under_provisioned(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
         elif fault_class == "bad-rollout":
             verified = _inject_and_verify_bad_rollout(cfg)
             chaos_name = "manual-patch" if verified else None
