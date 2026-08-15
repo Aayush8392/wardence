@@ -174,3 +174,20 @@ test_upr_worst_case_timing.py
 # Real trust-state safety-net snapshots (snapshot_restore_trust_state.py's
 # output) -- reusable-tool artifacts, not source, regenerable at will.
 trust_snapshot_*.json
+
+# 2026-08-15/1x session: real cpu-throttling/network-latency demo-visibility
+# investigation scripts (user/user-db isolation, orders http.timeout
+# configurability + rollout/refresh mechanics, carts source check) -- one-off
+# diagnostics, kept locally per the session's own "keep to gitignore for now"
+# call, not reusable infra.
+p2_readonly_loop/check_network_latency_candidate_delay.sh
+p2_readonly_loop/check_network_latency_with_timeout_patch.sh
+p2_readonly_loop/check_orders_actuator_refresh.sh
+p2_readonly_loop/check_orders_current_state.sh
+p2_readonly_loop/check_orders_http_timeout_preflight.sh
+p2_readonly_loop/check_orders_live_refresh_works.sh
+p2_readonly_loop/check_user_db_isolation_preflight.sh
+p2_readonly_loop/check_user_db_isolation_rootcause.sh
+p2_readonly_loop/check_user_health_direct_podip.sh
+p2_readonly_loop/check_user_health_direct_podip_v2.sh
+p2_readonly_loop/poll_orders_real_ready.sh
