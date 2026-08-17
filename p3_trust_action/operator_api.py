@@ -2005,22 +2005,27 @@ def system_status(payload: dict = Depends(require_role("admin", "demo-trigger"))
     }
 
 
-# Live-status readout for the 3 auto-fix-adjacent classes with no other
-# Operator-screen visibility (disk-full, init-failure, memory-leak).
-# Security spec locked via Kimi review 34 finding #9 + review 38 (fixed
-# 2 real errors in the first draft: raw Prometheus label leakage, and a
-# stale-SAFE_DEMO_CLASSES role-gating premise -- disk-full/init-failure/
-# memory-leak are ALL in SAFE_DEMO_CLASSES as of the 2026-08-1x reopen,
-# not just disk-full, so all 3 get the same demo-trigger+admin gate as
-# every other class's trigger permission, not a split).
+# Live-status readout for the classes with no other Operator-screen
+# visibility. Security spec locked via Kimi review 34 finding #9 +
+# review 38 (fixed 2 real errors in the first draft: raw Prometheus
+# label leakage, and a stale-SAFE_DEMO_CLASSES role-gating premise --
+# all of these classes are in SAFE_DEMO_CLASSES as of the 2026-08-1x
+# reopen, so they get the same demo-trigger+admin gate as every other
+# class's trigger permission, not a split).
+#
+# init-failure and bad-rollout REMOVED 2026-08-1x -- both were masked
+# by the same "old healthy pod keeps serving" RollingUpdate default and
+# both were fixed the same real way (rollout-strategy patch forcing the
+# old pod down first) -- see faultClasses.js's INVISIBLE_CLASSES
+# comment for the full real fix detail, not duplicated here.
 #
 # Every query below is a hardcoded template, verbatim from agent.py's
-# own real diagnosis path for these 3 classes -- target/namespace/pod
+# own real diagnosis path for these classes -- target/namespace/pod
 # regex all come from FAULT_CONFIG, never from the request. Always
 # called WITHOUT snapshot_at (live "now" only, unlike the diagnosis
 # path's evidence-freezing mechanism) -- this is a live glance, not a
 # scored diagnosis.
-_LIVE_STATUS_CLASSES = {"disk-full", "init-failure", "memory-leak", "bad-rollout"}
+_LIVE_STATUS_CLASSES = {"disk-full", "memory-leak"}
 
 
 def _prom_query_safe(query: str) -> list:

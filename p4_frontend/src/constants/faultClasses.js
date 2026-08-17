@@ -26,15 +26,26 @@ export const REPORT_ONLY_CLASSES = [
 
 export const ALL_CLASSES = [...AUTO_FIX_CLASSES, ...REPORT_ONLY_CLASSES];
 
-// The 4 classes whose active fault window is invisible on the real
+// The classes whose active fault window is invisible on the real
 // storefront by mechanism design (see wardence_frontend.md's
 // "customer-visibility audit" session) -- the only ones the live-status
 // readout (GET /operator/fault-status/{class}) is meaningful for.
-// bad-rollout added 2026-08-15 -- real correction, found live: front-end's
-// own rolling-update strategy + readiness probe keep the OLD healthy pod
-// serving the entire time the injected bad image sits failing to pull,
-// the same "old pod stays healthy" mechanism init-failure already used.
-export const INVISIBLE_CLASSES = ["disk-full", "init-failure", "memory-leak", "bad-rollout"];
+// bad-rollout and init-failure REMOVED 2026-08-1x -- both were masked by
+// the same "old healthy pod keeps serving" RollingUpdate default
+// (maxSurge=25%/maxUnavailable=25%), and both were fixed the same real
+// way, live-confirmed: patching the target Deployment's rollout strategy
+// to maxUnavailable=100%/maxSurge=0% forces the old pod down before the
+// new (broken) one comes up, producing a real, visible failure instead
+// of a silently-masked one. init-failure's real confirmed symptom: a
+// genuine 500 (IllegalStateException, "Unable to create order due to
+// unspecified IO error") on checkout specifically, not a full-site
+// outage like bad-rollout -- payment's own strategy was patched via
+// `kubectl patch deployment payment -n sock-shop -p
+// '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":"100%","maxSurge":"0%"}}}}'`,
+// same one-off live-cluster-only pattern as front-end's own fix (never
+// a repo-tracked manifest, Sock Shop's deployments aren't version-
+// controlled here).
+export const INVISIBLE_CLASSES = ["disk-full", "memory-leak"];
 
 // target/namespace verbatim from injector.py's real FAULT_CONFIG.
 export const FAULT_TARGETS = {

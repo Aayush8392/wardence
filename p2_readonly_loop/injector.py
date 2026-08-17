@@ -283,7 +283,13 @@ OOM_BASELINE_MEMORY_LIMIT = "200Mi"
 DISK_FULL_FIRE_INTERVAL_S = 15  # wait between write attempts, giving kubelet time to detect+evict
 DISK_STRESS_BYTES = 450_000_000  # queue-master's ephemeral-storage limit is 300Mi
 
-NETWORK_LATENCY_DELAY = "500ms"
+NETWORK_LATENCY_DELAY = "3000ms"  # locked value, Kimi review 45 -- live-tested
+# (2026-08-1x) to produce ~6.5s real observed delay once scoped to
+# front-end->orders (see build_network_latency_manifest's `target`
+# field), dramatic enough to perceive without crossing into "looks like
+# an outage" territory. Supersedes the old 500ms, which predates the
+# scoped-target mechanism and its own real 5s http.timeout headroom
+# analysis.
 NETWORK_LATENCY_JITTER = "50ms"
 # Well below the 500ms injected delay -- tolerates measurement noise
 # while still requiring a real, unambiguous slowdown before ground
@@ -658,7 +664,15 @@ CONNECTION_POOL_TEST_PASSWORD = "default_password"
 # stop trusting the laggy proxy, measure the real effect directly.
 # k6/Prometheus's http_req_duration stays wired up for the traffic-gen
 # dashboard (P4) -- just not trusted for THIS ground-truth decision.
-LATENCY_PROBE_SAMPLES = 5
+LATENCY_PROBE_SAMPLES = 2  # lowered from 5, 2026-08-1x: at the old
+# 500ms nominal delay 5 sequential samples was cheap, but the new
+# scoped 3000ms nominal (~6.5s real observed) means each DURING-fault
+# sample blocks for the full delayed response -- 5 samples serially
+# could take 30+ seconds, starving the hold loop's 10s poll cadence and
+# leaving the frontend's confirm-button stuck on "CONFIRMING" until
+# right before the window closes (live-observed, not theorized). Still
+# takes the max of real samples (guards against one fluke fast
+# reading), just caps worst-case latency at ~13s instead of ~33s.
 LATENCY_PROBE_IMAGE = "curlimages/curl"
 # Found the hard way (2026-07-27, while debugging network-partition):
 # every kubectl-run call using this image (here and K6_IMAGE below) was
@@ -877,6 +891,19 @@ spec:
 
 
 def build_network_latency_manifest(chaos_name: str, cfg: dict) -> str:
+    """`target` field added 2026-08-1x, Kimi review 45 -- scopes the
+    delay to ONLY the front-end<->orders pair (was previously unscoped,
+    delaying orders' own outbound calls to payment/shipping too, which
+    is what capped the old safe nominal delay at ~1s under orders' real
+    5s http.timeout to those services). Live-tested via
+    check_network_latency_scoped_target.sh before this was wired in:
+    front-end->orders /health jumped 428ms->6450ms under this exact
+    shape, orders->payment stayed ~unchanged (391ms->456ms) -- real,
+    confirmed isolation, not assumed from the CRD docs alone.
+
+    NOT shared with build_network_partition_manifest (separate function,
+    its own `selector` on orders with no `target` block at all) -- this
+    `target` field cannot leak into that class."""
     return f"""
 apiVersion: chaos-mesh.org/v1alpha1
 kind: NetworkChaos
@@ -891,6 +918,13 @@ spec:
       - {cfg['namespace']}
     labelSelectors:
       name: {cfg['target']}
+  target:
+    mode: one
+    selector:
+      namespaces:
+        - {cfg['namespace']}
+      labelSelectors:
+        name: front-end
   delay:
     latency: "{NETWORK_LATENCY_DELAY}"
     jitter: "{NETWORK_LATENCY_JITTER}"
@@ -967,80 +1001,76 @@ def _probe_orders_reachable(namespace: str) -> int:
     return sum(1 for ln in lines if ln != "HTTP_200")
 
 
+FRONT_END_EXEC_TIMEOUT_S = 10  # hard rule, Kimi review 45: never let a
+# hanging exec block the injector -- kubectl's own --request-timeout
+# plus a slightly-shorter in-pod wget -T so wget itself gives up first
+# in the normal case. Real bug found live-testing this (2026-08-1x):
+# front-end's real image ships BusyBox wget, which only understands
+# `-T SEC`, not GNU wget's `--timeout=`-- the latter fails instantly
+# with exit code 1, which made every probe sample silently fail (fast,
+# not slow) and the injector burn all 3 retry attempts finding nothing.
+
+
 def _probe_orders_latency_ms(namespace: str) -> float | None:
-    """Direct, timed HTTP requests via a throwaway pod -- see the
-    ABANDONED note above NETWORK_LATENCY_MIN_INCREASE_MS for why this
-    replaced a k6/Prometheus-metric-based check. Same pattern already
-    confirmed trustworthy during this session's own debugging (a
-    one-off curltest pod gave an accurate 10ms reading when the k6
-    metric was falsely showing 2000ms+).
+    """Rewritten 2026-08-1x, Kimi review 45's verification-blind-spot
+    catch: now that network-latency's NetworkChaos is scoped via
+    `target: front-end` (build_network_latency_manifest), a throwaway
+    pod with no matching labels sits entirely OUTSIDE the chaos scope
+    and would always read baseline latency regardless of whether the
+    fault actually landed -- it has to exec into the real, currently
+    Running front-end pod instead.
 
-    Hits orders' OWN Service directly (GET /health, confirmed 200 via
-    manual test), NOT front-end's /orders -- found the hard way that
-    an unauthenticated probe through front-end never actually reached
-    the orders microservice at all: front-end's order-building flow
-    requires a real session (customer/address/card, per
-    api/orders/index.js) and rejects a session-less request in ~7ms,
-    well before ever calling orders' backend, so the injected delay on
-    orders' egress was never being exercised. /health still traverses
-    the same delayed egress path on its response.
+    Still hits orders' own Service on /health (not front-end's /orders
+    route) -- confirmed this remains valid under scoping, not just
+    carried over unchanged: the delay applies at the network layer (a
+    tc/netem qdisc on the pod-to-pod link), so it affects ALL traffic
+    between the two pods regardless of HTTP path, not a specific route.
+    Live-tested (check_network_latency_scoped_target.sh, same session):
+    front-end->orders /health jumped 428ms->6450ms under the fault while
+    orders->payment stayed ~unchanged -- direct proof the delay is
+    visible on this exact leg.
 
-    Runs LATENCY_PROBE_SAMPLES real GETs in one throwaway pod and
-    returns the MAX (conservative -- one genuinely slow request is
-    enough to confirm the delay landed). Returns None if the probe
-    itself couldn't run (image pull failure, pod scheduling issue,
-    etc.) -- treated as "can't verify" by callers, never as "zero
-    latency"."""
-    pod_name = f"wardence-latency-probe-{uuid.uuid4().hex[:8]}"
-    script = (
-        f"for i in $(seq 1 {LATENCY_PROBE_SAMPLES}); do "
-        f'curl -s -o /dev/null -w "%{{time_total}}\\n" '
-        f"http://orders.{namespace}.svc.cluster.local/health; done"
-    )
-    try:
-        result = subprocess.run(
-            [
-                "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
-                "-n", namespace, f"--image={LATENCY_PROBE_IMAGE}", "--image-pull-policy=IfNotPresent",
-                "--", "sh", "-c", script,
-            ],
-            capture_output=True, text=True, timeout=LATENCY_PROBE_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        # Found the hard way (2026-07-27): a clean, idle `kubectl run --rm`
-        # round trip already measured 28.03s -- almost entirely pod
-        # scheduling/API overhead, not the curl requests themselves (those
-        # took ~1.5s combined). Only ~2s of headroom under
-        # LATENCY_PROBE_TIMEOUT_S even when nothing else is going on, so a
-        # cluster under real load (e.g. mid-way through a long batch of
-        # back-to-back episodes) tips over it reliably. This used to crash
-        # the whole injector with an uncaught traceback -- both callers of
-        # this function already correctly treat a None return as "can't
-        # verify" (never as "zero latency"), exactly matching this
-        # function's own docstring, which promised this behavior without
-        # actually catching the timeout that triggers it. Return None here
-        # so a slow-but-not-broken cluster degrades into a retry, not a crash.
+    Uses wget, not curl -- confirmed the real front-end image has wget
+    but not curl (the throwaway probe pod's curlimages/curl image is
+    NOT what runs in front-end). BusyBox's wget has no %{time_total}-
+    style self-timing and BusyBox's own `date` has no %N (nanosecond)
+    support inside the pod (both confirmed the hard way, same session)
+    -- so each sample is timed from THIS process's own wall clock,
+    wrapping one `kubectl exec` call per sample, not computed in-pod.
+
+    Runs LATENCY_PROBE_SAMPLES separate exec calls and returns the MAX
+    (conservative -- one genuinely slow request is enough to confirm
+    the delay landed). Returns None if every sample failed to run (pod
+    gone, exec plumbing broken, etc.) -- treated as "can't verify" by
+    callers, never as "zero latency"."""
+    pod_name = _current_pod_name("front-end", namespace)
+    if pod_name is None:
         return None
-    finally:
-        # --rm should already have deleted it, but a subprocess timeout
-        # kills our end of the connection, not necessarily the pod --
-        # best-effort cleanup so a probe failure can't leave junk pods
-        # accumulating in sock-shop (the app namespace the blinding
-        # test guards).
-        subprocess.run(
-            ["kubectl", "delete", "pod", pod_name, "-n", namespace, "--ignore-not-found"],
-            capture_output=True, text=True,
-        )
 
-    samples_s = []
-    for line in result.stdout.strip().splitlines():
+    samples_ms = []
+    for _ in range(LATENCY_PROBE_SAMPLES):
+        start = time.monotonic()
         try:
-            samples_s.append(float(line.strip()))
-        except ValueError:
+            result = subprocess.run(
+                [
+                    "kubectl", "exec", f"--request-timeout={FRONT_END_EXEC_TIMEOUT_S}s",
+                    "-n", namespace, pod_name, "--",
+                    "wget", "-q", "-O", "/dev/null", "-T", "5",
+                    f"http://orders.{namespace}.svc.cluster.local/health",
+                ],
+                capture_output=True, text=True, timeout=FRONT_END_EXEC_TIMEOUT_S + 5,
+            )
+        except subprocess.TimeoutExpired:
+            # A hung exec is a failed sample, not zero latency -- skip
+            # it and keep going (mirrors the throwaway-pod version's own
+            # "None on total failure, never zero" contract).
             continue
-    if not samples_s:
+        if result.returncode == 0:
+            samples_ms.append((time.monotonic() - start) * 1000)
+
+    if not samples_ms:
         return None
-    return max(samples_s) * 1000
+    return max(samples_ms)
 
 
 def _current_pod_name(target: str, namespace: str) -> str | None:
