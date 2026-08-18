@@ -35,8 +35,25 @@ rules:
     resources: ["pods/resize"]
     verbs: ["patch"]
   - apiGroups: [""]
-    resources: ["configmaps", "services"]
+    resources: ["configmaps"]
     verbs: ["get", "list", "patch"]
+  # Scoped narrowly to the carts Service only (2026-08-1x, crash-loop
+  # warm-standby demo-visibility fix -- see
+  # wardence_crash_loop_warm_standby_LOCKED_SPEC.md). Real, deliberate
+  # tightening from what used to be here: this line previously granted
+  # unscoped services get/list/patch across the whole namespace, but a
+  # direct check confirmed NOTHING in the codebase actually used it --
+  # narrowed to exactly the one real, concrete use case (flipping
+  # carts's Service selector between carts/carts-warm) rather than
+  # leaving a broad, unexercised grant sitting in the cage. `list`
+  # dropped deliberately: Kubernetes RBAC's resourceNames restriction
+  # has no real effect on `list` (a list request has no single target
+  # name to check against), so keeping it would be a silent, meaningless
+  # grant; only `get`/`patch` are real here, both correctly scoped.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "patch"]
+    resourceNames: ["carts"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

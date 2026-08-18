@@ -2,6 +2,7 @@
 wardence_context.md
 wardence_buildlog.md
 wardence_frontend.md
+wardence_crash_loop_warm_standby_LOCKED_SPEC.md
 wardence_guide.html
 reviews/
 
@@ -45,6 +46,10 @@ p2_readonly_loop/check_cpu_baseline.sh
 p2_readonly_loop/check_cpu_config.sh
 p2_readonly_loop/check_cpu_throttle_cleanup.sh
 p2_readonly_loop/check_frontend_baseline.sh
+p2_readonly_loop/check_carts_cold_start_timing.sh
+p2_readonly_loop/check_carts_3replica_memory_cost.sh
+p2_readonly_loop/check_carts_concurrent_boot_contention.sh
+p2_readonly_loop/check_carts_triple_boot_contention.sh
 p2_readonly_loop/measure_catalogue_load.py
 p2_readonly_loop/measure_catalogue_load_confirm.py
 p2_readonly_loop/measure_connection_pool_flood_reliability.py
@@ -197,3 +202,10 @@ p2_readonly_loop/poll_orders_real_ready.sh
 p2_readonly_loop/check_network_latency_scoped_target.sh
 p2_readonly_loop/check_cpu_throttle_via_limit_cut.sh
 p2_readonly_loop/check_cpu_throttle_via_register_probe.sh
+p2_readonly_loop/check_memory_leak_checkout_latency.sh
+p2_readonly_loop/check_memory_leak_full_investigation.sh
+p2_readonly_loop/check_memory_leak_post_shipping_burst.sh
+p2_readonly_loop/check_user_address_card_endpoints.sh
+p2_readonly_loop/check_user_customers_endpoint_isolated.sh
+p2_readonly_loop/check_user_probe_patch_cost.sh
+p2_readonly_loop/check_user_scoped_customer_endpoints.sh

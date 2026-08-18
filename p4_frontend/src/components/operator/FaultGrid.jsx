@@ -18,7 +18,7 @@ import { AUTO_FIX_CLASSES, REPORT_ONLY_CLASSES, CLASS_LABELS, FAULT_TARGETS } fr
 // implicitly opens/retargets the panel to this class, handled by the
 // parent via onOpenPanel + onTrigger both firing).
 
-function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, isActive, isSelected, live, fixRequested, onTrigger, onDiagnoseAndFix, onOpenPanel }) {
+function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, crashLoopReady, isActive, isSelected, live, fixRequested, onTrigger, onDiagnoseAndFix, onOpenPanel }) {
   const isAutoFix = bucket === "auto-fix";
   const trustState = trustMap[fc];
   const canAct = Boolean(token) && (role === "admin" || role === "demo-trigger");
@@ -112,9 +112,30 @@ function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, isActiv
     </button>
   );
 
+  // Real crash-loop warm-standby cooldown (Model A, locked -- see
+  // wardence_crash_loop_warm_standby_LOCKED_SPEC.md). Derived live from
+  // the cluster on the backend (operator_api.py's /trigger/status
+  // crash_loop_ready field, itself derived from the real Service
+  // selector + a real readiness check, never a stored flag) -- true
+  // whenever carts hasn't been confirmed restored to steady state yet
+  // from a prior episode. Checked only in the branch below that would
+  // otherwise show a plain enabled TRIGGER -- deliberately does NOT
+  // touch the "resolved && !republished_at" PUBLISHING branch just
+  // below, so the real ~12s R2-publish tail still plays out naturally
+  // before this cooldown state ever appears, per explicit ask: no
+  // artificial wait, just an honest state once publishing is actually
+  // done (or was never in flight to begin with, e.g. a fresh page
+  // load).
+  const crashLoopCoolingDown = fc === "crash-loop" && crashLoopReady === false;
+
   if (injectPending || !isActive || !state || (state === "resolved" && live?.republished_at) || state === "failed") {
-    stateLabel = injectPending ? "INJECTING" : "IDLE";
-    actionButton = idleButton(injectPending ? "INJECTING" : "TRIGGER");
+    if (!injectPending && crashLoopCoolingDown) {
+      stateLabel = "COOLDOWN";
+      actionButton = waitingButton("TRIGGER");
+    } else {
+      stateLabel = injectPending ? "INJECTING" : "IDLE";
+      actionButton = idleButton(injectPending ? "INJECTING" : "TRIGGER");
+    }
   } else if (state === "resolved" && !live?.republished_at) {
     // Real, honest intermediate stage -- diagnosis/action/durability are
     // all genuinely done, but the ~12s R2 publish hasn't landed, so the
@@ -224,8 +245,8 @@ function Section({ title, bucket, classes, activeFaultClass, selectedFaultClass,
   );
 }
 
-export default function FaultGrid({ token, role, trustMap, episodeInFlight, activeEpisode, selectedFaultClass, live, fixRequested, onTrigger, onDiagnoseAndFix, onOpenPanel }) {
-  const cardProps = { token, role, trustMap, episodeInFlight, live, fixRequested, onTrigger, onDiagnoseAndFix, onOpenPanel };
+export default function FaultGrid({ token, role, trustMap, episodeInFlight, crashLoopReady, activeEpisode, selectedFaultClass, live, fixRequested, onTrigger, onDiagnoseAndFix, onOpenPanel }) {
+  const cardProps = { token, role, trustMap, episodeInFlight, crashLoopReady, live, fixRequested, onTrigger, onDiagnoseAndFix, onOpenPanel };
 
   return (
     <div className="glass-module hud-bracket border border-outline-variant/30 p-4 space-y-6">

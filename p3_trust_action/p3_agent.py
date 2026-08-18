@@ -76,6 +76,7 @@ from llm_replay_test import build_prompt  # noqa: E402
 from misdispatch_guard import ensure_misdispatch_tables, get_safety_hold  # noqa: E402
 import dispatch_gate  # noqa: E402
 from constraint_checks import check_safe  # noqa: E402
+import carts_rotation  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -737,6 +738,38 @@ def _dispatch_with_gate(predicted_class: str, proposed_tool: str, proposed_param
     return proposed_tool, action_result, action_source, None
 
 
+def _maybe_flip_carts_warm(action_taken: str | None) -> None:
+    """crash-loop warm-standby forward flip (Model A, locked -- see
+    wardence_crash_loop_warm_standby_LOCKED_SPEC.md). Called right
+    after the real dispatch, never from inside a scored action
+    function -- this is cosmetic demo-visibility plumbing, never part
+    of what Dimension A/B/C measures. Fails silently/safely: if
+    carts-warm isn't confirmed Ready, carts_rotation.flip_to_warm()
+    itself returns False and does nothing -- today's honest slow
+    recovery proceeds exactly as it would without this function
+    existing at all. Gated on action_taken == "restart_deployment"
+    specifically (not just fault_class == "crash-loop") since that's
+    the exact real tool crash-loop's ACTION_MAP entry maps to -- if a
+    future gate substitution ever redirects crash-loop's own dispatch
+    to a different tool, this deliberately does NOT fire (the flip
+    only makes sense paired with the one real fix mechanism it was
+    designed around).
+
+    Wrapped in a broad try/except as real belt-and-suspenders --
+    carts_rotation's own functions are already hardened to fail closed
+    and never raise, but this call site sits directly before /act
+    returns its response for an already-successfully-dispatched fix.
+    An unhandled exception here, however unlikely, would turn a real,
+    correctly-scored fix into a 500 with no response at all -- strictly
+    worse than the flip simply not happening this once."""
+    if action_taken == "restart_deployment":
+        try:
+            carts_rotation.flip_to_warm()
+        except Exception as e:
+            print(f"  _maybe_flip_carts_warm: unexpected failure, flip did not happen "
+                  f"this episode (real dispatch above is unaffected): {e}")
+
+
 @app.post("/act")
 def act(req: ActRequest):
     """
@@ -876,6 +909,7 @@ def act(req: ActRequest):
             response["action_result"] = action_result
             response["action_source"] = action_source
             response["gate_substitution"] = gate_substitution
+            _maybe_flip_carts_warm(action_taken)
             return response
         # else: falls through to the deterministic dispatch below --
         # tool-agreement veto and/or the new params-safety veto fired,
@@ -894,6 +928,7 @@ def act(req: ActRequest):
     response["action_result"] = action_result
     response["gate_substitution"] = gate_substitution
     response["action_source"] = action_source
+    _maybe_flip_carts_warm(action_taken)
 
     return response
 

@@ -82,6 +82,7 @@ from injector import (  # noqa: E402
     _ensure_oom_baseline,
     _restart_count,
 )
+import carts_rotation  # noqa: E402
 
 
 def _republish_to_r2() -> bool:
@@ -840,6 +841,20 @@ def trigger_status(request: Request):
 
     in_flight_row = _in_flight_episode_row(conn)
     conn.close()
+
+    # crash-loop warm-standby readiness (Model A, locked -- see
+    # wardence_crash_loop_warm_standby_LOCKED_SPEC.md). Derived live
+    # from the cluster on every poll, never persisted -- same reasoning
+    # as everywhere else this state is checked (the Service selector +
+    # a real readiness check ARE the rotation state, a stored flag
+    # would just be a second source of truth that can drift from it).
+    # Lets the frontend grey out/explain the crash-loop button proactively
+    # instead of only finding out via a rejected click.
+    crash_loop_active_label = carts_rotation.get_active_label()
+    crash_loop_ready = (
+        crash_loop_active_label == "carts" and carts_rotation.is_carts_ready()
+    )
+
     return {
         "global_cap": GLOBAL_DAILY_CAP,
         "global_used_today": global_used,
@@ -853,6 +868,7 @@ def trigger_status(request: Request):
         # must handle that as "in flight but unknown," never crash on it.
         "in_flight_episode_id": in_flight_row[0] if in_flight_row else None,
         "in_flight_fault_class": in_flight_row[1] if in_flight_row else None,
+        "crash_loop_ready": crash_loop_ready,
     }
 
 
@@ -1273,6 +1289,29 @@ def trigger_inject(
         _audit(conn, role, "/trigger/inject", f"rejected: '{fault_class}' not implemented", ip)
         conn.close()
         raise HTTPException(400, f"'{fault_class}' has no injector implementation yet")
+
+    # crash-loop warm-standby gate (Model A, locked -- see
+    # wardence_crash_loop_warm_standby_LOCKED_SPEC.md). Real, honest
+    # server-side rejection BEFORE the injector subprocess ever spawns
+    # -- injector.py's own _ensure_crash_loop_baseline is still the
+    # authoritative, unconditional gate (this endpoint isn't the only
+    # trigger path; run_batch_plan.py's subprocess calls don't go
+    # through here at all), but checking here too gives a clean,
+    # immediate HTTP error instead of letting the request succeed at
+    # the API level and only fail deep inside a spawned subprocess a
+    # moment later. Applies to EVERY role including admin -- this is a
+    # correctness gate (carts genuinely isn't back to steady state
+    # yet), not a fairness rule admin should be exempt from, same
+    # reasoning as the concurrency guard below.
+    if fault_class == "crash-loop":
+        active_label = carts_rotation.get_active_label()
+        if active_label != "carts" or not carts_rotation.is_carts_ready():
+            _audit(conn, role, "/trigger/inject",
+                   "rejected: carts still recovering from a prior episode", ip)
+            conn.close()
+            raise HTTPException(
+                409, "carts is still recovering from a prior crash-loop episode -- try again shortly"
+            )
 
     if role == "demo-trigger":
         if fault_class not in SAFE_DEMO_CLASSES:

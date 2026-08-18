@@ -370,6 +370,7 @@ export default function Operator() {
           role={role}
           trustMap={trustMap}
           episodeInFlight={Boolean(triggerStatus?.episode_in_flight)}
+          crashLoopReady={triggerStatus?.crash_loop_ready}
           activeEpisode={activeEpisode}
           selectedFaultClass={openPanelClass}
           live={live}

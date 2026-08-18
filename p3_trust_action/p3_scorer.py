@@ -27,6 +27,7 @@ import argparse
 import datetime
 import json
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -414,6 +415,59 @@ def main():
         return
 
     episode_id, actual_class, target, namespace = episode
+
+    # crash-loop warm-standby backward flip (Model A, locked -- see
+    # wardence_crash_loop_warm_standby_LOCKED_SPEC.md). MOVED here
+    # (2026-08-1x, real incident) from right before this function's own
+    # final "verdict" print -- a real LLM-outage test showed the
+    # original placement was unsafe: /diagnose (up to DIAGNOSE_TIMEOUT_S,
+    # every provider tried and timed out in sequence with the LLM fully
+    # unreachable), /act (up to ACT_TIMEOUT_S), and verify_durability
+    # (blocks up to crash-loop's own 2min durability window) ALL run
+    # BEFORE the old placement, and together they can genuinely exceed
+    # operator_api.py's real, hard SCORER_TIMEOUT_S=400 on the whole
+    # subprocess. When that happens, this process gets killed from
+    # OUTSIDE before ever reaching the old placement -- confirmed live:
+    # a real episode dispatched its fix and forward-flipped correctly
+    # (both happen inside /act, before this function even gets that
+    # response back), but the Service selector was left stranded on
+    # carts-warm because the backward-flip spawn never got a chance to
+    # run at all.
+    #
+    # The backward flip has no real dependency on anything computed
+    # later in this function -- it only needs to know actual_class,
+    # which is already known right here -- so there's no correctness
+    # reason it was ever placed after the slow diagnose/act/durability
+    # sequence in the first place. Spawning it here, before any of that,
+    # means it fires within milliseconds of this episode being picked
+    # up, regardless of whatever happens to diagnose/act/durability
+    # afterward (including this whole process later being killed by
+    # SCORER_TIMEOUT_S) -- Dimension A/B/C scoring below is completely
+    # unaffected either way, since this spawn is fire-and-forget and
+    # doesn't touch conn/the trust tables at all.
+    #
+    # Spawned as a genuinely DETACHED background process
+    # (restore_carts_active.py), NOT polled inline -- carts' own real
+    # boot (measured: min 266s, max 533s) routinely outlasts this
+    # scorer's own runtime. start_new_session=True (same detach pattern
+    # run_episodes.py's own run() helper already uses) so the poller
+    # survives independently of this process's own lifetime; not
+    # waited on. Wrapped: Popen itself can raise (a real OS-level
+    # failure) -- must never block or crash this function over a purely
+    # cosmetic restoration step. injector.py's own
+    # _ensure_crash_loop_baseline stays as the real, authoritative
+    # backstop regardless -- worst case is just a later manual/next-
+    # trigger-time restoration instead of an immediate background one.
+    if actual_class == "crash-loop":
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).parent / "restore_carts_active.py")],
+                cwd=str(Path(__file__).parent),
+                start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            print(f"  crash-loop restoration: failed to spawn background reconciler: {e}")
 
     # Phase 1: diagnosis only (stub + background LLM), independently timed.
     diag_resp = requests.post(

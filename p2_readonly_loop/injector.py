@@ -1576,6 +1576,64 @@ def _ensure_queue_master_pod_cleanup(cfg: dict):
         )
 
 
+def _ensure_crash_loop_baseline() -> bool:
+    """Fast, non-blocking defense-in-depth check for crash-loop's warm-
+    standby design (Model A, locked -- see
+    wardence_crash_loop_warm_standby_LOCKED_SPEC.md). Confirms the
+    system is genuinely back to steady state (carts Service selector
+    == "carts", carts pod Ready) before allowing a new injection.
+    Returns True if safe to proceed, False if not -- the caller in
+    main() must treat False as a total injection failure (same path
+    as MAX_INJECT_ATTEMPTS exhaustion: no episode recorded, loud abort).
+
+    Deliberately does NOT wait/poll here -- unlike every other
+    _ensure_*_baseline function in this file (which self-heal by
+    actively resetting drifted state), this one CANNOT self-heal: if
+    carts is still recovering from a prior episode, the only real fix
+    is time, and waiting here would hold this process's system_lock
+    for however long that takes (up to the real measured ~533s worst
+    case), risking a second process treating the lock as stale
+    (SYSTEM_LOCK_STALE_S=600) and stealing it mid-wait. The long wait
+    instead lives in the operator/button layer, outside any lock --
+    this function only does a fast check and aborts loudly if the
+    system isn't ready, exactly the same shape as every other total-
+    injection-failure path in this file.
+
+    This is the one authoritative gate every real trigger path shares
+    (run_batch_plan.py's subprocess call AND operator_api.py's live-
+    trigger subprocess call both funnel through injector.py's main())
+    -- a frontend-button-only gate would leave run_batch_plan.py free
+    to fire crash-loop mid-recovery and produce a masked, non-visible
+    outage, since batch runs don't look at the button at all."""
+    result = subprocess.run(
+        ["kubectl", "get", "service", "carts", "-n", "sock-shop",
+         "-o", "jsonpath={.spec.selector.name}"],
+        capture_output=True, text=True,
+    )
+    active_label = result.stdout.strip()
+    if active_label != "carts":
+        print(f"  crash-loop baseline check: carts Service selector is "
+              f"{active_label!r}, not 'carts' -- a prior episode's standby "
+              f"rotation hasn't been restored yet. Aborting this injection "
+              f"attempt rather than faulting a target that isn't back to "
+              f"steady state.")
+        return False
+
+    ready_result = subprocess.run(
+        ["kubectl", "get", "pods", "-n", "sock-shop", "-l", "name=carts",
+         "--field-selector=status.phase=Running",
+         "-o", 'jsonpath={.items[0].status.containerStatuses[?(@.name=="carts")].ready}'],
+        capture_output=True, text=True,
+    )
+    if ready_result.stdout.strip() != "true":
+        print(f"  crash-loop baseline check: carts pod is not confirmed "
+              f"Ready. Aborting this injection attempt rather than faulting "
+              f"a target that isn't back to steady state.")
+        return False
+
+    return True
+
+
 def _ensure_cpu_throttle_baseline(cfg: dict):
     """Resets user's CPU limit back to CPU_THROTTLE_BASELINE_CPU_LIMIT
     before injecting, if it's currently anything else -- mirrors
@@ -3158,7 +3216,10 @@ def main():
             verified = _inject_and_verify_disk_full(cfg)
             chaos_name = "manual-exec" if verified else None
         elif fault_class == "crash-loop":
-            verified = _inject_and_verify_crash_loop(cfg, stop_file=args.stop_file)
+            if not _ensure_crash_loop_baseline():
+                verified = False
+            else:
+                verified = _inject_and_verify_crash_loop(cfg, stop_file=args.stop_file)
             chaos_name = "manual-exec" if verified else None
         elif fault_class == "network-latency":
             chaos_name = _inject_and_verify_network_latency(
