@@ -371,6 +371,88 @@ SESSION_FAILURE_SCALE_TIMEOUT_S = 60  # matches disk-full's own hard-won lesson:
 # flood-size retuning and disk-full's ephemeral-limit retuning.
 CPU_THROTTLE_STRESS_WORKERS = 6
 CPU_THROTTLE_STRESS_LOAD = 100  # percent
+
+# Live-trigger-only demo-visibility fix, locked 2026-08-19 after a full
+# real investigation (review 51, both Kimi and Qwen; real live testing
+# against a throwaway clone at the full real worst-case duration --
+# 300s hold + 35s settle + 300s abandonment ceiling = 635s). Batch runs
+# (training data, short duration_s=60, no stop_file) are COMPLETELY
+# UNCHANGED by any of this -- these constants and the probe-loosen
+# mechanism below only ever activate on a live trigger (stop_file is
+# not None), same convention under-provisioned-replicas' own
+# UNDER_PROVISIONED_LIVE_TRIGGER_VUS already established.
+#
+# Real problem this solves: the live-trigger hold is 300s
+# (operator_api.py's LIVE_TRIGGER_DURATION_OVERRIDE_S), not this file's
+# own 60s default, and the full worst case reaches 635s -- far beyond
+# what a freshness-gate-alone fix could survive (user's real liveness
+# initialDelaySeconds=300s, readiness=180s). Real fix: loosen both
+# probes for the fault's duration via a genuine Deployment-level patch
+# (not the resize subresource used by the fix action) -- this both
+# loosens the failure tolerance AND triggers a real rolling update,
+# giving a genuinely fresh replacement pod for free, then reverts both
+# after. Real, live-validated (2026-08-19, workers=50/concurrency=150,
+# /login not /register -- zero DB pollution, comparable real bcrypt
+# CPU cost, check_login_vs_register_cpu_cost.sh): zero restarts across
+# the full 635s worst case, p50=7.5s/p95=16.5s/p99=23.9s/max=36.9s,
+# zero request errors.
+CPU_THROTTLE_LIVE_TRIGGER_STRESS_WORKERS = 50
+CPU_THROTTLE_LIVE_TRIGGER_LOGIN_CONCURRENCY = 150
+
+# Explicit, not ambiguous (Kimi review 51's flag: an unspecified
+# periodSeconds makes failureThreshold's real tolerance unknowable).
+# 60 * 10s period ~= 600s of real tolerance, comfortably covering the
+# full 635s worst case with margin -- real value live-tested, not
+# guessed.
+#
+# initialDelaySeconds=5 added 2026-08-19, real bug found live-testing
+# the first actual end-to-end episode: the ORIGINAL version of this
+# dict deliberately left initialDelaySeconds untouched (matching real
+# production values, 180s readiness/300s liveness), reasoning that only
+# the OTHER three fields needed loosening. That was wrong in a way
+# throwaway-clone testing never exposed -- those tests only ever
+# measured the hold duration AFTER the loosen-rollout already
+# completed, never the full real end-to-end timeline. Live, the real
+# readinessProbe.initialDelaySeconds=180s floor means
+# `kubectl rollout status` (which _loosen_user_probes_for_fault blocks
+# on) cannot report success for ~180-230s -- and since the frontend's
+# "fault is live" countdown starts the moment the episode enters
+# `holding` (injector.py subprocess spawn), not when the real throttle
+# actually begins, that real wait silently ate into the demo's visible
+# time budget. Confirmed live: no felt effect for ~230s of a 300s
+# window, then a real dramatic effect crammed into the last ~70s.
+# Shrinking initialDelaySeconds to 5s removes this dead zone entirely
+# -- there is no real safety reason it needs to stay at 180s/300s
+# DURING the fault: that field only controls how soon checks START,
+# never how much failure they tolerate once started (that's
+# periodSeconds/timeoutSeconds/failureThreshold, already loosened and
+# already live-validated safe). A Go app (confirmed elsewhere in this
+# project, crash-loop's own warm-standby design) boots in seconds, not
+# minutes, so 5s is real margin, not a guess.
+CPU_THROTTLE_LOOSE_PROBE = {"periodSeconds": 10, "timeoutSeconds": 15, "failureThreshold": 60, "initialDelaySeconds": 5}
+
+# user's real, unmodified production probe config -- confirmed live,
+# repeatedly, across every script in this investigation (2026-08-19),
+# not assumed. Needed to revert to an EXACT known-good state. Split
+# into two separate dicts (not one shared dict, unlike
+# CPU_THROTTLE_LOOSE_PROBE) because readiness and liveness have
+# genuinely DIFFERENT real initialDelaySeconds (180 vs 300) -- a single
+# shared revert value would silently corrupt one of the two probes'
+# real production config.
+CPU_THROTTLE_TIGHT_READINESS_PROBE = {"periodSeconds": 3, "timeoutSeconds": 1, "failureThreshold": 3, "initialDelaySeconds": 180}
+CPU_THROTTLE_TIGHT_LIVENESS_PROBE = {"periodSeconds": 3, "timeoutSeconds": 1, "failureThreshold": 3, "initialDelaySeconds": 300}
+
+# The one fixed test user the live-trigger load generator logs in as
+# repeatedly -- precreated once (idempotent, a 500 on an already-
+# existing user is harmless and expected), never touched again. Real,
+# deliberate choice over /register: /register writes a permanent new
+# user-db row on every single call (real, unbounded DB pollution on
+# every live-trigger episode, flagged by both Kimi and Qwen in review
+# 51); /login against one fixed user does the same real bcrypt-compare
+# CPU work with zero new writes per call (confirmed comparable
+# degradation live, check_login_vs_register_cpu_cost.sh).
+CPU_THROTTLE_LOAD_TEST_USERNAME = "wardence_loadgen_fixed_user"
+CPU_THROTTLE_LOAD_TEST_PASSWORD = "wardencePass123"
 # container_cpu_cfs_throttled_periods_total is non-resetting and
 # already nonzero under light idle traffic (553 at measurement time) --
 # same shape as the restart-count metrics, so this compares a raw
@@ -863,11 +945,16 @@ spec:
 """
 
 
-def build_cpu_throttle_manifest(chaos_name: str, cfg: dict) -> str:
+def build_cpu_throttle_manifest(chaos_name: str, cfg: dict, workers: int | None = None) -> str:
     """Same StressChaos primitive OOM's build_oom_manifest already uses,
     just the cpu stressor mode instead of memory -- no oomScoreAdj
     needed here, there's no OOM-kill victim-selection problem for a CPU
-    stressor."""
+    stressor.
+
+    workers: optional override, used ONLY by the live-trigger path
+    (CPU_THROTTLE_LIVE_TRIGGER_STRESS_WORKERS) -- batch runs always
+    pass None and get the original CPU_THROTTLE_STRESS_WORKERS."""
+    real_workers = workers if workers is not None else CPU_THROTTLE_STRESS_WORKERS
     return f"""
 apiVersion: chaos-mesh.org/v1alpha1
 kind: StressChaos
@@ -885,7 +972,7 @@ spec:
       name: {cfg['target']}
   stressors:
     cpu:
-      workers: {CPU_THROTTLE_STRESS_WORKERS}
+      workers: {real_workers}
       load: {CPU_THROTTLE_STRESS_LOAD}
 """
 
@@ -2935,6 +3022,228 @@ def _inject_and_verify_connection_pool_exhaustion(
     return None
 
 
+def _get_user_probe_field(cfg: dict, probe_kind: str, field: str) -> str:
+    """Reads one real field (periodSeconds/timeoutSeconds/failureThreshold)
+    off user's real live readinessProbe or livenessProbe -- used only to
+    detect probe drift (_ensure_cpu_throttle_probe_baseline below), not
+    to reconstruct the whole probe spec."""
+    result = subprocess.run(
+        [
+            "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "-o", f'jsonpath={{.spec.template.spec.containers[?(@.name=="{cfg["container"]}")].{probe_kind}.{field}}}',
+        ],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _patch_user_probes(cfg: dict, readiness_values: dict, liveness_values: dict):
+    """Real strategic-merge Deployment patch on BOTH readinessProbe and
+    livenessProbe -- same mechanism class as init-failure's
+    _patch_payment_readiness_path (a real pod-template change, triggers
+    a genuine RollingUpdate), just patching timeoutSeconds/
+    failureThreshold/periodSeconds/initialDelaySeconds instead of
+    httpGet.path. Takes two SEPARATE dicts (not one shared dict) --
+    real bug fixed 2026-08-19: readiness and liveness have genuinely
+    different real initialDelaySeconds (180 vs 300), so a single shared
+    value would corrupt one of them on revert."""
+    patch_body = json.dumps({
+        "spec": {"template": {"spec": {"containers": [{
+            "name": cfg["container"],
+            "readinessProbe": readiness_values,
+            "livenessProbe": liveness_values,
+        }]}}}
+    })
+    subprocess.run(
+        [
+            "kubectl", "patch", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "--type=strategic", "-p", patch_body,
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def _wait_for_fresh_user_pod(cfg: dict, old_pod: str, timeout_s: int = 240) -> str | None:
+    """Real bug fixed live during this design's own validation
+    (2026-08-19): querying pod-by-label immediately after `rollout
+    status` reports success can still race the OLD pod's termination --
+    both pods can transiently share the same label, and picking the
+    first result has no guarantee of landing on the NEW one. Retries
+    until a RUNNING pod with a name DIFFERENT from old_pod is found,
+    then confirms it's genuinely Ready before returning -- never trusts
+    the first query alone. Returns None on timeout (caller must treat
+    this as a real failure, not proceed against a possibly-stale pod)."""
+    waited = 0
+    new_pod = None
+    while waited < timeout_s:
+        candidate = subprocess.run(
+            [
+                "kubectl", "get", "pod", "-n", cfg["namespace"], "-l", f"name={cfg['target']}",
+                "--field-selector=status.phase=Running",
+                "-o", "jsonpath={.items[0].metadata.name}",
+            ],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if candidate and candidate != old_pod:
+            new_pod = candidate
+            break
+        time.sleep(3)
+        waited += 3
+    if new_pod is None:
+        return None
+    ready_waited = 0
+    while ready_waited < timeout_s:
+        ready = subprocess.run(
+            [
+                "kubectl", "get", "pod", new_pod, "-n", cfg["namespace"],
+                "-o", f'jsonpath={{.status.containerStatuses[?(@.name=="{cfg["container"]}")].ready}}',
+            ],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if ready == "true":
+            return new_pod
+        time.sleep(3)
+        ready_waited += 3
+    return None
+
+
+def _ensure_cpu_throttle_probe_baseline(cfg: dict):
+    """Resets user's probes back to the real tight production values
+    if a prior run left them loosened (e.g. a crashed live-trigger
+    mid-episode) -- mirrors every other _ensure_*_baseline function's
+    pattern in this file, same reason: nothing else would ever notice
+    or revert this drift on its own."""
+    current_period = _get_user_probe_field(cfg, "readinessProbe", "periodSeconds")
+    if current_period == str(CPU_THROTTLE_TIGHT_READINESS_PROBE["periodSeconds"]):
+        return
+    print(f"  user's readinessProbe.periodSeconds is {current_period or '(unknown)'}, not the real "
+          f"tight baseline ({CPU_THROTTLE_TIGHT_READINESS_PROBE['periodSeconds']}) -- resetting before "
+          f"injecting (a prior live-trigger run likely left it loosened)...")
+    _patch_user_probes(cfg, CPU_THROTTLE_TIGHT_READINESS_PROBE, CPU_THROTTLE_TIGHT_LIVENESS_PROBE)
+    subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=240s",
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def _loosen_user_probes_for_fault(cfg: dict) -> str | None:
+    """Real, live-validated design (2026-08-19): patches user's probes
+    to CPU_THROTTLE_LOOSE_PROBE, which triggers a genuine RollingUpdate
+    -- the fresh replacement pod this produces is the real freshness
+    guarantee (no separate restart-for-freshness step needed). Returns
+    the new pod's name, or None if the rollout/fresh-pod-detection
+    failed (caller must abort, never fault an unconfirmed pod)."""
+    old_pod = _current_pod_name(cfg["target"], cfg["namespace"])
+    _patch_user_probes(cfg, CPU_THROTTLE_LOOSE_PROBE, CPU_THROTTLE_LOOSE_PROBE)
+    result = subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=240s",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"  WARNING: probe-loosen rollout did not confirm cleanly: {result.stderr.strip()[:300]}")
+        return None
+    return _wait_for_fresh_user_pod(cfg, old_pod)
+
+
+def _restore_user_probes(cfg: dict):
+    """Reverts user's probes back to the real tight production values,
+    verified via real rollout status -- same 'verify real completion,
+    not just API acceptance' discipline as restore_from_disk_full.
+    240s timeout, not 90s: real bug found live during this design's own
+    validation -- the reverted pod must wait out the real
+    readinessProbe.initialDelaySeconds=180s before it reports Ready, so
+    anything shorter than that (plus margin) was structurally
+    guaranteed to time out even on a clean revert."""
+    _patch_user_probes(cfg, CPU_THROTTLE_TIGHT_READINESS_PROBE, CPU_THROTTLE_TIGHT_LIVENESS_PROBE)
+    result = subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=240s",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"  WARNING: probe-restore rollout did not confirm cleanly: {result.stderr.strip()[:300]}")
+
+
+def _ensure_cpu_throttle_login_user_exists(cfg: dict):
+    """Real, one-time (idempotent) precreation of the fixed load-test
+    user via a real POST /register call -- a real 500 response here
+    just means the user already exists from an earlier episode, which
+    is the expected, harmless steady state after the first ever call.
+    Never retried/escalated on failure -- if this genuinely never
+    worked, the load generator's own login calls would simply fail
+    (visible in its own real logs), not a silent scoring risk (this
+    load generator never feeds evidence/verification, only demo
+    visibility)."""
+    subprocess.run(
+        [
+            "kubectl", "run", f"wardence-cputhrottle-usersetup-{uuid.uuid4().hex[:8]}",
+            "--rm", "-i", "--restart=Never", "-n", cfg["namespace"],
+            f"--image={K6_IMAGE}", "--image-pull-policy=IfNotPresent",
+            "--command", "--", "sh", "-c",
+            f"curl -s -o /dev/null -m 10 -X POST "
+            f"http://{cfg['target']}.{cfg['namespace']}.svc.cluster.local/register "
+            f"-H 'Content-Type: application/json' "
+            f"-d '{{\"username\":\"{CPU_THROTTLE_LOAD_TEST_USERNAME}\",\"password\":\"{CPU_THROTTLE_LOAD_TEST_PASSWORD}\","
+            f"\"email\":\"{CPU_THROTTLE_LOAD_TEST_USERNAME}@example.com\",\"firstName\":\"Load\",\"lastName\":\"Gen\"}}'",
+        ],
+        capture_output=True, text=True, timeout=20,
+    )
+
+
+def _launch_cpu_throttle_login_load(namespace: str, target: str, concurrency: int, duration_s: int):
+    """Non-blocking (Popen) launch of the real sustained login load
+    generator, live-validated end-to-end 2026-08-19 (workers=50/
+    concurrency=150/full 635s worst case: zero restarts, zero request
+    errors, p50=7.5s/p95=16.5s/p99=23.9s/max=36.9s). Same real Popen/
+    kubectl-run/k6 pattern as under-provisioned-replicas'
+    _launch_sustained_catalogue_burst -- GET /login with real HTTP
+    Basic Auth against the one fixed precreated user
+    (CPU_THROTTLE_LOAD_TEST_USERNAME), zero user-db writes per call
+    (the real reason this replaced /register -- see
+    CPU_THROTTLE_LOAD_TEST_USERNAME's docstring above). Hits user's own
+    real Service DNS, not a specific pod IP -- routes to whichever real
+    pod is currently live, same as every other class's own live-trigger
+    load. Returns (pod_name, Popen); caller reaps it the same way
+    UPR's burst_proc is reaped."""
+    pod_name = f"wardence-cputhrottle-load-{uuid.uuid4().hex[:8]}"
+    script = f"""
+import http from 'k6/http';
+import encoding from 'k6/encoding';
+export const options = {{
+  scenarios: {{
+    login_burst: {{
+      executor: 'constant-vus',
+      vus: {concurrency},
+      duration: '{duration_s}s',
+    }},
+  }},
+}};
+const authHeader = 'Basic ' + encoding.b64encode('{CPU_THROTTLE_LOAD_TEST_USERNAME}:{CPU_THROTTLE_LOAD_TEST_PASSWORD}');
+export default function () {{
+  http.get('http://{target}.{namespace}.svc.cluster.local/login', {{headers: {{Authorization: authHeader}}}});
+}}
+"""
+    proc = subprocess.Popen(
+        [
+            "kubectl", "run", pod_name, "--rm", "-i", "--restart=Never",
+            "-n", namespace, f"--image={K6_IMAGE}", "--image-pull-policy=IfNotPresent",
+            "--", "run", "--quiet", "-",
+        ],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    proc.stdin.write(script)
+    proc.stdin.close()
+    return pod_name, proc
+
+
 def _verify_cpu_throttle_effect(
     target: str, namespace: str, container: str, baseline_periods: int
 ) -> bool:
@@ -2959,12 +3268,21 @@ def _inject_and_verify_cpu_throttling(cfg: dict, stop_file: str | None = None) -
     not Chaos Mesh's own state.
 
     stop_file: same early-exit contract as run_crash_loop_injection --
-    checked once per ~10s tick during the hold; omit for batch runs."""
+    checked once per ~10s tick during the hold; omit for batch runs.
+    ALSO now the same convention under-provisioned-replicas already
+    uses to branch into a real live-trigger sustained-demo path (see
+    CPU_THROTTLE_LIVE_TRIGGER_STRESS_WORKERS's docstring above for the
+    full real design/validation history) -- batch runs (stop_file is
+    None) are completely unaffected, same original workers/no-probe-
+    loosen/no-load-generator path as before."""
     _ensure_cpu_throttle_baseline(cfg)
     chaos_kind = "stresschaos"
     namespace = cfg["namespace"]
     target = cfg["target"]
     container = cfg["container"]
+
+    if stop_file is not None:
+        return _inject_and_verify_cpu_throttling_live_trigger(cfg, stop_file)
 
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
         baseline_periods = _cfs_throttled_periods(target, namespace, container)
@@ -3006,6 +3324,94 @@ def _inject_and_verify_cpu_throttling(cfg: dict, stop_file: str | None = None) -
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
         print(f"  attempt {attempt}: no real throttled-periods increase observed{suffix}")
     return None
+
+
+def _inject_and_verify_cpu_throttling_live_trigger(cfg: dict, stop_file: str) -> str | None:
+    """Real live-trigger demo path, locked and live-validated 2026-08-19
+    (review 51 + real testing against a throwaway clone at the full
+    real worst-case duration, 635s -- see CPU_THROTTLE_LIVE_TRIGGER_*'s
+    docstrings above for the complete design history). Single attempt
+    only, no MAX_INJECT_ATTEMPTS retry -- same reasoning
+    under-provisioned-replicas' own live-trigger path already
+    established: retrying a real ~300-635s sustained hold 3x would cost
+    up to ~30 real minutes.
+
+    Real sequence: ensure probes aren't already drifted from a prior
+    crashed run -> loosen probes (real rolling update, gives a
+    genuinely fresh replacement pod for free) -> ensure the fixed login
+    load-test user exists -> apply StressChaos at the live-trigger
+    severity (50 workers, not batch's 6) -> launch the real login load
+    generator in the background -> hold for the full duration_s,
+    verifying via the SAME real kernel-counter mechanism batch runs use
+    (container_cpu_cfs_throttled_periods_total) -- the login load is
+    for demo visibility only, it never feeds verification/scoring, so
+    no new evidence mechanism was needed. Probes are ALWAYS restored in
+    finally, regardless of how the hold ends (interrupted, verified, or
+    an exception) -- never leave the real production pod running with
+    loosened probes."""
+    namespace = cfg["namespace"]
+    target = cfg["target"]
+    container = cfg["container"]
+    duration_s = cfg["duration_s"]
+
+    _ensure_cpu_throttle_probe_baseline(cfg)
+    print(f"  live-trigger: loosening user's probes (real rolling update, gives a fresh pod for free)...")
+    fresh_pod = _loosen_user_probes_for_fault(cfg)
+    if fresh_pod is None:
+        print("  FAILED: probe-loosen rollout never produced a confirmed fresh, Ready pod. Aborting "
+              "(probes will still be restored below).")
+        _restore_user_probes(cfg)
+        return None
+    print(f"  confirmed fresh pod: {fresh_pod}")
+
+    _ensure_cpu_throttle_login_user_exists(cfg)
+
+    chaos_name = f"{cfg['chaos_name_prefix']}-live-{uuid.uuid4().hex[:8]}"
+    load_pod = None
+    load_proc = None
+    try:
+        baseline_periods = _cfs_throttled_periods(target, namespace, container)
+        manifest = build_cpu_throttle_manifest(chaos_name, cfg, workers=CPU_THROTTLE_LIVE_TRIGGER_STRESS_WORKERS)
+        apply_manifest(manifest)
+        print(f"  live-trigger: baseline_periods={baseline_periods}, workers={CPU_THROTTLE_LIVE_TRIGGER_STRESS_WORKERS}, "
+              f"holding for the full {duration_s}s window...")
+
+        load_pod, load_proc = _launch_cpu_throttle_login_load(
+            namespace, target, CPU_THROTTLE_LIVE_TRIGGER_LOGIN_CONCURRENCY, duration_s
+        )
+        print(f"  real login load generator launched: {load_pod} "
+              f"(concurrency={CPU_THROTTLE_LIVE_TRIGGER_LOGIN_CONCURRENCY})")
+
+        interrupted = False
+        elapsed = 0
+        while elapsed < duration_s:
+            if os.path.exists(stop_file):
+                interrupted = True
+                break
+            time.sleep(10)
+            elapsed += 10
+
+        verified = _verify_cpu_throttle_effect(target, namespace, container, baseline_periods)
+    finally:
+        delete_chaos_resource("stresschaos", chaos_name)
+        if load_pod is not None:
+            _kill_pod_now(namespace, load_pod)
+        if load_proc is not None:
+            try:
+                load_proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                load_proc.kill()
+        # Probes restored LAST, unconditionally, regardless of how the
+        # hold ended -- the one thing that must never be skipped, same
+        # "never leave real production state drifted" discipline as
+        # every other _ensure_*_baseline function in this file.
+        print("  live-trigger: restoring user's real production probes...")
+        _restore_user_probes(cfg)
+
+    if interrupted:
+        print("  early-stop requested -- not retrying")
+        return chaos_name if verified else None
+    return chaos_name if verified else None
 
 
 def _pod_restart_count_direct(pod_name: str, namespace: str, container: str) -> int | None:

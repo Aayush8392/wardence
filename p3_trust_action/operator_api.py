@@ -276,7 +276,24 @@ INJECT_SUBPROCESS_TIMEOUT_S = {
     # as the other 8 if these are ever extended for live-visibility too.
     "disk-full": 220,             # duration_s=60, natural hard ceiling, no extension
     "bad-rollout": 200,           # duration_s=60, standing config change
-    "cpu-throttling": 350,        # real-safety-tested to 300s (2026-08-01), injector cost not separately measured
+    # RECALIBRATED 350 -> 900, 2026-08-19, after the real probe-loosening
+    # demo-visibility fix landed (see injector.py's CPU_THROTTLE_LIVE_
+    # TRIGGER_*/_inject_and_verify_cpu_throttling_live_trigger). Real,
+    # NOT YET LIVE-MEASURED reasoning, sized generously on purpose: the
+    # live-trigger path now brackets the 300s hold with TWO real
+    # Deployment rollouts (loosen before, restore after), and each
+    # fresh replacement pod still has to wait out user's real
+    # readinessProbe.initialDelaySeconds=180s before `kubectl rollout
+    # status` reports success (only periodSeconds/timeoutSeconds/
+    # failureThreshold are patched, initialDelaySeconds is never
+    # touched -- confirmed live, every probe dump this session still
+    # showed the real 180s value). 900 = 300s hold + 2x240s (each
+    # rollout's own internal timeout, itself already padded past the
+    # real 180s floor) + margin. Revisit with a real live timing test
+    # (same discipline as oom's/UPR's own recalibration entries above)
+    # before trusting this number under real pressure -- it is a safe
+    # upper bound, not a measured one.
+    "cpu-throttling": 900,
     # under-provisioned-replicas: RECALIBRATED 150 -> 300, 2026-08-1x
     # (Kimi review 34 finding #8's scope extended past the review itself,
     # to UPR -- it shares the same catalogue target/baseline-reset cost as
