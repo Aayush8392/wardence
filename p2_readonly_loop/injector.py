@@ -1663,6 +1663,21 @@ def _ensure_queue_master_pod_cleanup(cfg: dict):
         )
 
 
+def _carts_pod_ready() -> bool:
+    """Live kubectl check that the real `carts` pod (not carts-warm) is
+    genuinely Running AND Ready. Shared by _ensure_crash_loop_baseline's
+    two checks (the selector-stuck self-heal path and the final
+    steady-state gate) so there's exactly one real place this check is
+    made."""
+    ready_result = subprocess.run(
+        ["kubectl", "get", "pods", "-n", "sock-shop", "-l", "name=carts",
+         "--field-selector=status.phase=Running",
+         "-o", 'jsonpath={.items[0].status.containerStatuses[?(@.name=="carts")].ready}'],
+        capture_output=True, text=True,
+    )
+    return ready_result.stdout.strip() == "true"
+
+
 def _ensure_crash_loop_baseline() -> bool:
     """Fast, non-blocking defense-in-depth check for crash-loop's warm-
     standby design (Model A, locked -- see
@@ -1673,18 +1688,21 @@ def _ensure_crash_loop_baseline() -> bool:
     main() must treat False as a total injection failure (same path
     as MAX_INJECT_ATTEMPTS exhaustion: no episode recorded, loud abort).
 
-    Deliberately does NOT wait/poll here -- unlike every other
-    _ensure_*_baseline function in this file (which self-heal by
-    actively resetting drifted state), this one CANNOT self-heal: if
-    carts is still recovering from a prior episode, the only real fix
-    is time, and waiting here would hold this process's system_lock
-    for however long that takes (up to the real measured ~533s worst
-    case), risking a second process treating the lock as stale
-    (SYSTEM_LOCK_STALE_S=600) and stealing it mid-wait. The long wait
-    instead lives in the operator/button layer, outside any lock --
-    this function only does a fast check and aborts loudly if the
-    system isn't ready, exactly the same shape as every other total-
-    injection-failure path in this file.
+    Real self-heal, added after a live incident (2026-08-19) where the
+    detached backward-flip process (restore_carts_active.py) died
+    before restoring the selector, leaving it stuck on "carts-warm"
+    forever even though the real carts pod was healthy the whole time
+    -- every subsequent trigger attempt aborted with an opaque cooldown
+    until a one-time manual `kubectl patch` fixed it. If the selector
+    is stuck AWAY from "carts" but the real carts pod is confirmed
+    Ready, that's exactly this stuck-reconciliation shape (not a
+    genuine in-progress recovery) -- self-heal by patching the selector
+    back directly, same idempotent patch carts_rotation.flip_to_carts()
+    would apply, done here via kubectl (not a cross-package import into
+    p3_trust_action) to match this file's existing style. Only a
+    genuinely not-yet-Ready carts pod still waits/aborts -- the one
+    case where the long real wait belongs in the operator/button layer,
+    outside any lock, same reasoning as before.
 
     This is the one authoritative gate every real trigger path shares
     (run_batch_plan.py's subprocess call AND operator_api.py's live-
@@ -1699,20 +1717,34 @@ def _ensure_crash_loop_baseline() -> bool:
     )
     active_label = result.stdout.strip()
     if active_label != "carts":
-        print(f"  crash-loop baseline check: carts Service selector is "
-              f"{active_label!r}, not 'carts' -- a prior episode's standby "
-              f"rotation hasn't been restored yet. Aborting this injection "
-              f"attempt rather than faulting a target that isn't back to "
-              f"steady state.")
-        return False
+        if _carts_pod_ready():
+            print(f"  crash-loop baseline check: carts Service selector is "
+                  f"{active_label!r}, not 'carts', but the real carts pod is "
+                  f"confirmed Ready -- this is a stuck reconciliation (a "
+                  f"prior episode's backward flip never completed), not a "
+                  f"genuine in-progress recovery. Self-healing by patching "
+                  f"the selector back to 'carts'.")
+            patch_result = subprocess.run(
+                ["kubectl", "patch", "service", "carts", "-n", "sock-shop",
+                 "-p", '{"spec":{"selector":{"name":"carts"}}}'],
+                capture_output=True, text=True,
+            )
+            if patch_result.returncode != 0:
+                print(f"  crash-loop baseline check: self-heal patch failed: "
+                      f"{patch_result.stderr.strip()}. Aborting this "
+                      f"injection attempt.")
+                return False
+            print("  crash-loop baseline check: self-heal patch applied.")
+        else:
+            print(f"  crash-loop baseline check: carts Service selector is "
+                  f"{active_label!r}, not 'carts', and the real carts pod is "
+                  f"not confirmed Ready -- a prior episode's standby "
+                  f"rotation is still genuinely recovering. Aborting this "
+                  f"injection attempt rather than faulting a target that "
+                  f"isn't back to steady state.")
+            return False
 
-    ready_result = subprocess.run(
-        ["kubectl", "get", "pods", "-n", "sock-shop", "-l", "name=carts",
-         "--field-selector=status.phase=Running",
-         "-o", 'jsonpath={.items[0].status.containerStatuses[?(@.name=="carts")].ready}'],
-        capture_output=True, text=True,
-    )
-    if ready_result.stdout.strip() != "true":
+    if not _carts_pod_ready():
         print(f"  crash-loop baseline check: carts pod is not confirmed "
               f"Ready. Aborting this injection attempt rather than faulting "
               f"a target that isn't back to steady state.")
