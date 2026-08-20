@@ -230,4 +230,5 @@ p2_readonly_loop/check_shipping_heap_baseline_noise.sh
 p2_readonly_loop/check_shipping_heap_history_prometheus.py
 p2_readonly_loop/check_memory_leak_felt_effect_and_timing.sh
 p2_readonly_loop/check_shipping_warmup_plateau.sh
+p2_readonly_loop/check_shipping_capacity_probe.sh
 loadgen_run2.js
