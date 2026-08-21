@@ -233,3 +233,7 @@ p2_readonly_loop/check_shipping_warmup_plateau.sh
 p2_readonly_loop/check_shipping_capacity_probe.sh
 p2_readonly_loop/check_shipping_jdk_version.sh
 loadgen_run2.js
+p2_readonly_loop/check_shipping_organic_traffic_rate.sh
+p2_readonly_loop/check_shipping_prometheus_jvm_scrape.sh
+p2_readonly_loop/check_shipping_heap_organic_baseline.sh
+p2_readonly_loop/check_shipping_synthetic_load_no_leak.sh
