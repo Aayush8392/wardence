@@ -197,6 +197,24 @@ def ensure_episode_snapshots_table(conn: sqlite3.Connection):
     for col, col_type in new_cols.items():
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE episode_snapshots ADD COLUMN {col} {col_type}")
+    # memory_leak_baseline_heap_kb added 2026-08-2x for the real production
+    # memory-leak build. Real, corrected home for the WRITE (not this table
+    # -- see injector.py's ensure_db()): injector.py captures the real
+    # baseline (min_over_time(heap_used[30s]) at t0+35s settle) into
+    # episodes.memory_leak_baseline_heap_kb, since that's the row it already
+    # owns at settle time -- episode_snapshots doesn't get its own INSERT
+    # until AFTER diagnosis, well after injector needs to have written this.
+    # THIS column exists purely so the Replay Viewer has it alongside every
+    # other per-episode field it already reads from here -- p3_scorer.py
+    # reads the real value from `episodes` when building the /diagnose
+    # payload and copies it into this table's own INSERT below (not yet
+    # wired -- next piece). agent.py's DiagnoseRequest gains a matching
+    # baseline_heap_kb field. Only populated for memory-leak episodes going
+    # forward -- NULL for every other class and for every episode scored
+    # before this column existed, same "no backfill, no fabrication" rule
+    # as the provider/model/tier columns above.
+    if "memory_leak_baseline_heap_kb" not in existing_cols:
+        conn.execute("ALTER TABLE episode_snapshots ADD COLUMN memory_leak_baseline_heap_kb REAL")
     conn.commit()
 
 
@@ -469,12 +487,27 @@ def main():
         except Exception as e:
             print(f"  crash-loop restoration: failed to spawn background reconciler: {e}")
 
+    # Real per-episode floor reading (KB), memory-leak only -- read from
+    # episodes.memory_leak_baseline_heap_kb, injector.py's own real write
+    # (captured at settle time, BEFORE this scorer ever runs). Queried
+    # unconditionally (cheap, a single indexed PK lookup) rather than
+    # gated on actual_class == "memory-leak" -- NULL for every other
+    # class, same "harmless to always read, meaningful only where
+    # populated" shape as every other per-episode field this function
+    # already reads from `episodes`/`episode_snapshots`.
+    baseline_row = conn.execute(
+        "SELECT memory_leak_baseline_heap_kb FROM episodes WHERE episode_id = ?",
+        (episode_id,),
+    ).fetchone()
+    baseline_heap_kb = baseline_row[0] if baseline_row is not None else None
+
     # Phase 1: diagnosis only (stub + background LLM), independently timed.
     diag_resp = requests.post(
         DIAGNOSE_URL,
         json={
             "target": target, "namespace": namespace, "episode_id": episode_id,
             "snapshot_at": args.snapshot_at, "stream": args.stream,
+            "baseline_heap_kb": baseline_heap_kb,
         },
         timeout=DIAGNOSE_TIMEOUT_S,
     )
@@ -604,8 +637,9 @@ def main():
             (episode_id, tool_output, reasoning, confidence,
              action_taken, action_result, durability_verdict, durability_elapsed_s,
              gate_substitution, provider, model, tier,
-             transcript_json, observations_json, failed_attempts_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             transcript_json, observations_json, failed_attempts_json,
+             memory_leak_baseline_heap_kb)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             episode_id,
@@ -624,6 +658,12 @@ def main():
             json.dumps(llm_result.get("observations")) if llm_result.get("observations") else None,
             json.dumps(llm_result.get("failed_attempts"), default=lambda o: getattr(o, "__dict__", str(o)))
             if llm_result.get("failed_attempts") else None,
+            # Real copy from `episodes` (read earlier in this function,
+            # before the /diagnose call) -- NOT a second write to the
+            # source of truth, purely so the Replay Viewer has it
+            # alongside every other per-episode field it already reads
+            # from THIS table. NULL for every non-memory-leak episode.
+            baseline_heap_kb,
         ),
     )
     conn.commit()

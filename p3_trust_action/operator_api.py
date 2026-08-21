@@ -224,7 +224,6 @@ INJECT_SUBPROCESS_TIMEOUT_S = {
     # (2026-08-11). Six of seven cost ~181-190s real (clean, minimal
     # per-probe overhead) -> 260s gives ~70-80s real margin.
     "network-partition": 260,           # real: 181.0s
-    "memory-leak": 260,                 # real: 181.2s
     "init-failure": 260,                # real: 181.0s
     "session-cart-failure": 260,        # real: 190.4s
     "connection-pool-exhaustion": 260,  # real: 184.2s
@@ -305,6 +304,18 @@ INJECT_SUBPROCESS_TIMEOUT_S = {
     # framing as oom above -- this covers the rare case the new automatic
     # post-episode reset didn't run.
     "under-provisioned-replicas": 300,
+    # memory-leak: RECALIBRATED 2026-08-21 for the real production
+    # mechanism (JVM-attach LeakAgent against shipping), replacing the OLD
+    # StressChaos entry above (260s, measured against the now-removed
+    # 100s-duration container-stressor mechanism -- no longer a valid
+    # comparison). Real locked config: 180s hold + 35s settle (real
+    # floor-capture wait before the agent starts ramping) + real overhead
+    # margin (ramp confirmation, synthetic-load-burst launch, RELEASE/
+    # reap in the finally block) = 300s. No clone-only warmup phase
+    # needed in production, per the established "production shipping is
+    # always warm from real organic traffic" finding -- unlike the clone
+    # harness, which needed its own warmup window before a clean measurement.
+    "memory-leak": 300,
 }
 DEFAULT_INJECT_SUBPROCESS_TIMEOUT_S = 300  # any class not yet in the dict above
 # The subprocess call below is wrapped in try/except TimeoutExpired, so
@@ -380,8 +391,13 @@ RESOLVE_SAFETY_BUFFER_S = 5
 # This constant is the REAL fix, not a bandage on that symptom: every
 # diagnosis query in agent.py has a genuine, bounded PromQL lookback
 # window (confirmed by reading the file, not assumed) -- [3m] for
-# restarts/OOM/eviction/memory-leak/connection-pool, [2m] for
-# network-latency. Wait too long past injection and the agent's own
+# restarts/OOM/eviction/connection-pool, [2m] for network-latency.
+# memory-leak's own window is [60s] as of the 2026-08-21 production
+# mechanism swap (was [3m], tied to the now-removed StressChaos
+# mechanism) -- narrower than every window this constant was originally
+# sized against, so the "just above the longest real query window"
+# reasoning below is now conservative for memory-leak specifically, not
+# invalidated by it. Wait too long past injection and the agent's own
 # queries will correctly see nothing, because the real evidence has
 # aged out of the window it checks -- producing a FALSE "wrong" that
 # reflects nothing about the system's real accuracy, only that the user
@@ -631,7 +647,8 @@ HOLDING_CLASSES = {
 # duration_s for every one of these 8 classes is its ORIGINAL,
 # pre-Operator-extension value (crash-loop 40s, cpu-throttling/
 # network-latency/network-partition/init-failure/session-cart-failure
-# 60s, memory-leak 100s) -- the real 180s/300s durations locked across
+# 60s -- memory-leak's own original value was 100s, since corrected --
+# see the note below) -- the real 180s/300s durations locked across
 # several earlier design sessions (live-tested, safety-verified) were
 # only ever applied via --duration-override in one-off test scripts,
 # never wired into the actual live-trigger wrapper. Confirmed live,
@@ -642,6 +659,14 @@ HOLDING_CLASSES = {
 # itself, matching the existing --duration-override convention (a
 # fresh per-run cfg copy, FAULT_CONFIG never mutated) -- batch runs are
 # UNAFFECTED, this dict is only ever consulted for live triggers.
+#
+# memory-leak's own entry below is now a genuine no-op, not stale data
+# left uncorrected: FAULT_CONFIG["memory-leak"]["duration_s"] was
+# directly fixed to 180 earlier in the 2026-08-21 session (the real
+# production mechanism's own locked hold, replacing the old 100s
+# StressChaos-era value) -- both this override and the base config now
+# agree. Kept here anyway, not removed, for the same explicit-symmetry
+# reasoning every other class's entry already follows in this dict.
 LIVE_TRIGGER_DURATION_OVERRIDE_S = {
     "crash-loop": 180,
     "cpu-throttling": 300,
@@ -2155,18 +2180,31 @@ def _init_failure_live_status(namespace: str, target: str) -> dict:
 
 
 def _memory_leak_live_status(namespace: str, target: str) -> dict:
-    query = (
-        f'max_over_time(container_memory_working_set_bytes{{namespace="{namespace}", '
-        f'pod=~"{target}-[^-]+-[^-]+$", container="{target}"}}[3m])'
-    )
+    """Real production replacement (2026-08-21 session), REPLACES the old
+    container_memory_working_set_bytes reading -- that signal belonged to
+    the now-removed StressChaos mechanism and has no real relationship to
+    the JVM-attach LeakAgent's own retained heap. `heap_used` is
+    shipping's own real, scraped JVM heap metric (KB, same signal
+    agent.py's real diagnosis query reads).
+
+    Deliberately reports the RAW current/recent-peak reading, NOT a
+    rise-over-baseline like the real scored diagnosis does -- this is a
+    live "now" glance with no episode context (no snapshot_at, no
+    per-episode baseline_heap_kb the way /diagnose has), so there is no
+    real baseline available here to compare against. Fabricating one
+    would misrepresent this as more diagnostic than it honestly is;
+    every other class's own live-status function here (disk-full/
+    init-failure/bad-rollout) reports similarly raw, undiagnosed
+    readings, not a full verdict."""
+    query = f'max_over_time(heap_used{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}[2m])'
     try:
         result = _prom_query_safe(query)
     except HTTPException as exc:
-        return {"memory_working_set_mib": None, "warning": exc.detail}
+        return {"heap_used_mib": None, "warning": exc.detail}
     if not result:
-        return {"memory_working_set_mib": None, "warning": None}
-    value_mib = round(float(result[0]["value"][1]) / (1024 * 1024), 1)
-    return {"memory_working_set_mib": value_mib, "warning": None}
+        return {"heap_used_mib": None, "warning": None}
+    value_mib = round(float(result[0]["value"][1]) / 1024, 1)  # heap_used is KB, not bytes
+    return {"heap_used_mib": value_mib, "warning": None}
 
 
 def _bad_rollout_live_status(namespace: str, target: str) -> dict:

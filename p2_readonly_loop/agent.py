@@ -43,13 +43,21 @@ DL_DETECTOR_SERVICES = {"front-end", "orders", "user", "catalogue", "queue-maste
 # (injected delay is 500ms, see injector.py NETWORK_LATENCY_DELAY).
 HIGH_LATENCY_THRESHOLD_MS = 300
 
-# shipping's baseline working-set memory is ~298MiB (confirmed via a
-# direct Prometheus query, 2026-07-21), and injector.py's stressor adds
-# ~150MiB on top (see injector.py's MEMORY_LEAK_STRESS_SIZE docstring
-# for why it's sized that small -- shipping's real headroom under its
-# 500Mi limit is only ~202MiB). 380MiB sits comfortably between the
-# ~298MiB normal baseline and the ~448MiB stressed level.
-MEMORY_LEAK_THRESHOLD_MIB = 380
+# Real production diagnosis threshold, LOCKED 2026-08-21 session (see
+# wardence_buildlog.md's measurement 1-4 chain) -- REPLACES the old
+# MEMORY_LEAK_THRESHOLD_MIB absolute check (380MiB, calibrated against the
+# now-removed container-stressor mechanism: baseline ~298MiB + ~150MiB
+# stressor). That formula is structurally dead against the real production
+# mechanism -- shipping's real baseline RSS (~314-334MiB) plus a
+# -Xmx128m-capped leak agent has no arithmetic path to 380MiB, and separate
+# real measurement (2 real production no-leak samples) proved an absolute
+# threshold can't work at all: a freshly-booted JVM's own floor can sit
+# BELOW a long-running production JVM's organic floor. Self-referential
+# rise-over-baseline is the real fix -- see query_prometheus's heap_rise_kb
+# computation below for the full formula.
+# 20 MiB -- clears the real measured 8.0 MiB organic ceiling and 1.4-1.7 MiB
+# synthetic-load-only ceiling with real margin.
+MEMORY_LEAK_RISE_THRESHOLD_KB = 20000
 
 # catalogue-db's max_connections is 151, baseline Threads_connected is
 # ~2-3 (both confirmed via direct query, 2026-07-21). 100 sits
@@ -258,6 +266,16 @@ class DiagnoseRequest(BaseModel):
     # behavior exactly. See _prom_instant_query's docstring for why
     # this exists.
     snapshot_at: str | None = None
+    # Real per-episode floor reading (KB), memory-leak only. Unlike
+    # snapshot_at (a single frozen "now" instant), this diagnosis needs a
+    # SECOND, earlier anchor -- the target pod's own heap_used floor
+    # captured by injector.py at settle time (t0+35s) -- so the diagnosis
+    # query can compute a self-referential rise-over-baseline rather than
+    # an absolute threshold (which measurement showed can't work across a
+    # freshly-booted clone vs. a long-running production pod). Optional,
+    # same precedent snapshot_at itself set: every existing caller/class
+    # is unaffected, zero regression risk.
+    baseline_heap_kb: float | None = None
 
 
 def _prom_instant_query(query: str, snapshot_at: str | None = None) -> list:
@@ -290,7 +308,9 @@ def _prom_instant_query(query: str, snapshot_at: str | None = None) -> list:
     return resp.json()["data"]["result"]
 
 
-def query_prometheus(target: str, namespace: str, snapshot_at: str | None = None) -> dict:
+def query_prometheus(
+    target: str, namespace: str, snapshot_at: str | None = None, baseline_heap_kb: float | None = None
+) -> dict:
     """Tool: check whether a matching container is crash-looping, was OOM-killed,
     was evicted (disk-full), or is seeing elevated request latency
     (network-latency, via p95_latency_ms -- k6's own observed latency
@@ -632,33 +652,21 @@ def query_prometheus(target: str, namespace: str, snapshot_at: str | None = None
     else:
         session_db_replicas_hit_zero = False
 
-    # memory-leak: cAdvisor's container_memory_working_set_bytes is a
-    # real-time gauge, not a percentile estimator -- but that cuts the
-    # other way from the latency metric's problem: it reflects TRUE
-    # CURRENT memory, so once injector.py's stressor process ends, the
-    # elevated reading disappears almost immediately (unlike a restart
-    # count or OOM reason, which stay as sticky historical evidence).
-    # By the time this endpoint gets called (injector-end + settle),
-    # an instant query would very likely see nothing. max_over_time
-    # over a window wide enough to cover the fault's own duration_s
-    # (100s) plus the settle gap avoids that -- same fix as the latency
-    # query above, different root cause (here it's about a genuinely
-    # un-sticky signal, not volatility).
-    # oom: catalogue's own real peak working-set memory, added 2026-08-03
-    # -- this field used to be populated for `shipping` only (memory-leak's
-    # diagnosis threshold, the field's original and only consumer). oom's
-    # real production auto-fix (patch_memory_limit) always used a fixed
-    # deterministic "400Mi" constant and never needed this value, so the
-    # gap was invisible until action_proposer.py's LLM-driven magnitude
-    # sizing started depending on a real peak_memory_mib for oom too --
-    # oom silently always saw None here, tripping the "metric missing,
-    # fall back to restart_deployment" instruction on every single
-    # episode. [6m] window (vs. shipping's [3m]) because oom's real
+    # oom: catalogue's own real peak working-set memory, added 2026-08-03.
+    # Real, deliberate scope narrowing 2026-08-21: this dict used to also
+    # carry "shipping": "3m" for memory-leak's OLD container-stressor
+    # diagnosis -- removed along with that mechanism (see heap_rise_kb
+    # below, its real replacement). oom's real production auto-fix
+    # (patch_memory_limit) always used a fixed deterministic "400Mi"
+    # constant and never needed this value, so the gap was invisible until
+    # action_proposer.py's LLM-driven magnitude sizing started depending on
+    # a real peak_memory_mib for oom too -- oom silently always saw None
+    # here, tripping the "metric missing, fall back to restart_deployment"
+    # instruction on every single episode. [6m] window because oom's real
     # verification ceiling is 200s (see injector.py's redesigned
-    # _inject_and_verify_oom), noticeably wider than memory-leak's fixed
-    # 100s duration_s -- same reasoning as cpu-throttling's own 2m->6m
-    # widening for a class whose real fault window can run long.
-    _PEAK_MEMORY_TARGETS = {"shipping": "3m", "catalogue": "6m"}
+    # _inject_and_verify_oom) -- same reasoning as cpu-throttling's own
+    # 2m->6m widening for a class whose real fault window can run long.
+    _PEAK_MEMORY_TARGETS = {"catalogue": "6m"}
     if target in _PEAK_MEMORY_TARGETS:
         memory_query = (
             f'max_over_time(container_memory_working_set_bytes{{namespace="{namespace}", '
@@ -670,6 +678,33 @@ def query_prometheus(target: str, namespace: str, snapshot_at: str | None = None
         )
     else:
         peak_memory_mib = None
+
+    # memory-leak: real production replacement (2026-08-21 session, LOCKED
+    # design -- see wardence_buildlog.md for the full measurement chain),
+    # REPLACES the old container_memory_working_set_bytes/MEMORY_LEAK_
+    # THRESHOLD_MIB absolute check above. Self-referential rise-over-
+    # baseline, not an absolute threshold -- real measurement proved a
+    # fixed number can't work across a freshly-booted JVM and a long-
+    # running production one (their real absolute floors aren't
+    # comparable). `heap_used` is shipping's own real, now-scraped JVM
+    # heap metric (KB, classic-Actuator shape, confirmed present and
+    # scraped via add_shipping_metrics_scrape.sh). `baseline_heap_kb` is
+    # injector.py's own real per-episode floor reading (min_over_time,
+    # captured at settle time BEFORE the leak agent starts ramping,
+    # persisted to episodes.memory_leak_baseline_heap_kb) -- threaded
+    # through from the caller (None for every non-memory-leak class/every
+    # caller not yet updated to pass it, same zero-regression precedent
+    # snapshot_at itself set). 60s window sized off the real governor
+    # cadence measured in the clone (release/recover cycles every ~8-20s
+    # during the hold) -- comfortably spans multiple cycles so a single
+    # transient GC dip doesn't false-negative.
+    if target == "shipping" and baseline_heap_kb is not None:
+        heap_query = f'max_over_time(heap_used{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}[60s])'
+        heap_result = _prom_instant_query(heap_query, snapshot_at)
+        peak_heap_kb = max((float(e["value"][1]) for e in heap_result), default=None)
+        heap_rise_kb = (peak_heap_kb - baseline_heap_kb) if peak_heap_kb is not None else None
+    else:
+        heap_rise_kb = None
 
     # connection-pool-exhaustion: mysql_global_status_threads_connected,
     # via a mysqld_exporter sidecar deployed specifically for this class
@@ -810,6 +845,7 @@ def query_prometheus(target: str, namespace: str, snapshot_at: str | None = None
         "cpu_throttle_periods_increase": cpu_throttle_periods_increase,
         "front_end_image_pull_failing": front_end_image_pull_failing,
         "current_replicas": current_replicas,
+        "heap_rise_kb": heap_rise_kb,
     }
 
 
@@ -829,9 +865,19 @@ def stub_diagnose(tool_output: dict) -> dict:
     combined_throughput_bps = tool_output["combined_throughput_bps"]
     payment_stuck_not_ready = tool_output["payment_stuck_not_ready"]
     session_db_replicas_hit_zero = tool_output["session_db_replicas_hit_zero"]
-    peak_memory_mib = tool_output["peak_memory_mib"]
+    # peak_memory_mib deliberately NOT extracted here (2026-08-21) -- its
+    # only consumer inside this function was the old memory-leak absolute-
+    # threshold check, now replaced by heap_rise_kb below. Real remaining
+    # consumer is action_proposer.py's own magnitude sizing, which reads
+    # tool_output["peak_memory_mib"] directly, unaffected by this.
     peak_threads_connected = tool_output["peak_threads_connected"]
     cpu_throttle_periods_increase = tool_output["cpu_throttle_periods_increase"]
+    # .get(), not [...] -- unlike every other field above (always present,
+    # every tool_output build includes them), heap_rise_kb is a brand-new
+    # 2026-08-21 field; any tool_output captured/replayed from before this
+    # key existed genuinely won't have it, and that must read as "no
+    # signal" (None), never a KeyError.
+    heap_rise_kb = tool_output.get("heap_rise_kb")
 
     if oom_pods:
         return {
@@ -929,12 +975,14 @@ def stub_diagnose(tool_output: dict) -> dict:
             "reasoning": f"orders' combined network throughput {combined_throughput_bps:.1f} bytes/s "
                          f"< {NETWORK_PARTITION_MAX_THROUGHPUT_BPS} bytes/s threshold (stubbed rule, not LLM)",
         }
-    if peak_memory_mib is not None and peak_memory_mib >= MEMORY_LEAK_THRESHOLD_MIB:
+    if heap_rise_kb is not None and heap_rise_kb >= MEMORY_LEAK_RISE_THRESHOLD_KB:
         return {
             "diagnosis": "memory-leak",
             "confidence": 0.6,
-            "reasoning": f"peak working-set memory {peak_memory_mib}MiB >= {MEMORY_LEAK_THRESHOLD_MIB}MiB threshold, "
-                         f"no restart/OOM/eviction observed (stubbed rule, not LLM)",
+            "reasoning": f"shipping's JVM heap rose {heap_rise_kb:.0f}KB ({heap_rise_kb / 1024:.1f}MiB) over its "
+                         f"own real per-episode baseline >= {MEMORY_LEAK_RISE_THRESHOLD_KB}KB "
+                         f"({MEMORY_LEAK_RISE_THRESHOLD_KB / 1024:.0f}MiB) threshold, no restart/OOM/eviction "
+                         f"observed (stubbed rule, not LLM)",
         }
     if peak_threads_connected is not None and peak_threads_connected >= CONNECTION_POOL_THRESHOLD:
         return {
@@ -962,7 +1010,9 @@ def stub_diagnose(tool_output: dict) -> dict:
 
 @app.post("/diagnose")
 def diagnose(req: DiagnoseRequest):
-    tool_output = query_prometheus(req.target, req.namespace, snapshot_at=req.snapshot_at)
+    tool_output = query_prometheus(
+        req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb
+    )
     result = stub_diagnose(tool_output)
     # under-provisioned-replicas fallback: only fires the real active
     # probe when nothing cheaper already explains this target, and

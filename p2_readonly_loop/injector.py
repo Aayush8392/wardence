@@ -217,7 +217,14 @@ FAULT_CONFIG = {
         "namespace": "sock-shop",
         "target": "shipping",
         "container": "shipping",
-        "duration_s": 100,
+        # Real, corrected 2026-08-21: was 100s, a leftover from the old
+        # StressChaos mechanism -- the real production build's locked hold
+        # (measurement 4, wardence_buildlog.md) is 180s, matching the exact
+        # config (target=80MiB, governor=100MiB, concurrency=15, hold=180s)
+        # that produced the validated felt-effect run this design is built
+        # against. Caught and fixed before the ramp/TTL math would have
+        # silently used the stale value.
+        "duration_s": 180,
         "chaos_name_prefix": "wardence-memleak",
     },
     "connection-pool-exhaustion": {
@@ -647,6 +654,29 @@ PAYMENT_READINESS_PATH_FAULT = "/wardence-fault-nonexistent"
 MEMORY_LEAK_STRESS_SIZE = "150M"
 MEMORY_LEAK_MIN_INCREASE_MIB = 100
 
+# ---- production memory-leak mechanism (2026-08-21 session, LOCKED design,
+# real build in progress) -- targets `shipping` (JVM-attach LeakAgent), NOT
+# the old StressChaos/`catalogue`-container mechanism above. Both constant
+# blocks coexist deliberately while the swap is mid-flight; the old block
+# and every function that reads it get removed once the new mechanism is
+# fully wired (open item 6 from the 2026-08-21 session's punch list). ----
+MEMORY_LEAK_SETTLE_SECONDS = 35  # real floor-capture wait before the leak agent starts ramping
+# 20 MiB, locked 2026-08-21 -- see wardence_buildlog.md for the real measurement chain.
+MEMORY_LEAK_RISE_THRESHOLD_KB = 20000
+# Real locked config (measurement 4, wardence_buildlog.md 2026-08-21): the
+# exact target/governor-ceiling combination that produced the validated
+# felt-effect run this whole design is built against. Governor ceiling
+# itself is NOT set from here -- LeakAgent.java reads it from the
+# `wardence.leak.governorCeilingMib` JVM system property (defaults to 100
+# already), so it's a deploy-time JAVA_OPTS concern (install_shipping_leak_agent.py),
+# not something injector.py sends over the control-file protocol.
+MEMORY_LEAK_TARGET_MB = 80
+# Real locked concurrency (measurement 4/review 59, wardence_buildlog.md):
+# the only value real production traffic (0.667 req/s, measurement 1)
+# cannot reproduce -- the synthetic burst below is what makes the felt
+# effect real, not decoration.
+MEMORY_LEAK_LOAD_CONCURRENCY = 15
+
 # catalogue-db's max_connections is 151 (confirmed still unchanged,
 # 2026-07-25). baseline Threads_connected was ~2-3 on 2026-07-21;
 # re-checked 2026-07-25 (real drift after days of accumulated testing)
@@ -803,6 +833,17 @@ def ensure_db():
         )
         """
     )
+    # memory_leak_baseline_heap_kb: real per-episode floor reading for the
+    # production memory-leak build, captured by _capture_memory_leak_baseline()
+    # at settle time (t0+35s). Lives on `episodes`, not `episode_snapshots` --
+    # episode_snapshots doesn't get its one INSERT until p3_scorer.py finishes
+    # diagnosis, well after injector needs to have already written this value,
+    # while `episodes` is the row injector itself creates at episode start and
+    # already owns. p3_scorer.py reads it from here when building the
+    # /diagnose payload. NULL for every non-memory-leak class.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(episodes)")}
+    if "memory_leak_baseline_heap_kb" not in existing_cols:
+        conn.execute("ALTER TABLE episodes ADD COLUMN memory_leak_baseline_heap_kb REAL")
     conn.commit()
     return conn
 
@@ -1571,6 +1612,166 @@ def _ensure_oom_baseline(cfg: dict):
     )
 
 
+def _capture_memory_leak_baseline(
+    episode_id: str, fault_class: str, cfg: dict, t0: str, conn: sqlite3.Connection
+) -> float | None:
+    """Real per-episode floor reading for memory-leak's production diagnosis
+    design (locked 2026-08-21 session): min_over_time(heap_used[30s]) against
+    the target pod's own real, currently-scraped JVM heap metric (see
+    add_shipping_metrics_scrape.sh -- confirmed live and scraping before this
+    was written). Called at settle time (t0+MEMORY_LEAK_SETTLE_SECONDS),
+    BEFORE the leak agent starts ramping -- same moment injector.py already
+    does mechanism-assertion for every other class, just earlier in this
+    class's own flow than the others since there's a real ramp phase after.
+
+    Self-referential by design, not a hardcoded constant: real measurement
+    (2026-08-21 session) found a freshly-booted clone JVM's floor can sit
+    BELOW a long-running production JVM's own organic floor (45MiB vs.
+    48.6MiB observed) -- class-loading history, JIT state, and connection-pool
+    warmup mean absolute cross-comparison between any two JVM instances is
+    invalid. Capturing THIS pod's own floor, fresh, every episode, is what
+    makes the later rise-over-baseline diagnosis honest regardless of which
+    JVM instance is actually running.
+
+    Real UPSERT, not a plain UPDATE (a real bug caught before running, not
+    after): this runs mid-injection, before the fault's own chaos_name is
+    known -- for a batch run (no --episode-id), episodes has no row yet at
+    all (record_episode's INSERT only happens after injection completes), so
+    a plain UPDATE would silently affect 0 rows and the baseline would be
+    lost with no error. Mirrors record_episode's own ON CONFLICT pattern:
+    the initial INSERT covers the batch-run case (no pre-existing row) using
+    the real fault_class/target/namespace/t0 already known at this point in
+    main(), with chaos_resource_name left as a real placeholder ('pending')
+    since it genuinely isn't known yet -- record_episode's own later UPSERT
+    correctly overwrites it once injection succeeds. The ON CONFLICT branch
+    covers Operator's async-pre-created-row case and ONLY ever touches
+    memory_leak_baseline_heap_kb, never stomping fields record_episode owns.
+
+    Returns the real captured value (KB), or None (leaving the column NULL)
+    if Prometheus has no data yet -- callers must treat None as "baseline
+    unavailable," never silently substitute a guessed default.
+    """
+    target = cfg["target"]
+    namespace = cfg["namespace"]
+    query = f'min_over_time(heap_used{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}[30s])'
+    try:
+        resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+        resp.raise_for_status()
+        result = resp.json()["data"]["result"]
+    except requests.RequestException as e:
+        print(f"  memory-leak baseline capture: Prometheus query failed ({e}), "
+              f"leaving memory_leak_baseline_heap_kb NULL for {episode_id}")
+        return None
+
+    if not result:
+        print(f"  memory-leak baseline capture: no heap_used data yet for {target} "
+              f"in {namespace}, leaving memory_leak_baseline_heap_kb NULL for {episode_id}")
+        return None
+
+    baseline_kb = float(result[0]["value"][1])
+    conn.execute(
+        "INSERT INTO episodes "
+        "(episode_id, fault_class, target, namespace, t0, chaos_resource_name, memory_leak_baseline_heap_kb) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?) "
+        "ON CONFLICT(episode_id) DO UPDATE SET "
+        "memory_leak_baseline_heap_kb=excluded.memory_leak_baseline_heap_kb",
+        (episode_id, fault_class, target, namespace, t0, baseline_kb),
+    )
+    conn.commit()
+    print(f"  memory-leak baseline captured: {baseline_kb:.0f} KB ({baseline_kb / 1024:.1f} MiB) for {episode_id}")
+    return baseline_kb
+
+
+def _leak_agent_send_cmd(pod: str, namespace: str, container: str, cmd: str) -> bool:
+    """Real control-file protocol, validated end-to-end in the clone
+    (check_memory_leak_javaagent_hardened.sh's own send_cmd, identical
+    shape). Writes to a .tmp file then atomically renames over the real
+    cmd file -- LeakAgent.java's control thread only ever reads a
+    fully-written file this way, never a partial one mid-write. Returns
+    False (never raises) on a kubectl failure -- callers must treat that
+    as "command not confirmed sent," not silently proceed."""
+    result = subprocess.run(
+        [
+            "kubectl", "exec", "-n", namespace, pod, "-c", container, "--",
+            "sh", "-c",
+            f"printf '%s\\n' '{cmd}' > /agent-ctl/cmd.tmp && mv /agent-ctl/cmd.tmp /agent-ctl/cmd",
+        ],
+        capture_output=True, text=True,
+    )
+    return result.returncode == 0
+
+
+def _leak_agent_read_status(pod: str, namespace: str, container: str) -> dict[str, str] | None:
+    """Real status-file read + parse, same key=value line shape
+    LeakAgent.java's writeStatus() produces (version, state, requested_mb,
+    allocated_mb, heap_used_mib, post_gc_heap_mib, governor_ceiling_mb,
+    etc. -- see LeakAgent.java for the full field list). Returns None (not
+    an empty dict) if the file is missing/empty/unreadable -- callers must
+    distinguish "no data yet" from "agent reports zero of everything,"
+    which a plain empty dict would conflate."""
+    result = subprocess.run(
+        [
+            "kubectl", "exec", "-n", namespace, pod, "-c", container, "--",
+            "sh", "-c", "cat /agent-ctl/status 2>/dev/null",
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    fields: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            fields[key] = value
+    return fields or None
+
+
+def _ensure_memory_leak_baseline(cfg: dict) -> None:
+    """Real pre-flight check, same defensive shape as _ensure_oom_baseline/
+    _ensure_cpu_throttle_baseline (fire-and-forget reset before injecting,
+    not a bool gate the caller must check) -- but this class's own version
+    of "not at baseline" is the leak agent's own live state, not a k8s
+    resource limit. A stale allocation could survive into a new episode if
+    a prior run crashed/was killed before its own `finally` block's RELEASE
+    ever ran (a real, not hypothetical, gap -- e.g. the whole injector.py
+    process being killed mid-hold). Checked via the same control-file
+    protocol (_leak_agent_read_status/_leak_agent_send_cmd) already built
+    for the real ramp, not a separate mechanism.
+
+    Best-effort by design: if the pod or agent can't be reached here, this
+    silently returns rather than failing loudly -- the real ramp step
+    later in _inject_and_verify_memory_leak has its own, louder ABORT path
+    if the agent genuinely isn't reachable, so this pre-flight isn't the
+    only real safety net for that case."""
+    pod = _current_pod_name(cfg["target"], cfg["namespace"])
+    if pod is None:
+        return  # no pod to check yet -- the ramp step's own ABORT will catch a real problem later
+    status = _leak_agent_read_status(pod, cfg["namespace"], cfg["container"])
+    if status is None:
+        return  # agent not loaded/reachable -- same reasoning as above
+
+    state = status.get("state")
+    allocated_mb = status.get("allocated_mb")
+    if state in ("IDLE", "READY") and allocated_mb in (None, "0"):
+        return  # already clean, the common case
+
+    print(f"  {pod}'s leak agent is not clean before injecting (state={state}, "
+          f"allocated_mb={allocated_mb}) -- a prior episode likely didn't release cleanly "
+          f"(e.g. injector.py was killed mid-hold). Forcing RELEASE before proceeding...")
+    _leak_agent_send_cmd(pod, cfg["namespace"], cfg["container"], "RELEASE")
+
+    for _ in range(10):
+        time.sleep(1)
+        status = _leak_agent_read_status(pod, cfg["namespace"], cfg["container"])
+        if status is not None and status.get("state") in ("IDLE", "READY") \
+                and status.get("allocated_mb") in (None, "0"):
+            print(f"  confirmed clean: state={status.get('state')}, allocated_mb={status.get('allocated_mb')}")
+            return
+    print("  WARNING: sent RELEASE but the agent's status never confirmed IDLE/allocated_mb=0 "
+          "within 10s -- proceeding anyway; the ramp step's own ABORT path will catch a real "
+          "problem if this leaves the agent in a genuinely bad state.")
+
+
 def _clear_stale_oom_sticky_flag(cfg: dict):
     """Real, live-verified fix (2026-08-01) -- real incident: a real
     under-provisioned-replicas episode fired on catalogue only ~4
@@ -1745,9 +1946,9 @@ def _ensure_crash_loop_baseline() -> bool:
             return False
 
     if not _carts_pod_ready():
-        print(f"  crash-loop baseline check: carts pod is not confirmed "
-              f"Ready. Aborting this injection attempt rather than faulting "
-              f"a target that isn't back to steady state.")
+        print("  crash-loop baseline check: carts pod is not confirmed "
+              "Ready. Aborting this injection attempt rather than faulting "
+              "a target that isn't back to steady state.")
         return False
 
     return True
@@ -1935,6 +2136,88 @@ export default function () {{
     proc.stdin.write(script)
     proc.stdin.close()
     return pod_name, proc
+
+
+def _launch_shipping_load_burst(namespace: str, concurrency: int, duration_s: int) -> subprocess.Popen | None:
+    """Non-blocking (Popen) launch of the real synthetic load burst
+    memory-leak's production design was actually measured against
+    (check_shipping_synthetic_load_no_leak.sh, 2026-08-21 session) --
+    identical payload/mechanism, not a fresh reimplementation: closed-loop
+    POST /shipping, CONCURRENCY workers each awaiting their own response
+    before issuing the next. Real measurement confirmed organic traffic
+    alone (0.667 req/s) cannot reproduce the validated felt effect; this
+    burst is the real reason the effect is felt at all, not decoration.
+
+    Deliberately reuses the SAME technique the validated check script used
+    -- `kubectl exec` directly into a live front-end pod running an inline
+    Node.js closed-loop client, targeting shipping's own real pod IP (not
+    the Service DNS name) -- rather than a separate k6 pod like
+    _launch_sustained_catalogue_burst, because this exact mechanism (not
+    k6) is what the real production measurements (measurement 3, prior
+    session) were taken against.
+
+    Returns None (logs why, never raises) if either pod can't be resolved.
+    Caller owns reaping the returned Popen (communicate/terminate), same
+    contract as _launch_sustained_catalogue_burst -- wired into
+    _inject_and_verify_memory_leak, which reaps it in its own `finally`
+    block (see that function's hold loop)."""
+    shipping_pod = _current_pod_name("shipping", namespace)
+    if shipping_pod is None:
+        print(f"  ABORT: no Running shipping pod found in {namespace} -- cannot resolve a pod IP "
+              f"to target the synthetic load burst at.")
+        return None
+    ip_result = subprocess.run(
+        ["kubectl", "get", "pod", shipping_pod, "-n", namespace, "-o", "jsonpath={.status.podIP}"],
+        capture_output=True, text=True,
+    )
+    shipping_ip = ip_result.stdout.strip()
+    if not shipping_ip:
+        print(f"  ABORT: shipping pod {shipping_pod} has no podIP yet -- cannot start the load burst.")
+        return None
+
+    front_end_pod = _current_pod_name("front-end", namespace)
+    if front_end_pod is None:
+        print(f"  ABORT: no Running front-end pod found in {namespace} -- the load burst is "
+              f"executed FROM front-end (same technique the validated check script used), "
+              f"not from a separate pod.")
+        return None
+
+    js = (
+        "'use strict';\n"
+        "var http = require('http');\n"
+        f"var IP = '{shipping_ip}';\n"
+        f"var CONCURRENCY = {concurrency};\n"
+        f"var DURATION_MS = {duration_s * 1000};\n"
+        "var sent = 0, failed = 0;\n"
+        "function oneRequest(seq) {\n"
+        "  return new Promise(function (resolve) {\n"
+        "    var body = JSON.stringify({ id: 'wardence-loadtest-' + seq + '-' + Date.now(), "
+        "name: 'wardence-loadtest' });\n"
+        "    var req = http.request({ hostname: IP, port: 80, path: '/shipping', method: 'POST',\n"
+        "      headers: { 'Content-Type': 'application/json', "
+        "'Content-Length': Buffer.byteLength(body) } },\n"
+        "      function (res) { res.on('data', function () {}); "
+        "res.on('end', function () { sent++; resolve(); }); });\n"
+        "    req.on('error', function () { failed++; sent++; resolve(); });\n"
+        "    req.write(body); req.end();\n"
+        "  });\n"
+        "}\n"
+        "var deadline = Date.now() + DURATION_MS;\n"
+        "function loop() {\n"
+        "  if (Date.now() >= deadline) return Promise.resolve();\n"
+        "  return oneRequest(sent).then(loop);\n"
+        "}\n"
+        "var workers = [];\n"
+        "for (var w = 0; w < CONCURRENCY; w++) workers.push(loop());\n"
+        "Promise.all(workers).then(function () {\n"
+        "  console.log('[loadresult] sent=' + sent + ' failed=' + failed);\n"
+        "});\n"
+    )
+    proc = subprocess.Popen(
+        ["kubectl", "exec", "-n", namespace, front_end_pod, "--", "node", "-e", js],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return proc
 
 
 def _launch_catalogue_live_sampler(namespace: str, duration_s: int) -> str:
@@ -2703,78 +2986,167 @@ def _inject_and_verify_network_partition(
 
 
 def _inject_and_verify_memory_leak(
-    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+    cfg: dict, episode_id: str, fault_class: str, t0: str, conn: sqlite3.Connection,
+    stop_file: str | None = None, evidence_file: str | None = None,
 ) -> str | None:
-    """Verified via cAdvisor's own container_memory_working_set_bytes
-    (a reliable, real-time kube-native metric -- not the k6/Prometheus
-    percentile that turned out unreliable for network-latency). TWO
-    conditions must hold: memory rose by a real margin over baseline,
-    AND the pod never restarted -- a restart would mean the stressor
-    was sized too large and this was actually an OOM, not a leak (the
-    sibling, but structurally different, fault class). Holds for the
-    FULL duration_s every attempt, same fix applied to network-latency
-    after learning the hard way that ending a fault early starves any
-    real external observer (here: the agent's own later diagnosis
-    query) of a fair chance to see it."""
-    chaos_kind = "stresschaos"
-    namespace = cfg["namespace"]
+    """Real production mechanism (2026-08-21 session, build in progress --
+    see wardence_buildlog.md for the full measurement/design chain). This
+    REPLACES the old StressChaos/`catalogue`-container version (which used
+    to live here, verified via cAdvisor's container_memory_working_set_bytes)
+    with the real JVM-attach LeakAgent against `shipping`. Old mechanism's
+    functions (build_memory_leak_manifest, _memory_working_set_mib -- both
+    now fully orphaned, zero callers left anywhere in this file) are
+    intentionally left in place for now, not deleted -- fully removing them
+    is open item 6 from the 2026-08-21 punch list, done only once every
+    piece below is real, not before.
+
+    Real settle-then-capture ordering, distinct from every other class's
+    injector flow: baseline capture happens BEFORE the fault mechanism
+    starts (a real floor reading of the pod's OWN current heap, needed by
+    the self-referential rise-over-baseline diagnosis design), not during
+    or after a hold window like every other class's mechanism-assertion.
+    """
     target = cfg["target"]
+
+    print(f"  settling {MEMORY_LEAK_SETTLE_SECONDS}s before capturing {target}'s real heap floor...")
+    time.sleep(MEMORY_LEAK_SETTLE_SECONDS)
+    baseline_kb = _capture_memory_leak_baseline(episode_id, fault_class, cfg, t0, conn)
+    if baseline_kb is None:
+        print(f"  ABORT: could not capture a real heap-floor baseline for {target} -- "
+              f"refusing to inject without one (a diagnosis with no baseline is meaningless "
+              f"for this class's self-referential design). Check Prometheus/the JVM metrics "
+              f"scrape target before retrying.")
+        return None
+
+    pod = _current_pod_name(target, cfg["namespace"])
+    if pod is None:
+        print(f"  ABORT: no Running pod found for {target} in {cfg['namespace']} -- "
+              f"cannot start the leak agent ramp without a real pod to exec into.")
+        return None
+
     container = cfg["container"]
+    ttl_s = cfg["duration_s"] + 30  # real margin over the hold, same shape as the clone's "HOLD_S + 30"
+    cmd = f"ALLOCATE {MEMORY_LEAK_TARGET_MB} ttl={ttl_s}"
+    print(f"  sending '{cmd}' to {pod} ({container})...")
+    if not _leak_agent_send_cmd(pod, cfg["namespace"], container, cmd):
+        print(f"  ABORT: kubectl exec failed writing the command file to {pod} -- "
+              f"the leak agent may not be installed/loaded on this pod, or the pod is unreachable.")
+        return None
 
-    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
-        baseline_mib = _memory_working_set_mib(target, namespace, container)
-        baseline_restarts = _restart_count(target, namespace)
-        if baseline_mib is None:
-            print("  no container_memory_working_set_bytes data yet -- treating baseline as 0")
-            baseline_mib = 0.0
+    # Real confirmation, not fire-and-forget: the control thread only polls
+    # /agent-ctl/cmd once per second (LeakAgent.java's controlLoop), so give
+    # it a real window to pick up the command and report back via the
+    # status file before treating the ramp as started.
+    ramp_confirmed = False
+    for _ in range(10):
+        time.sleep(1)
+        status = _leak_agent_read_status(pod, cfg["namespace"], container)
+        if status is not None and status.get("state") in (
+            "ALLOCATING", "GOVERNED_HOLD", "ALLOCATED",
+        ):
+            ramp_confirmed = True
+            print(f"  ramp confirmed: state={status.get('state')}, "
+                  f"requested_mb={status.get('requested_mb')}, allocated_mb={status.get('allocated_mb')}")
+            break
+    if not ramp_confirmed:
+        print(f"  ABORT: sent '{cmd}' but the agent's own status file never reported an "
+              f"ALLOCATING/GOVERNED_HOLD/ALLOCATED state within 10s -- treating this as an "
+              f"unconfirmed ramp, not a successful one. Check `kubectl exec ... cat /agent-ctl/status` "
+              f"and the pod's logs directly before retrying.")
+        return None
 
-        chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
-        manifest = build_memory_leak_manifest(chaos_name, cfg)
-        apply_manifest(manifest)
-        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: baseline={baseline_mib}MiB, "
-              f"holding the fault active for the full {cfg['duration_s']}s window...")
+    print(f"  launching the synthetic load burst (concurrency={MEMORY_LEAK_LOAD_CONCURRENCY}, "
+          f"duration={cfg['duration_s']}s) against shipping...")
+    load_proc = _launch_shipping_load_burst(
+        cfg["namespace"], MEMORY_LEAK_LOAD_CONCURRENCY, cfg["duration_s"]
+    )
+    if load_proc is None:
+        print("  ABORT: could not start the synthetic load burst -- proceeding to inject without "
+              "it would silently reproduce the exact 'organic traffic alone' no-fault condition "
+              "measurement 1 already confirmed cannot show the real felt effect, making any "
+              "resulting diagnosis untrustworthy. Releasing the already-ramping agent before "
+              "aborting.")
+        _leak_agent_send_cmd(pod, cfg["namespace"], container, "RELEASE")
+        return None
+    print(f"  synthetic load burst started (pid={load_proc.pid}), running for the full "
+          f"{cfg['duration_s']}s hold in the background.")
 
-        restarted = False
-        interrupted = False
-        peak_mib = baseline_mib
-        evidence_written = False
-        elapsed = 0
+    # Real evidence point: the ramp is already confirmed (agent genuinely
+    # transitioned to ALLOCATING/GOVERNED_HOLD/ALLOCATED above) AND the
+    # synthetic load that makes the effect real is now running -- both
+    # conditions this design actually depends on are true, same "write the
+    # moment real verification first confirms" convention every other
+    # holding class already follows, just with a mechanism-specific
+    # definition of "confirmed" (this class's own agent status, not a
+    # Prometheus-derived percentile/threshold the way most others use).
+    _write_evidence_file_once(evidence_file)
+
+    baseline_restarts = _restart_count(target, cfg["namespace"])
+    restarted = False
+    interrupted = False
+    elapsed = 0.0
+    tick = 5.0
+    try:
+        while elapsed < cfg["duration_s"]:
+            if stop_file is not None and os.path.exists(stop_file):
+                interrupted = True
+                break
+            this_tick = min(tick, cfg["duration_s"] - elapsed)
+            time.sleep(this_tick)
+            elapsed += this_tick
+            if _restart_count(target, cfg["namespace"]) > baseline_restarts:
+                restarted = True
+                break  # ground truth compromised -- the JVM (and its heap) is gone, no point holding further
+    finally:
+        # Real, deliberate ordering: reap the load burst BEFORE releasing
+        # the agent, not the reverse -- releasing first would let the
+        # agent's own GC reclaim memory while the burst is still hammering
+        # shipping, adding load against a target already mid-recovery for
+        # no reason. Neither reap is allowed to raise past this point --
+        # this path must always reach RELEASE, restart or not, interrupted
+        # or not, since a real leak is sitting on production either way.
+        print("  reaping the synthetic load burst...")
         try:
-            while elapsed < cfg["duration_s"]:
-                if stop_file is not None and os.path.exists(stop_file):
-                    interrupted = True
-                    break
-                time.sleep(10)
-                elapsed += 10
-                current_mib = _memory_working_set_mib(target, namespace, container)
-                if current_mib is not None:
-                    peak_mib = max(peak_mib, current_mib)
-                if not evidence_written and peak_mib >= baseline_mib + MEMORY_LEAK_MIN_INCREASE_MIB:
-                    _write_evidence_file_once(evidence_file)
-                    evidence_written = True
-                if _restart_count(target, namespace) > baseline_restarts:
-                    restarted = True
-                    break  # stop early -- this is an OOM now, not a leak, no point holding further
-        finally:
-            delete_chaos_resource(chaos_kind, chaos_name)
+            load_proc.terminate()
+            load_proc.communicate(timeout=15)
+        except Exception as e:
+            print(f"  load burst reap: terminate/communicate failed ({e}), forcing kill...")
+            try:
+                load_proc.kill()
+            except Exception:
+                pass
+        print(f"  releasing the leak agent on {pod}...")
+        _leak_agent_send_cmd(pod, cfg["namespace"], container, "RELEASE")
 
-        if interrupted:
-            if evidence_written:
-                return chaos_name
-            print("  early-stop requested -- not retrying")
-            return None
+    # _ensure_memory_leak_baseline (built and wired into main(), called
+    # BEFORE this function on every memory-leak invocation) is the real
+    # defensive pre-flight for the NEXT episode -- the RELEASE just above
+    # is this episode's own end-of-run cleanup, a separate, narrower job.
 
-        if restarted:
-            print(f"  attempt {attempt}: pod restarted during injection (stressor too large -- "
-                  f"this was an OOM, not a leak){', retrying' if attempt < MAX_INJECT_ATTEMPTS else ''}")
-            continue
+    if restarted:
+        print(f"  ABORT: {target} restarted mid-episode -- ground truth compromised (a restart "
+              f"means the JVM, and everything the leak agent had retained, is gone; this can no "
+              f"longer honestly be scored as a memory-leak episode). Not retrying automatically -- "
+              f"see the note below on why this class doesn't use MAX_INJECT_ATTEMPTS.")
+        return None
 
-        if peak_mib >= baseline_mib + MEMORY_LEAK_MIN_INCREASE_MIB:
-            return chaos_name
-        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
-        print(f"  attempt {attempt}: no sustained memory increase observed "
-              f"(baseline={baseline_mib}MiB, peak={peak_mib}MiB){suffix}")
-    return None
+    if interrupted:
+        print("  early-stop requested -- not retrying")
+        return "leak-agent"
+
+    # Real, deliberate deviation from every other class's retry-on-failure
+    # loop (MAX_INJECT_ATTEMPTS): NOT applied here. Every other class's
+    # retry is cheap (seconds to tens of seconds per attempt) and covers
+    # real, expected flakiness (a transient Chaos Mesh daemon hiccup, a
+    # probe that missed its window). This class's own attempt costs a real
+    # ~215s+ against PRODUCTION shipping (35s settle + 180s hold), and the
+    # mechanism itself is deterministic (ramp confirmation above already
+    # verified the agent genuinely took hold) -- a failure past that point
+    # is a real signal something is structurally wrong (restart, aborted
+    # burst), not the kind of transient flakiness a blind retry fixes.
+    # Silently 2-3x-ing real production load/risk on every failure would
+    # be the wrong tradeoff for what this class actually needs.
+    return "leak-agent"
 
 
 def _ensure_flood_user(cfg: dict) -> None:
@@ -3387,7 +3759,7 @@ def _inject_and_verify_cpu_throttling_live_trigger(cfg: dict, stop_file: str) ->
     duration_s = cfg["duration_s"]
 
     _ensure_cpu_throttle_probe_baseline(cfg)
-    print(f"  live-trigger: loosening user's probes (real rolling update, gives a fresh pod for free)...")
+    print("  live-trigger: loosening user's probes (real rolling update, gives a fresh pod for free)...")
     fresh_pod = _loosen_user_probes_for_fault(cfg)
     if fresh_pod is None:
         print("  FAILED: probe-loosen rollout never produced a confirmed fresh, Ready pod. Aborting "
@@ -3649,6 +4021,16 @@ def main():
 
         print(f"Episode {episode_id}: attempting {fault_class} on {cfg['target']} ({cfg['namespace']}) at {t0}")
 
+        # Real, deliberate exception to the "conn opened once, after
+        # injection, for record_episode" pattern every other class follows:
+        # memory-leak's settle-time baseline capture needs a real DB
+        # connection DURING injection, before chaos_name is known. Opened
+        # here (instead of a second ensure_db() call inside the function
+        # itself) so it's the SAME connection record_episode reuses below --
+        # avoids two separate SQLite connections racing on the same file
+        # mid-episode.
+        conn = ensure_db() if fault_class == "memory-leak" else None
+
         if fault_class == "disk-full":
             _ensure_queue_master_pod_cleanup(cfg)
             verified = _inject_and_verify_disk_full(cfg)
@@ -3664,8 +4046,10 @@ def main():
                 cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
             )
         elif fault_class == "memory-leak":
+            _ensure_memory_leak_baseline(cfg)
             chaos_name = _inject_and_verify_memory_leak(
-                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+                cfg, episode_id, fault_class, t0, conn,
+                stop_file=args.stop_file, evidence_file=args.evidence_file,
             )
         elif fault_class == "connection-pool-exhaustion":
             chaos_name = _inject_and_verify_connection_pool_exhaustion(
@@ -3734,7 +4118,11 @@ def main():
             # was ever exposed to.
             sys.exit(1)
 
-        conn = ensure_db()
+        # Reuse memory-leak's already-open connection (opened above for
+        # settle-time baseline capture) instead of opening a second one --
+        # every other class still opens fresh here, unaffected.
+        if conn is None:
+            conn = ensure_db()
         record_episode(conn, episode_id, fault_class, cfg, chaos_name, t0)
         conn.close()
         print(f"Episode {episode_id}: injection verified ({chaos_name}) and ground truth recorded.")

@@ -155,7 +155,7 @@ function InvisibleClassEvidence({ faultClass, token }) {
       )}
       {status && !status.warning && faultClass === "memory-leak" && (
         <span className="font-data-mono text-sm">
-          {status.memory_working_set_mib != null ? `${status.memory_working_set_mib} MiB` : "n/a"}
+          {status.heap_used_mib != null ? `${status.heap_used_mib} MiB` : "n/a"}
         </span>
       )}
       {status && !status.warning && faultClass === "bad-rollout" && (

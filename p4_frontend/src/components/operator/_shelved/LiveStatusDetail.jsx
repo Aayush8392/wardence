@@ -73,7 +73,7 @@ export default function LiveStatusDetail({ token }) {
                 )}
                 {s && !s.warning && fc === "memory-leak" && (
                   <span className="font-data-mono text-sm">
-                    {s.memory_working_set_mib != null ? `${s.memory_working_set_mib} MiB` : "n/a"}
+                    {s.heap_used_mib != null ? `${s.heap_used_mib} MiB` : "n/a"}
                   </span>
                 )}
               </div>

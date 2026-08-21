@@ -408,6 +408,14 @@ class HandleRequest(BaseModel):
     # /trigger/reasoning-stream to tail. False for every batch-run
     # episode (default) -- zero behavior change, zero file written.
     stream: bool = False
+    # Real per-episode floor reading (KB), memory-leak only -- threaded
+    # through from p3_scorer.py, which reads it from episodes.
+    # memory_leak_baseline_heap_kb (injector.py's own real write, captured
+    # at settle time before the leak agent starts ramping). None for every
+    # other class/every caller not yet updated to pass it, same
+    # zero-regression precedent snapshot_at itself set. See agent.py's
+    # query_prometheus for the real formula this feeds.
+    baseline_heap_kb: float | None = None
 
 
 class ActRequest(BaseModel):
@@ -442,7 +450,9 @@ class ActRequest(BaseModel):
     actual_class: str | None = None
 
 
-def _build_llm_tools(target: str, namespace: str, snapshot_at: str | None = None) -> dict:
+def _build_llm_tools(
+    target: str, namespace: str, snapshot_at: str | None = None, baseline_heap_kb: float | None = None
+) -> dict:
     """Same real tool set + binding convention as test_react_agent.py's
     build_tools -- kept in sync by hand (same 'duplicated by hand'
     convention this project already uses for FAULT_CLASSES/FIELD_GUIDANCE/
@@ -452,8 +462,14 @@ def _build_llm_tools(target: str, namespace: str, snapshot_at: str | None = None
     query_prometheus call below -- otherwise the real LLM's own ReAct
     tool call would see LIVE "now" evidence while the stub sees frozen
     evidence, undermining Dimension B's whole comparison premise (both
-    are supposed to be judged against the SAME evidence)."""
-    tools = {"query_prometheus": lambda: query_prometheus(target, namespace, snapshot_at=snapshot_at)}
+    are supposed to be judged against the SAME evidence). baseline_heap_kb
+    (2026-08-21) follows the identical reasoning -- the LLM's own
+    heap_rise_kb reading must be computed against the SAME real baseline
+    the stub's comparison uses, not silently see None and lose the signal
+    entirely."""
+    tools = {"query_prometheus": lambda: query_prometheus(
+        target, namespace, snapshot_at=snapshot_at, baseline_heap_kb=baseline_heap_kb
+    )}
     if target in DL_DETECTOR_SERVICES:
         tools["call_dl_detector"] = lambda: call_dl_detector(target)
     if target == "catalogue":
@@ -519,7 +535,9 @@ def diagnose(req: HandleRequest):
     the caller uses this to decide whether /act is even worth calling,
     same as the old /handle's early-return-on-report-only behavior.
     """
-    tool_output = query_prometheus(req.target, req.namespace, snapshot_at=req.snapshot_at)
+    tool_output = query_prometheus(
+        req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb
+    )
     stub_result = stub_diagnose(tool_output)
     # under-provisioned-replicas fallback -- mirrors agent.py's own
     # /diagnose endpoint exactly, same reason (see
@@ -574,7 +592,9 @@ def diagnose(req: HandleRequest):
         llm_result = {"status": "llm_unavailable", "llm_diagnosis": None,
                        "failed_attempts": [], "detail": "WARDENCE_STUB_ONLY set -- LLM call skipped"}
     else:
-        llm_tools = _build_llm_tools(req.target, req.namespace, snapshot_at=req.snapshot_at)
+        llm_tools = _build_llm_tools(
+            req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb
+        )
         on_event, reasoning_stream_path = (
             _make_reasoning_event_writer(req.episode_id) if (req.stream and req.episode_id) else (None, None)
         )
