@@ -694,12 +694,25 @@ def query_prometheus(
     # persisted to episodes.memory_leak_baseline_heap_kb) -- threaded
     # through from the caller (None for every non-memory-leak class/every
     # caller not yet updated to pass it, same zero-regression precedent
-    # snapshot_at itself set). 60s window sized off the real governor
-    # cadence measured in the clone (release/recover cycles every ~8-20s
-    # during the hold) -- comfortably spans multiple cycles so a single
-    # transient GC dip doesn't false-negative.
+    # snapshot_at itself set). Real bug found and fixed 2026-08-21: the
+    # original 60s window was sized ONLY for the live-trigger case (where
+    # snapshot_at freezes evaluation to a moment DURING the active hold),
+    # comfortably spanning the real governor release/recover cadence
+    # (~8-20s cycles) so a single transient GC dip doesn't false-negative.
+    # It was never sized for CLI/batch-mode diagnosis (no snapshot_at,
+    # "now" is used), where the real fault has ALREADY fully self-reverted
+    # (settle+180s hold+release all complete) before scoring ever runs --
+    # confirmed via a real historical Prometheus range query on a genuine
+    # miss (heap_rise_kb=16725 reported, real true peak was +36MB three
+    # minutes earlier, 60s window only reached back to a post-peak
+    # governor dip). Widened to 300s: comfortably covers the full real
+    # 180s hold regardless of where the peak lands within it, plus the
+    # standard 35s settle-wait margin this project uses elsewhere, plus
+    # real headroom for scrape/query lag -- generous margin over the
+    # minimum, matching the same "widen conservatively" precedent already
+    # used for oom's window (3m->6m) for the identical failure shape.
     if target == "shipping" and baseline_heap_kb is not None:
-        heap_query = f'max_over_time(heap_used{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}[60s])'
+        heap_query = f'max_over_time(heap_used{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}[300s])'
         heap_result = _prom_instant_query(heap_query, snapshot_at)
         peak_heap_kb = max((float(e["value"][1]) for e in heap_result), default=None)
         heap_rise_kb = (peak_heap_kb - baseline_heap_kb) if peak_heap_kb is not None else None

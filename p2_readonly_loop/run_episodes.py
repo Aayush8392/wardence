@@ -113,7 +113,16 @@ TARGET_RECENCY_WINDOW_S = {
     "network-partition": 150,           # agent.py combined_throughput_bps: [2m] subquery
     "init-failure": 150,                # agent.py payment_stuck_not_ready: max_over_time(...[2m])
     "session-cart-failure": 150,        # agent.py session_db_replicas_hit_zero: min_over_time(...[2m])
-    "memory-leak": 210,                 # agent.py peak_memory_mib: max_over_time(...[3m])
+    # Real, corrected 2026-08-21: was 210 (stale, matched the OLD, removed
+    # peak_memory_mib/[3m] signal). The real heap_rise_kb query window was
+    # widened to [300s] the same session (to fix a real false-negative --
+    # see agent.py's own comment on that query) but this recency value was
+    # never updated to match, leaving a real contamination gap: two
+    # memory-leak episodes closer together than ~300s could let one
+    # episode's diagnosis pick up the PRIOR episode's residual elevated
+    # heap instead of its own. Fixed to match the same "window + 30s
+    # buffer" convention every other entry in this dict already follows.
+    "memory-leak": 330,                 # agent.py heap_rise_kb: max_over_time(...[300s])
     "connection-pool-exhaustion": 210,  # agent.py peak_threads_connected: max_over_time(...[3m])
     # Auto-fix classes: RECALIBRATED 2026-08-06, real 3-round Kimi review
     # (reviews/24_recency_window_kimi_review.md-equivalent thread) plus

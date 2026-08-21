@@ -65,7 +65,7 @@ Field meanings, WITH the real thresholds used to interpret each one (a null/fals
 - combined_throughput_bps (orders only): < 200 bytes/s -> network-partition (check this before network-latency).
 - payment_stuck_not_ready: true -> init-failure.
 - session_db_replicas_hit_zero: true -> session-cart-failure.
-- peak_memory_mib (shipping only): >= 380 MiB -> memory-leak.
+- heap_rise_kb (shipping only): >= 20000 KB (20 MiB) above the episode's own captured pre-injection heap floor -> memory-leak.
 - peak_threads_connected (catalogue-db only): >= 100 -> connection-pool-exhaustion.
 - cpu_throttle_periods_increase (user only): >= 100 -> cpu-throttling.
 - front_end_image_pull_failing: true -> bad-rollout.

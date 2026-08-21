@@ -512,15 +512,15 @@
   },
   "memory-leak": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 113,
-      "total_tokens": 307049,
+      "count": 116,
+      "total_tokens": 317062,
       "min_tokens": 0,
       "max_tokens": 3451,
-      "total_neurons": 4535.209030151367,
+      "total_neurons": 4679.018117904663,
       "min_neurons": 0.0,
       "max_neurons": 51.77272605895996,
-      "avg_tokens": 2717.2477876106195,
-      "avg_neurons": 40.13459318718024
+      "avg_tokens": 2733.293103448276,
+      "avg_neurons": 40.336363085385024
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 123,

@@ -104,7 +104,7 @@ FIELD_GUIDANCE = """Field meanings and thresholds (a null/false/empty field mean
 - combined_throughput_bps (orders only): < 200 bytes/s -> network-partition, but ONLY if p95_latency_ms above is null or did not already give you an answer. This is a weaker, fallback signal, not a primary one, for this specific pair of classes.
 - payment_stuck_not_ready: true -> init-failure.
 - session_db_replicas_hit_zero: true -> session-cart-failure.
-- peak_memory_mib (shipping only): >= 380 MiB -> memory-leak.
+- heap_rise_kb (shipping only): >= 20000 KB (20 MiB) above the episode's own captured pre-injection heap floor -> memory-leak.
 - peak_threads_connected (catalogue-db only): >= 100 -> connection-pool-exhaustion.
 - cpu_throttle_periods_increase (user only): >= 100 -> cpu-throttling.
 - front_end_image_pull_failing: true -> bad-rollout.
@@ -151,7 +151,7 @@ _NUMERIC_THRESHOLD_FIELDS = {
     # field: (threshold, diagnosis)
     "cpu_throttle_periods_increase": (100, "cpu-throttling"),
     "catalogue_probe_p95_ms": (190, "under-provisioned-replicas"),
-    "peak_memory_mib": (380, "memory-leak"),
+    "heap_rise_kb": (20000, "memory-leak"),
     "peak_threads_connected": (100, "connection-pool-exhaustion"),
 }
 
