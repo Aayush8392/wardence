@@ -1,0 +1,51 @@
+# systemd unit for operator_api.py on the Oracle host -- real process
+# supervision, since a bare `uvicorn` process (the decided placement,
+# 2026-08-23: NOT an in-cluster pod, no k8s-native self-healing) has
+# nothing else restarting it on crash.
+#
+# NOT yet installed anywhere -- this is a template. Real values needed
+# before use (all currently placeholders):
+#   - <WARDENCE_USER>: the real Linux user this should run as (never root)
+#   - <REPO_PATH>: real absolute path to the cloned repo on the Oracle host
+#   - <VENV_PATH>: real absolute path to the Python venv with dependencies
+#     installed (kubernetes client, fastapi, uvicorn, etc. -- see
+#     p3_trust_action/requirements.txt)
+#   - CORS_ORIGINS / PROMETHEUS_URL: real values, only knowable once
+#     Vercel (frontend) and the Prometheus NodePort
+#     (patch_prometheus_nodeport.sh) both actually exist
+#
+# Secrets are NOT set here -- both real .env files (repo-root .env for
+# LLM provider keys, p3_trust_action/.env for R2 credentials) are loaded
+# by the Python code itself (model_backend.py / publish_to_r2.py), so they
+# just need to exist as real files on this host with real values, same as
+# on the current WSL2 dev machine. Never put secret values directly in
+# this unit file -- it's committed to the repo.
+#
+# Install:
+#   sudo cp deploy/operator-api.service /etc/systemd/system/wardence-operator-api.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wardence-operator-api
+
+[Unit]
+Description=Wardence Operator API
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<WARDENCE_USER>
+WorkingDirectory=<REPO_PATH>/p3_trust_action
+Environment=CORS_ORIGINS=<REAL_VERCEL_DOMAIN>
+Environment=PROMETHEUS_URL=http://localhost:30090
+ExecStart=<VENV_PATH>/bin/uvicorn operator_api:app --host 0.0.0.0 --port 8002
+Restart=on-failure
+RestartSec=5
+# Real gotcha already hit once in this project (2026-08-22 session, WSL2/
+# Python 3.14): `--app-dir` reproducibly crashed uvicorn on this stack --
+# WorkingDirectory + a bare `operator_api:app` (no --app-dir) is the known
+# working invocation. Confirm this still holds on the Oracle host's own
+# Python version before trusting it blindly -- it was never re-tested
+# outside the original WSL2 environment.
+
+[Install]
+WantedBy=multi-user.target

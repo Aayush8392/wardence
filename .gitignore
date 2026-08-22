@@ -23,6 +23,10 @@ __pycache__/
 # Stale local DB folder from before the DB moved to WSL2's native filesystem
 p2_readonly_loop/output/
 
+# Raw live-cluster-state dump for the deployment-readiness effort -- scratch
+# reference material for building real patch scripts, not app code.
+p2_readonly_loop/cluster_dump/
+
 # Live local database copies -- binary, constantly changing, never meant
 # to be tracked. Real source of truth is WSL2's native filesystem copy
 # (~/wardence_p2_data/wardence.db), these are stale/incidental local copies.

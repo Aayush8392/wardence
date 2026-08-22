@@ -154,11 +154,14 @@ def _republish_to_r2() -> bool:
 app = FastAPI()
 
 # The p4_frontend dev server needs cross-origin access to this API -- same
-# CORS requirement as R2 (see wardence_frontend.md). Tighten allow_origins
-# to the real Vercel domain once deployed; localhost:5173 covers local dev.
+# CORS requirement as R2 (see wardence_frontend.md). CORS_ORIGINS is a
+# comma-separated env override (e.g. "https://wardence.vercel.app" once
+# deployed, or "http://localhost:5173,https://wardence.vercel.app" to
+# allow both at once) -- defaults to local-dev-only so nothing changes
+# when the var is unset, same as always.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:5173").split(","),
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
@@ -379,7 +382,16 @@ INJECTOR_CWD = Path(__file__).parent.parent / "p2_readonly_loop"
 SCORER_PATH = Path(__file__).parent / "p3_scorer.py"
 SCORER_CWD = Path(__file__).parent
 
-PROMETHEUS_URL = "http://localhost:9090"
+# Defaults to localhost:9090, which only resolves with a real
+# `kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus
+# 9090:9090` running locally (today's local-dev setup, unchanged). On a
+# real deployment (see deploy/README.md), set PROMETHEUS_URL to the
+# reachable value for wherever this process actually runs -- an in-cluster
+# service DNS name if operator_api.py runs as a pod, or a NodePort/
+# LoadBalancer address if it runs outside the cluster the way it does
+# today. That placement decision isn't made yet -- this default just
+# keeps local dev working exactly as before until it is.
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
 STATUS_NAMESPACE = "sock-shop"
 
 # Matches p2_readonly_loop/run_episodes.py's own SETTLE_SECONDS -- same
