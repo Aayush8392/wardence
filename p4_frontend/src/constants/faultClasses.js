@@ -44,8 +44,16 @@ export const ALL_CLASSES = [...AUTO_FIX_CLASSES, ...REPORT_ONLY_CLASSES];
 // '{"spec":{"strategy":{"rollingUpdate":{"maxUnavailable":"100%","maxSurge":"0%"}}}}'`,
 // same one-off live-cluster-only pattern as front-end's own fix (never
 // a repo-tracked manifest, Sock Shop's deployments aren't version-
-// controlled here).
-export const INVISIBLE_CLASSES = ["disk-full", "memory-leak"];
+// controlled here). memory-leak REMOVED 2026-08-23 -- the real
+// request-synced GC trigger (LeakAgent.java) made it storefront-felt as
+// a genuine checkout hang, closing the whole demo-visibility arc.
+// `disk-full` is the only class left, and it's PROVEN (not just
+// untested) permanently invisible by architecture: `queue-master` has
+// zero synchronous coupling to any user-facing request path, confirmed
+// at Sock Shop's own real upstream source across orders/shipping/
+// queue-master. Covered by the live-status readout instead, never
+// expected to move into this list becoming empty.
+export const INVISIBLE_CLASSES = ["disk-full"];
 
 // target/namespace verbatim from injector.py's real FAULT_CONFIG.
 export const FAULT_TARGETS = {

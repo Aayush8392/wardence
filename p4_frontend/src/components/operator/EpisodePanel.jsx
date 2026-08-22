@@ -148,21 +148,6 @@ function InvisibleClassEvidence({ faultClass, token }) {
           {status.indication.replaceAll("_", " ").toUpperCase()}
         </span>
       )}
-      {status && !status.warning && faultClass === "init-failure" && (
-        <span className={`font-label-caps text-[10px] px-2 py-1 border ${status.ready_false_present ? "border-primary text-primary" : "border-outline-variant text-on-surface-variant"}`}>
-          {status.ready_false_present ? "FAILED_PROBE" : "READY"}
-        </span>
-      )}
-      {status && !status.warning && faultClass === "memory-leak" && (
-        <span className="font-data-mono text-sm">
-          {status.heap_used_mib != null ? `${status.heap_used_mib} MiB` : "n/a"}
-        </span>
-      )}
-      {status && !status.warning && faultClass === "bad-rollout" && (
-        <span className={`font-label-caps text-[10px] px-2 py-1 border ${status.image_pull_failing ? "border-primary text-primary" : "border-outline-variant text-on-surface-variant"}`}>
-          {status.image_pull_failing ? "IMAGE_PULL_FAILING" : "OK"}
-        </span>
-      )}
     </div>
   );
 }

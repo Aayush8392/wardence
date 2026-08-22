@@ -635,31 +635,16 @@ PAYMENT_READINESS_PATH_FAULT = "/wardence-fault-nonexistent"
 # (Ready is false until the first successful probe) -- caught before
 # writing dependent code, not after a failed run.
 
-# shipping's container memory LIMIT is 500Mi (its JAVA_OPTS -Xmx128m is
-# an internal JVM heap cap, irrelevant here -- StressChaos's stress-ng
-# process runs OUTSIDE the JVM but inside the same cgroup, so it
-# consumes memory against the 500Mi container limit regardless of the
-# app's own heap setting, same mechanism already proven for oom's
-# catalogue target).
-#
-# Found the hard way BEFORE running anything (checked first, per this
-# session's own established discipline): shipping's baseline working
-# set is already ~298MiB (confirmed via a direct Prometheus query),
-# not near-zero as first assumed -- leaving only ~202MiB of real
-# headroom under the 500Mi limit. The originally planned 300M stressor
-# would have pushed total usage to ~598MiB, well past the limit,
-# causing a real OOM kill instead of the sustained "elevated but never
-# restarts" signature this class is supposed to have. Sized down to
-# fit comfortably within the real headroom instead.
-MEMORY_LEAK_STRESS_SIZE = "150M"
-MEMORY_LEAK_MIN_INCREASE_MIB = 100
-
 # ---- production memory-leak mechanism (2026-08-21 session, LOCKED design,
-# real build in progress) -- targets `shipping` (JVM-attach LeakAgent), NOT
-# the old StressChaos/`catalogue`-container mechanism above. Both constant
-# blocks coexist deliberately while the swap is mid-flight; the old block
-# and every function that reads it get removed once the new mechanism is
-# fully wired (open item 6 from the 2026-08-21 session's punch list). ----
+# live-verified end-to-end, 2026-08-23 -- demo-visibility arc closed).
+# Targets `shipping` (JVM-attach LeakAgent). The old StressChaos/
+# `catalogue`-container mechanism (real, sustained memory pressure that
+# turned out to have ZERO real effect on shipping's own JVM heap, see
+# the 2026-08-20 session's real finding) has been fully removed -- its
+# constants (MEMORY_LEAK_STRESS_SIZE/MEMORY_LEAK_MIN_INCREASE_MIB) and
+# functions (build_memory_leak_manifest/_memory_working_set_mib) are
+# gone, not just orphaned (closes open item 6 from the 2026-08-21
+# punch list). ----
 MEMORY_LEAK_SETTLE_SECONDS = 35  # real floor-capture wait before the leak agent starts ramping
 # 20 MiB, locked 2026-08-21 -- see wardence_buildlog.md for the real measurement chain.
 MEMORY_LEAK_RISE_THRESHOLD_KB = 20000
@@ -957,32 +942,6 @@ spec:
       workers: 1
       size: "{size}"
       oomScoreAdj: -1000
-"""
-
-
-def build_memory_leak_manifest(chaos_name: str, cfg: dict, size: str = MEMORY_LEAK_STRESS_SIZE) -> str:
-    """No oomScoreAdj, unlike build_oom_manifest -- staying comfortably
-    under the container's memory limit by design, so there's no OOM
-    kill to steer away from the stressor here."""
-    return f"""
-apiVersion: chaos-mesh.org/v1alpha1
-kind: StressChaos
-metadata:
-  name: {chaos_name}
-  namespace: chaos-mesh
-spec:
-  mode: one
-  containerNames:
-    - {cfg['container']}
-  selector:
-    namespaces:
-      - {cfg['namespace']}
-    labelSelectors:
-      name: {cfg['target']}
-  stressors:
-    memory:
-      workers: 1
-      size: "{size}"
 """
 
 
@@ -1336,27 +1295,6 @@ def _restart_count(target: str, namespace: str) -> int:
     resp.raise_for_status()
     result = resp.json()["data"]["result"]
     return sum(int(float(entry["value"][1])) for entry in result)
-
-
-def _memory_working_set_mib(target: str, namespace: str, container: str) -> float | None:
-    """cAdvisor's own container_memory_working_set_bytes -- a real,
-    reliable kube-native cgroup metric (same trust tier as
-    kube_pod_container_status_restarts_total), NOT the k6/Prometheus
-    metric that turned out too unreliable for network-latency's ground
-    truth (this one reflects true current kernel-reported memory, not
-    an internal percentile estimator). Filtered on container= to avoid
-    picking up the pause container's negligible footprint. Returns None
-    if no data point exists yet, treated as "can't verify" by callers."""
-    query = (
-        f'container_memory_working_set_bytes{{namespace="{namespace}", '
-        f'pod=~"{target}-[^-]+-[^-]+$", container="{container}"}}'
-    )
-    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
-    resp.raise_for_status()
-    result = resp.json()["data"]["result"]
-    if not result:
-        return None
-    return max(float(entry["value"][1]) for entry in result) / (1024 * 1024)
 
 
 def _cfs_throttled_periods(target: str, namespace: str, container: str) -> int:
@@ -3058,16 +2996,13 @@ def _inject_and_verify_memory_leak(
     cfg: dict, episode_id: str, fault_class: str, t0: str, conn: sqlite3.Connection,
     stop_file: str | None = None, evidence_file: str | None = None,
 ) -> str | None:
-    """Real production mechanism (2026-08-21 session, build in progress --
-    see wardence_buildlog.md for the full measurement/design chain). This
-    REPLACES the old StressChaos/`catalogue`-container version (which used
-    to live here, verified via cAdvisor's container_memory_working_set_bytes)
-    with the real JVM-attach LeakAgent against `shipping`. Old mechanism's
-    functions (build_memory_leak_manifest, _memory_working_set_mib -- both
-    now fully orphaned, zero callers left anywhere in this file) are
-    intentionally left in place for now, not deleted -- fully removing them
-    is open item 6 from the 2026-08-21 punch list, done only once every
-    piece below is real, not before.
+    """Real production mechanism (2026-08-21 session, LOCKED design,
+    live-verified end-to-end 2026-08-23 -- see wardence_buildlog.md for
+    the full measurement/design chain). Real JVM-attach LeakAgent
+    against `shipping`. The old StressChaos/`catalogue`-container
+    version (real, sustained pressure, but confirmed via live testing
+    to have ZERO real effect on shipping's own JVM heap) has been
+    fully removed, not just orphaned.
 
     Real settle-then-capture ordering, distinct from every other class's
     injector flow: baseline capture happens BEFORE the fault mechanism

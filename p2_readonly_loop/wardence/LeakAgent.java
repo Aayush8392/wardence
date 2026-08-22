@@ -218,19 +218,41 @@ public class LeakAgent {
     // prior trigger and getting no burst at all, though this couldn't be
     // directly confirmed without per-event timestamps (fixed the same
     // session -- see maybeFireSyncBurst's own real-time stderr log line).
-    // Lowered to 4000ms as the next real test step, deliberately NOT
-    // further -- both reviews' agreed floor was 5000ms specifically to
-    // avoid a real G1 death-spiral risk on this heap; going below that
-    // reviewed floor in one step, rather than testing just under it first,
-    // wasn't judged worth the extra risk for an unmeasured payoff.
+    // Lowered to 4000ms as a prior real test step, deliberately NOT
+    // further at the time -- both reviews' agreed floor was 5000ms
+    // specifically to avoid a real G1 death-spiral risk on this heap;
+    // going below that reviewed floor in one step, rather than testing
+    // just under it first, wasn't judged worth the extra risk for an
+    // unmeasured payoff at the time.
     // Real, honest note from the same session's signal pivot (see
     // SYNC_REQUEST_PROCESSOR_MBEAN's own comment): this value was tuned
     // against v1's edge-detection mechanism, which barely fired at all (1
-    // real trigger/episode) -- v2's counter-based detection will very
-    // likely notice real traffic far more often, meaning THIS debounce
-    // value is now the real, live-binding constraint for the first time.
-    // Not re-derived yet -- real next step once v2 is live-tested.
-    private static final long SYNC_DEBOUNCE_MS = 4000;
+    // real trigger/episode) -- v2's counter-based detection notices real
+    // traffic far more often (confirmed live, ~18 real triggers/episode),
+    // meaning THIS debounce value is the real, live-binding constraint.
+    // Lowered again to 3000ms, still below both reviews' reviewed 5000ms
+    // floor -- a further deliberate step under v2 detection to test
+    // whether more frequent triggers catch more real checkout clicks,
+    // at the same acknowledged G1 death-spiral risk.
+    // **LOCKED, real live-tested result (2026-08-23 session), the
+    // demo-visibility arc's actual close: at 3000ms/40MiB, EVERY real
+    // manual checkout click during a live hold felt a delay (>1s), not
+    // just most of them -- the first time in the whole arc this
+    // happened. 2 of those real clicks needed a retry before completing
+    // (see SYNC_BURST_MAX_MIB's own comment for why: some real STALL
+    // durations now brush against orders' 5s downstream timeout to
+    // shipping). Real, deliberate design decision, not an accepted
+    // side effect: this is the new intended behavior, not a regression
+    // from the original "always completes, never errors" spec -- a
+    // real failure a user has to retry reads as MORE dramatic for a
+    // demo, not worse, and it doesn't touch diagnosis/scoring (both
+    // are pure Prometheus heap-metric reads, independent of checkout
+    // outcome) or risk a crash-loop-shaped restart (a Future.get
+    // timeout throws cleanly on the orders side, confirmed via the
+    // earlier cascading-dependency-failure source investigation --
+    // neither shipping nor orders restarts). No further tuning planned
+    // unless this specific tradeoff is ever revisited.
+    private static final long SYNC_DEBOUNCE_MS = 3000;
     // NOT yet empirically tuned -- real headroom kept below the dynamic
     // free-heap estimate so a stale (racy) read of totalMemory()/
     // freeMemory() at burst time doesn't itself trigger a real OOM. The
@@ -273,13 +295,25 @@ public class LeakAgent {
     //     genuinely couldn't distinguish the two). Felt effect LESS
     //     consistent than 30MiB despite occasional higher severity (a
     //     couple 2s hangs vs. 30MiB's rare 1s) -- "a lot still resolve
-    //     quite early," no clear improvement over 30MiB.
-    // **Reverted to 30MiB** -- the cleanest real result of the three, and
-    // pushing the cap further clearly isn't the right lever: it mainly
-    // controls the SEVERITY of one trigger, not how many real clicks get
-    // hit at all. That's SYNC_DEBOUNCE_MS's job -- see its own comment for
-    // the real next test step.
-    private static final long SYNC_BURST_MAX_MIB = 30;
+    //     quite early," no clear improvement over 30MiB at the time.
+    // **Reverted to 30MiB at the time** -- the cleanest real result of the
+    // three, and pushing the cap further wasn't judged the right lever: it
+    // mainly controls the SEVERITY of one trigger, not how many real
+    // clicks get hit at all (that's SYNC_DEBOUNCE_MS's job). **Real,
+    // honest caveat on that whole 20/30/40 comparison, flagged the same
+    // session:** it ran entirely under v1's edge-detection mechanism
+    // (~2 real triggers/episode) -- explicitly stale now that v2's
+    // counter-based detection fires far more often (~18/episode), which
+    // could change how burst size interacts with trigger frequency.
+    // Raised back to 40MiB to re-test under v2, alongside the lowered
+    // SYNC_DEBOUNCE_MS.
+    // **LOCKED, real live-tested result (2026-08-23 session): 40MiB +
+    // 3000ms debounce is what closed the demo-visibility arc for real
+    // -- see SYNC_DEBOUNCE_MS's own comment for the full real result
+    // and the locked design decision. The earlier stale 20/30/40MiB
+    // comparison above (under v1 detection) is superseded by this real
+    // result under v2, not still the standing verdict.
+    private static final long SYNC_BURST_MAX_MIB = 40;
     // Real, deliberate design per Qwen's review-62 fix: sized against
     // REAL-TIME free heap, not a fixed constant -- this is what makes the
     // burst proportional to actual current pressure rather than

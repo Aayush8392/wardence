@@ -131,13 +131,25 @@ def _republish_to_r2() -> bool:
     R2-sourced data on an immediate tab-switch" gap flagged in
     _attempt_resolve's own docstring. Every existing caller ignores the
     return value, unaffected.
+
+    Real, small fix (2026-08-23): republished_at is a pure success
+    signal with no other completion path -- FaultGrid.jsx/EpisodePanel.jsx
+    both gate their PUBLISHING state purely on it being non-null, so a
+    single transient failure here (a real ~12s network op) used to leave
+    the frontend stuck on PUBLISHING forever with no fallback. Retries
+    once after a short delay before giving up -- genuinely reduces the
+    real chance of a transient blip mattering, without inventing new
+    schema/state for a failure this rare.
     """
-    try:
-        publish_to_r2.main()
-        return True
-    except Exception as e:  # noqa: BLE001 -- deliberately broad, see docstring
-        print(f"WARNING: R2 republish after manual override failed: {e}")
-        return False
+    for attempt in range(2):
+        try:
+            publish_to_r2.main()
+            return True
+        except Exception as e:  # noqa: BLE001 -- deliberately broad, see docstring
+            print(f"WARNING: R2 republish attempt {attempt + 1}/2 failed: {e}")
+            if attempt == 0:
+                time.sleep(3)
+    return False
 
 app = FastAPI()
 
@@ -2218,16 +2230,21 @@ def system_status(payload: dict = Depends(require_role("admin", "demo-trigger"))
 # init-failure and bad-rollout REMOVED 2026-08-1x -- both were masked
 # by the same "old healthy pod keeps serving" RollingUpdate default and
 # both were fixed the same real way (rollout-strategy patch forcing the
-# old pod down first) -- see faultClasses.js's INVISIBLE_CLASSES
-# comment for the full real fix detail, not duplicated here.
+# old pod down first). memory-leak REMOVED 2026-08-23 -- the real
+# request-synced GC trigger mechanism made it storefront-felt (checkout
+# hang), closing the whole demo-visibility arc; see faultClasses.js's
+# INVISIBLE_CLASSES comment for the full real fix detail on all three,
+# not duplicated here. `disk-full` is the only class left, proven
+# (not just untested) to be permanently invisible by architecture --
+# `queue-master` has zero synchronous coupling to any user-facing
+# request path, confirmed at Sock Shop's own real upstream source.
 #
-# Every query below is a hardcoded template, verbatim from agent.py's
-# own real diagnosis path for these classes -- target/namespace/pod
-# regex all come from FAULT_CONFIG, never from the request. Always
-# called WITHOUT snapshot_at (live "now" only, unlike the diagnosis
-# path's evidence-freezing mechanism) -- this is a live glance, not a
-# scored diagnosis.
-_LIVE_STATUS_CLASSES = {"disk-full", "memory-leak"}
+# The query below is a hardcoded template, verbatim from agent.py's own
+# real diagnosis path for this class -- target/namespace/pod regex come
+# from FAULT_CONFIG, never from the request. Called WITHOUT snapshot_at
+# (live "now" only, unlike the diagnosis path's evidence-freezing
+# mechanism) -- this is a live glance, not a scored diagnosis.
+_LIVE_STATUS_CLASSES = {"disk-full"}
 
 
 def _prom_query_safe(query: str) -> list:
@@ -2288,75 +2305,13 @@ def _disk_full_live_status(namespace: str, target: str) -> dict:
     }
 
 
-def _init_failure_live_status(namespace: str, target: str) -> dict:
-    query = (
-        f'max_over_time(kube_pod_status_ready{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$", '
-        f'condition="false"}}[2m]) == 1'
-    )
-    try:
-        result = _prom_query_safe(query)
-    except HTTPException as exc:
-        return {"ready_false_present": None, "warning": exc.detail}
-    return {"ready_false_present": len(result) > 0, "warning": None}
-
-
-def _memory_leak_live_status(namespace: str, target: str) -> dict:
-    """Real production replacement (2026-08-21 session), REPLACES the old
-    container_memory_working_set_bytes reading -- that signal belonged to
-    the now-removed StressChaos mechanism and has no real relationship to
-    the JVM-attach LeakAgent's own retained heap. `heap_used` is
-    shipping's own real, scraped JVM heap metric (KB, same signal
-    agent.py's real diagnosis query reads).
-
-    Deliberately reports the RAW current/recent-peak reading, NOT a
-    rise-over-baseline like the real scored diagnosis does -- this is a
-    live "now" glance with no episode context (no snapshot_at, no
-    per-episode baseline_heap_kb the way /diagnose has), so there is no
-    real baseline available here to compare against. Fabricating one
-    would misrepresent this as more diagnostic than it honestly is;
-    every other class's own live-status function here (disk-full/
-    init-failure/bad-rollout) reports similarly raw, undiagnosed
-    readings, not a full verdict."""
-    query = f'max_over_time(heap_used{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}[2m])'
-    try:
-        result = _prom_query_safe(query)
-    except HTTPException as exc:
-        return {"heap_used_mib": None, "warning": exc.detail}
-    if not result:
-        return {"heap_used_mib": None, "warning": None}
-    value_mib = round(float(result[0]["value"][1]) / 1024, 1)  # heap_used is KB, not bytes
-    return {"heap_used_mib": value_mib, "warning": None}
-
-
-def _bad_rollout_live_status(namespace: str, target: str) -> dict:
-    """Real (2026-08-15): bad-rollout was found to be storefront-invisible
-    too, not just disk-full/init-failure/memory-leak -- front-end's own
-    rolling-update strategy (real, confirmed maxSurge=25%/maxUnavailable=25%,
-    which for a single replica means create-new-before-removing-old) plus
-    its existing readinessProbe means the OLD healthy pod keeps serving
-    100% of real traffic the entire time the NEW (broken-image) pod sits
-    unable to start -- injector.py's own _front_end_image_pull_failing
-    docstring already called this "the same old-pod-stays-healthy pattern
-    as init-failure," just never reflected in this readout or
-    INVISIBLE_CLASSES until now. Mirrors that exact same real Prometheus
-    signal, not a new detection mechanism."""
-    query = (
-        f'kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
-        f'pod=~"{target}.*", reason=~"ImagePullBackOff|ErrImagePull"}} == 1'
-    )
-    try:
-        result = _prom_query_safe(query)
-    except HTTPException as exc:
-        return {"image_pull_failing": None, "warning": exc.detail}
-    return {"image_pull_failing": len(result) > 0, "warning": None}
-
-
 @app.get("/operator/fault-status/{fault_class}")
 def operator_fault_status(
     fault_class: str, payload: dict = Depends(require_role("admin", "demo-trigger"))
 ):
-    """Sanitized, read-only live-status readout for the 3 classes with
-    no other Operator-screen visibility. Named 'fault-status', not
+    """Sanitized, read-only live-status readout for disk-full -- the one
+    class proven permanently storefront-invisible by architecture (see
+    _LIVE_STATUS_CLASSES's own comment). Named 'fault-status', not
     'live-status', to avoid any semantic collision with the
     episode-scoped /trigger/live-status above (Kimi review 38 finding
     5C). Every field returned is server-computed (bool/number/string
@@ -2368,16 +2323,5 @@ def operator_fault_status(
             404, f"live-status not available for '{fault_class}' (only {sorted(_LIVE_STATUS_CLASSES)})"
         )
     config = FAULT_CONFIG[fault_class]
-    namespace = config["namespace"]
-    target = config["target"]
-
-    if fault_class == "disk-full":
-        status = _disk_full_live_status(namespace, target)
-    elif fault_class == "init-failure":
-        status = _init_failure_live_status(namespace, target)
-    elif fault_class == "bad-rollout":
-        status = _bad_rollout_live_status(namespace, target)
-    else:
-        status = _memory_leak_live_status(namespace, target)
-
+    status = _disk_full_live_status(config["namespace"], config["target"])
     return {"fault_class": fault_class, **status}
