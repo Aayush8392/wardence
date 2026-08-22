@@ -1616,10 +1616,8 @@ def _capture_memory_leak_baseline(
     episode_id: str, fault_class: str, cfg: dict, t0: str, conn: sqlite3.Connection
 ) -> float | None:
     """Real per-episode floor reading for memory-leak's production diagnosis
-    design (locked 2026-08-21 session): min_over_time(heap_used[30s]) against
-    the target pod's own real, currently-scraped JVM heap metric (see
-    add_shipping_metrics_scrape.sh -- confirmed live and scraping before this
-    was written). Called at settle time (t0+MEMORY_LEAK_SETTLE_SECONDS),
+    design (locked 2026-08-21 session, REVISED 2026-08-22 after a real live
+    misdiagnosis). Called at settle time (t0+MEMORY_LEAK_SETTLE_SECONDS),
     BEFORE the leak agent starts ramping -- same moment injector.py already
     does mechanism-assertion for every other class, just earlier in this
     class's own flow than the others since there's a real ramp phase after.
@@ -1632,6 +1630,52 @@ def _capture_memory_leak_baseline(
     invalid. Capturing THIS pod's own floor, fresh, every episode, is what
     makes the later rise-over-baseline diagnosis honest regardless of which
     JVM instance is actually running.
+
+    PRIMARY SOURCE, revised 2026-08-22: LeakAgent.java's own live
+    post_gc_heap_mib (GC-notification-anchored, review 57), read directly off
+    the pod via _leak_agent_read_status(), NOT a Prometheus min_over_time
+    query anymore. Real, live-confirmed bug this replaces: a genuine episode
+    (241a6c51, 2026-08-22) captured baseline_heap_kb=110604 (108MiB) via the
+    old min_over_time(heap_used[30s]) query -- a real Prometheus range-query
+    trace across that exact episode confirmed heap_used organically climbs
+    80->111MiB over shipping's own natural ~100-110s GC sawtooth (real
+    traffic churn, nothing to do with the leak), THEN drops to ~48MiB on a
+    normal GC. The old 30s window is far shorter than that cycle, so a
+    single min_over_time sample can land ANYWHERE in the climb depending on
+    pure timing luck -- this episode's capture landed one GC cycle before the
+    natural drop, at 111MiB, already above the governor's own ~100MiB leak
+    ceiling, guaranteeing heap_rise_kb <= 0 (misdiagnosed "none") even though
+    a real, visible spike-and-recover leak ran on schedule (confirmed via the
+    live status file during the same episode: state=ALLOCATING,
+    post_gc_heap_mib=101, sync_trigger_count=1). post_gc_heap_mib is
+    structurally immune to this: it only updates on a REAL GC notification
+    (G1's own event, not a timer), so whatever value is present at read time
+    is, by construction, "the heap immediately after the most recent actual
+    collection" -- never a mid-climb snapshot, regardless of when exactly
+    this function happens to run relative to shipping's own GC cadence.
+
+    FALLBACK, unchanged from the original design: the old Prometheus
+    min_over_time(heap_used[30s]) query, used ONLY if post_gc_heap_mib reads
+    -1 (LeakAgent.java's own documented non-fatal sentinel for "the
+    com.sun.management GC-notification listener failed to register on this
+    JDK build") or the agent's status file can't be read at all. Real,
+    honest tradeoff: the fallback path can still hit the same sawtooth-
+    timing problem this whole revision exists to fix -- accepted because it
+    only fires in the already-rare, already-logged degrade case, and a noisy
+    baseline in that rare case is strictly better than no baseline at all
+    (the previous behavior when Prometheus had no data yet).
+
+    Not changed, and deliberately so: PEAK measurement (agent.py's own
+    heap_rise_kb query, max_over_time(heap_used[300s]) at diagnosis time)
+    stays on Prometheus. post_gc_heap_mib is never scraped into Prometheus --
+    it only exists in the live agent's status file, readable only while
+    injector.py is actively running against the live pod. Diagnosis happens
+    later, asynchronously, against Prometheus's stored history (snapshot_at
+    can be minutes after the real spike) -- it structurally has no live pod
+    to read a status file from by then. This is fine: max_over_time over a
+    wide window is the right tool for catching a genuine transient peak (we
+    WANT sensitivity to spikes there); it was only the FLOOR side that
+    needed GC-anchoring, not the peak side.
 
     Real UPSERT, not a plain UPDATE (a real bug caught before running, not
     after): this runs mid-injection, before the fault's own chaos_name is
@@ -1648,27 +1692,52 @@ def _capture_memory_leak_baseline(
     memory_leak_baseline_heap_kb, never stomping fields record_episode owns.
 
     Returns the real captured value (KB), or None (leaving the column NULL)
-    if Prometheus has no data yet -- callers must treat None as "baseline
+    if neither source has data yet -- callers must treat None as "baseline
     unavailable," never silently substitute a guessed default.
     """
     target = cfg["target"]
     namespace = cfg["namespace"]
-    query = f'min_over_time(heap_used{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}[30s])'
-    try:
-        resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
-        resp.raise_for_status()
-        result = resp.json()["data"]["result"]
-    except requests.RequestException as e:
-        print(f"  memory-leak baseline capture: Prometheus query failed ({e}), "
-              f"leaving memory_leak_baseline_heap_kb NULL for {episode_id}")
-        return None
 
-    if not result:
-        print(f"  memory-leak baseline capture: no heap_used data yet for {target} "
-              f"in {namespace}, leaving memory_leak_baseline_heap_kb NULL for {episode_id}")
-        return None
+    baseline_kb = None
+    pod = _current_pod_name(target, namespace)
+    if pod is not None:
+        status = _leak_agent_read_status(pod, namespace, cfg["container"])
+        if status is not None:
+            raw = status.get("post_gc_heap_mib")
+            if raw is not None:
+                try:
+                    post_gc_mib = float(raw)
+                except ValueError:
+                    post_gc_mib = -1.0
+                if post_gc_mib >= 0:
+                    baseline_kb = post_gc_mib * 1024.0
+                    print(f"  memory-leak baseline capture: using LeakAgent's own real "
+                          f"post_gc_heap_mib={post_gc_mib:.1f}MiB (GC-anchored, not a timed "
+                          f"snapshot) for {episode_id}")
 
-    baseline_kb = float(result[0]["value"][1])
+    if baseline_kb is None:
+        print(f"  memory-leak baseline capture: post_gc_heap_mib unavailable "
+              f"(agent unreachable or GC-notification listener not registered on this JDK) -- "
+              f"falling back to Prometheus min_over_time(heap_used[30s]) for {episode_id}. "
+              f"Real, honest caveat: this fallback path can still land mid-sawtooth (the exact "
+              f"bug this revision exists to fix) -- only used because it's strictly better than "
+              f"no baseline at all.")
+        query = f'min_over_time(heap_used{{namespace="{namespace}", pod=~"{target}-[^-]+-[^-]+$"}}[30s])'
+        try:
+            resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+            resp.raise_for_status()
+            result = resp.json()["data"]["result"]
+        except requests.RequestException as e:
+            print(f"  memory-leak baseline capture: Prometheus fallback query failed ({e}), "
+                  f"leaving memory_leak_baseline_heap_kb NULL for {episode_id}")
+            return None
+
+        if not result:
+            print(f"  memory-leak baseline capture: no heap_used data yet for {target} "
+                  f"in {namespace}, leaving memory_leak_baseline_heap_kb NULL for {episode_id}")
+            return None
+
+        baseline_kb = float(result[0]["value"][1])
     conn.execute(
         "INSERT INTO episodes "
         "(episode_id, fault_class, target, namespace, t0, chaos_resource_name, memory_leak_baseline_heap_kb) "

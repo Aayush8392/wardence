@@ -94,6 +94,24 @@ from run_episodes import (  # noqa: E402
 )
 
 
+# Request-synced GC trigger design (2026-08-22 session, locked in
+# wardence_buildlog.md): a real, in-memory, process-wide flag -- correct
+# because the two-phase trigger flow already guarantees at most one
+# episode in flight system-wide (see _episode_in_flight/_TRIGGER_LOCK),
+# so there is never more than one memory-leak episode that could set
+# this at once. Deliberately NOT persisted to the DB or a file: it only
+# needs to survive for the lifetime of a single live episode, and an
+# uvicorn restart mid-episode already loses far more state than this
+# (the in-flight subprocess itself, the background wrapper thread) --
+# adding durability here alone wouldn't make a restart mid-episode safe.
+_leak_checkout_paused = False
+
+
+def _set_leak_checkout_paused(value: bool) -> None:
+    global _leak_checkout_paused
+    _leak_checkout_paused = value
+
+
 def _republish_to_r2() -> bool:
     """Refresh the public R2 snapshot right after a manual trust-state
     change (2026-07-24 fix). Without this, admin's /promote or /demote
@@ -957,6 +975,21 @@ def _set_episode_state(conn, episode_id: str, state: str, **extra) -> None:
     conn.execute(f"UPDATE episodes SET {set_clause} WHERE episode_id = ?", (*vals, episode_id))
     conn.commit()
 
+    # Request-synced GC trigger design: clear the checkout-pause flag on
+    # EVERY terminal transition (resolved OR failed), not just a clean
+    # resolve -- a timed-out/crashed/abandoned memory-leak episode must
+    # not leave checkout permanently paused for the rest of the process's
+    # lifetime. Centralized here (every real state transition already
+    # goes through this one function, per this function's own docstring)
+    # instead of duplicated at each of the several call sites that reach
+    # a terminal state.
+    if state in TERMINAL_EPISODE_STATES:
+        fc_row = conn.execute(
+            "SELECT fault_class FROM episodes WHERE episode_id = ?", (episode_id,)
+        ).fetchone()
+        if fc_row is not None and fc_row[0] == "memory-leak":
+            _set_leak_checkout_paused(False)
+
 
 def _evidence_confirmed_now(fault_class: str, cfg: dict, baseline_restarts: int, baseline_periods: int) -> bool:
     """Single-poll evidence check for the 2 holding classes -- reuses
@@ -1495,6 +1528,12 @@ def trigger_inject(
 
     _audit(conn, role, "/trigger/inject", f"fault_class={fault_class} episode_id={episode_id}", ip)
     conn.close()
+
+    if fault_class == "memory-leak":
+        # Set BEFORE the background thread starts (not inside it) so
+        # there's no window where the injector subprocess could already be
+        # running while baseline.js still sees an unpaused flag.
+        _set_leak_checkout_paused(True)
 
     thread = threading.Thread(target=_run_live_episode, args=(episode_id, fault_class, cfg), daemon=True)
     thread.start()
@@ -2109,6 +2148,19 @@ def change_password_endpoint(
     _audit(conn, payload["role"], "/accounts/password", username, request.client.host)
     conn.close()
     return {"username": username, "password_changed": True}
+
+
+# --- Request-synced GC trigger design (2026-08-22 session) -----------------
+# Deliberately unauthenticated: this is a cluster-internal poll target for
+# baseline.js's own k6 pod, called once per iteration off the request-
+# generating path, never from the public-facing frontend. Exposes a
+# single boolean, nothing else -- no episode_id, no fault detail, no
+# blinding risk (traffic_gen already knows it's part of the fault-
+# injection harness; the app being tested, shipping, is never told
+# anything by this endpoint).
+@app.get("/internal/leak-pause")
+def internal_leak_pause():
+    return {"paused": _leak_checkout_paused}
 
 
 # --- Live system-status (2026-07-22) ---------------------------------------

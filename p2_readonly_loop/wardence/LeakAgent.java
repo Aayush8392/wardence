@@ -28,9 +28,11 @@ import java.util.concurrent.atomic.AtomicLong;
 // snapshot readings that were never comparable to each other).
 import java.lang.management.MemoryUsage;
 import java.util.Map;
+import javax.management.MBeanServer;
 import javax.management.Notification;
 import javax.management.NotificationEmitter;
 import javax.management.NotificationListener;
+import javax.management.ObjectName;
 import javax.management.openmbean.CompositeData;
 import com.sun.management.GarbageCollectionNotificationInfo;
 
@@ -163,6 +165,145 @@ public class LeakAgent {
     // needed -- only ever read/written from that one thread).
     private static long govPrevStwMs = -1;
     private static long govPrevStwSampledAt = 0;
+
+    // ---- request-synced GC-pressure trigger (2026-08-22 session design,
+    // Kimi+Qwen reviews 61/62) ----
+    // REVISED same session, real signal pivot, after direct measurement
+    // (not guessed) proved the original v1 design structurally broken:
+    // v1 watched currentThreadsBusy for a live 0->1 edge, meant to catch a
+    // request AS it arrived. Real, direct measurement (a stall-timing
+    // diagnostic added specifically to test this) showed the watcher
+    // thread itself was frozen by real STW GC pauses for 968 separate
+    // stalls totaling 148.3 REAL SECONDS in one single episode (worst
+    // single stall: 1.78s) -- a live edge that occurs entirely inside one
+    // of those frozen windows is structurally invisible to a thread that
+    // is ALSO frozen for that exact window, no matter how fine the poll
+    // interval is. Real result: only 1 real trigger fired the whole
+    // episode despite dozens of real checkout clicks.
+    // v2 (this version): watches Tomcat's own real `GlobalRequestProcessor`
+    // requestCount instead -- a monotonic, cumulative counter of completed
+    // requests, not a live instantaneous flag. This is IMMUNE to the same
+    // freeze problem: no matter how long the watcher was frozen, the very
+    // next successful read correctly sees the counter jumped, since the
+    // counter itself doesn't depend on being observed at any particular
+    // instant. Real, honest tradeoff, not a free win: requestCount only
+    // updates via Tomcat's `registerReply()`, which fires AFTER a
+    // response is already committed -- this is exactly why v1's original
+    // design (reviews 61/62) rejected it for precise in-request timing.
+    // The burst now fires shortly AFTER a real request completes, not
+    // during it -- landing on whatever comes next (organic traffic or the
+    // user's own next click) rather than the exact request that triggered
+    // detection. Accepted deliberately: going from "catches ~1 of dozens
+    // of real requests" to "reliably reacts to nearly all real traffic,
+    // just slightly delayed onto the next one" is a real, large net
+    // improvement for the actual goal (a demo that reliably FEELS the
+    // fault), even though it's no longer surgically tied to one specific
+    // click.
+    private static final String SYNC_REQUEST_PROCESSOR_MBEAN =
+        "Tomcat:type=GlobalRequestProcessor,name=\"http-nio-80\"";
+    // Real, deliberate poll interval -- kept unchanged from v1 even though
+    // the precision argument that originally justified 20ms no longer
+    // applies (a monotonic counter can't be missed the way a live edge
+    // could, so a slower poll would work just as correctly). Left as-is to
+    // keep this revision scoped to the real, measured problem (the signal
+    // choice) rather than also changing a knob that was never shown to be
+    // wrong -- a real candidate to relax later if reqsync's own CPU/JMX
+    // call overhead ever needs trimming, not yet measured as a problem.
+    private static final long SYNC_POLL_MS = 20;
+    // Real, live-tested (2026-08-22 session): 7000ms (the middle of both
+    // reviews' agreed 5-10s range) produced only 2 real triggers across a
+    // full hold in the 30MiB/40MiB runs, and the real felt-effect
+    // complaint became "a lot [of clicks] still resolve quite early" --
+    // consistent with real clicks landing inside the 7s cooldown of a
+    // prior trigger and getting no burst at all, though this couldn't be
+    // directly confirmed without per-event timestamps (fixed the same
+    // session -- see maybeFireSyncBurst's own real-time stderr log line).
+    // Lowered to 4000ms as the next real test step, deliberately NOT
+    // further -- both reviews' agreed floor was 5000ms specifically to
+    // avoid a real G1 death-spiral risk on this heap; going below that
+    // reviewed floor in one step, rather than testing just under it first,
+    // wasn't judged worth the extra risk for an unmeasured payoff.
+    // Real, honest note from the same session's signal pivot (see
+    // SYNC_REQUEST_PROCESSOR_MBEAN's own comment): this value was tuned
+    // against v1's edge-detection mechanism, which barely fired at all (1
+    // real trigger/episode) -- v2's counter-based detection will very
+    // likely notice real traffic far more often, meaning THIS debounce
+    // value is now the real, live-binding constraint for the first time.
+    // Not re-derived yet -- real next step once v2 is live-tested.
+    private static final long SYNC_DEBOUNCE_MS = 4000;
+    // NOT yet empirically tuned -- real headroom kept below the dynamic
+    // free-heap estimate so a stale (racy) read of totalMemory()/
+    // freeMemory() at burst time doesn't itself trigger a real OOM. The
+    // burst allocation is wrapped in a try/catch regardless (real OOM
+    // here is treated as "the estimate was stale, skip this trigger", not
+    // fatal), but this margin is meant to make that catch a rare
+    // safety net, not the normal path.
+    private static final long SYNC_BURST_MARGIN_MIB = 10;
+    // Real, deliberate bound. Without this, the burst size (freeMib -
+    // margin) would allocate essentially ALL remaining headroom on every
+    // single trigger: fights the governor's own graduated
+    // GOVERNOR_RELEASE_STEP_MB=10MiB steps instead of adding a bounded
+    // pulse on top of them, and risks racing the worker thread's own
+    // concurrent allocation straight into a real OOM.
+    // Real, live-tested tuning pass (2026-08-22 session), each step run as
+    // a full real live episode with real manual checkout clicks, not
+    // simulated:
+    //   20MiB: 5 real triggers, zero checkout failures, felt effect real
+    //     but inconsistent (>half of ~10 manual clicks unaffected, 2
+    //     genuinely hung 1+s, a few 0.3-0.5s).
+    //   30MiB: only 2 real triggers this run, zero checkout failures, felt
+    //     effect MORE consistent than 20MiB despite fewer triggers -- every
+    //     single click during the active hold felt genuinely slower
+    //     (mostly ~0.5s, rarely 1+s). Real, meaningful improvement in
+    //     reliability of the felt effect, not just severity.
+    // Real ceiling reasoning, not a guess: the governor already runs the
+    // retained leak near ~100-111MiB during a hold (confirmed live), and
+    // this project's own earlier governed-leak tuning recorded a real 97%
+    // STW-pause fraction at just 86MiB heap_used and a real ~124MiB thrash
+    // onset -- severe GC pressure starts well below the 128MiB Xmx
+    // ceiling, not at it. A burst fires ON TOP of the already-elevated
+    // governed-hold baseline, so raising this risks pushing the COMBINED
+    // live-set into that pressure zone (a full/mixed GC instead of a quick
+    // minor one) well before the min(freeMib-margin, cap) sizing formula's
+    // own real-time headroom check would ever risk an actual OOM.
+    //   40MiB: same 2 real triggers as 30MiB (a real, honest caveat: with
+    //     only a cumulative counter and no per-event timestamps at the
+    //     time, this could mean "burst size doesn't affect trigger
+    //     frequency" OR just fewer real requests landed in this window --
+    //     genuinely couldn't distinguish the two). Felt effect LESS
+    //     consistent than 30MiB despite occasional higher severity (a
+    //     couple 2s hangs vs. 30MiB's rare 1s) -- "a lot still resolve
+    //     quite early," no clear improvement over 30MiB.
+    // **Reverted to 30MiB** -- the cleanest real result of the three, and
+    // pushing the cap further clearly isn't the right lever: it mainly
+    // controls the SEVERITY of one trigger, not how many real clicks get
+    // hit at all. That's SYNC_DEBOUNCE_MS's job -- see its own comment for
+    // the real next test step.
+    private static final long SYNC_BURST_MAX_MIB = 30;
+    // Real, deliberate design per Qwen's review-62 fix: sized against
+    // REAL-TIME free heap, not a fixed constant -- this is what makes the
+    // burst proportional to actual current pressure rather than
+    // potentially being silently absorbed by whatever headroom the
+    // governor happens to have left at that instant.
+    private static volatile long syncLastTriggerAtMs = 0;
+    private static final AtomicInteger syncTriggerCount = new AtomicInteger(0);
+    private static final AtomicInteger syncSkippedNoHeadroomCount = new AtomicInteger(0);
+    private static final AtomicBoolean syncMbeanUnavailable = new AtomicBoolean(false);
+
+    // Real diagnostic instrumentation added 2026-08-22, to directly test
+    // (not just guess) whether STW GC pauses freezing this SAME polling
+    // thread explain the real observed low busy-edge detection rate (2
+    // real triggers out of ~35 real checkout attempts in the same
+    // session's live test) -- a stop-the-world pause freezes every Java
+    // thread including this one, so a real request that fully arrives and
+    // completes inside such a pause is structurally invisible to a polling
+    // loop that is ALSO frozen for that exact window. If this thread's own
+    // measured cycle time regularly blows past its expected ~SYNC_POLL_MS,
+    // that's direct, real evidence of the freeze happening, not inference.
+    private static final long SYNC_STALL_THRESHOLD_MS = 50;
+    private static final AtomicInteger syncStallCount = new AtomicInteger(0);
+    private static final AtomicLong syncStallMsTotal = new AtomicLong(0);
+    private static volatile long syncMaxStallMs = 0;
 
     private static volatile int targetMb = 0;
     private static volatile long allocatedBytes = 0L;
@@ -311,8 +452,11 @@ public class LeakAgent {
             startThread("wardence-leak-watchdog", new Runnable() {
                 public void run() { watchdogLoop(); }
             });
+            startThread("wardence-leak-reqsync", new Runnable() {
+                public void run() { requestSyncLoop(); }
+            });
 
-            System.err.println("[wardence-leak-agent] hardened agent loaded, 4 threads started");
+            System.err.println("[wardence-leak-agent] hardened agent loaded, 5 threads started");
         } catch (Throwable t) {
             // Never let the agent break the real app's boot.
             System.err.println("[wardence-leak-agent] premain failed (non-fatal): " + t);
@@ -762,6 +906,175 @@ public class LeakAgent {
         System.err.println("[wardence-leak-agent] " + reason);
     }
 
+    // ================= Thread 5: request-synced GC-pressure trigger =================
+    // v2 (see SYNC_REQUEST_PROCESSOR_MBEAN's own comment for the real,
+    // measured reason v1's live busy-edge watch was replaced): watches
+    // Tomcat's own real, monotonic GlobalRequestProcessor.requestCount and
+    // fires whenever it notices the count has genuinely increased since
+    // the last successful read -- immune to this same thread being frozen
+    // for however long, since the counter itself never "resets" or gets
+    // missed the way a live instantaneous flag could.
+    private static void requestSyncLoop() {
+        MBeanServer mbs = ManagementFactory.getPlatformMBeanServer();
+        ObjectName processorName;
+        try {
+            processorName = new ObjectName(SYNC_REQUEST_PROCESSOR_MBEAN);
+        } catch (Throwable t) {
+            // Real, non-fatal degrade: if the MBean name is ever wrong for
+            // a different shipping build, this thread simply never fires
+            // rather than crashing the agent or the app it's attached to.
+            syncMbeanUnavailable.set(true);
+            lastError = "reqsync: MBean lookup failed, thread disabled: " + t;
+            return;
+        }
+
+        // -1 sentinel: "not yet read for real" -- the first successful
+        // read seeds this WITHOUT firing (there's no real "increase" to
+        // react to on the very first observation, only a baseline to
+        // compare future reads against).
+        long prevRequestCount = -1L;
+        long lastLoopAtMs = System.currentTimeMillis();
+        while (true) {
+            try {
+                // Real stall measurement -- see SYNC_STALL_THRESHOLD_MS's
+                // own comment above for why this exists. Computed BEFORE
+                // any real work this iteration, against the previous
+                // iteration's own start time, so it captures the real
+                // elapsed wall-clock gap (sleep + any freeze) rather than
+                // just this iteration's own work time.
+                long loopStartMs = System.currentTimeMillis();
+                long cycleMs = loopStartMs - lastLoopAtMs;
+                lastLoopAtMs = loopStartMs;
+                long stallMs = cycleMs - SYNC_POLL_MS;
+                if (stallMs > SYNC_STALL_THRESHOLD_MS) {
+                    syncStallCount.incrementAndGet();
+                    syncStallMsTotal.addAndGet(stallMs);
+                    if (stallMs > syncMaxStallMs) {
+                        syncMaxStallMs = stallMs;
+                    }
+                    System.err.println("[wardence-leak-agent] reqsync STALL: " + stallMs
+                        + "ms over expected (likely this thread was itself frozen by a real "
+                        + "GC pause) at=" + loopStartMs);
+                }
+
+                Object countObj = mbs.getAttribute(processorName, "requestCount");
+                long nowCount = (countObj instanceof Number) ? ((Number) countObj).longValue() : -1L;
+                if (nowCount >= 0) {
+                    if (prevRequestCount >= 0 && nowCount > prevRequestCount) {
+                        // One burst per real OBSERVATION of new traffic, not
+                        // one per individual completed request -- if several
+                        // requests completed during a real freeze, they're
+                        // still just "traffic happened, react once," same as
+                        // v1's own edge-per-observation shape.
+                        maybeFireSyncBurst();
+                    }
+                    prevRequestCount = nowCount;
+                }
+                Thread.sleep(SYNC_POLL_MS);
+            } catch (Throwable t) {
+                // A single bad MBean read shouldn't permanently disable this
+                // thread the way a lookup failure above does -- back off a
+                // beat and keep polling. lastLoopAtMs is re-stamped here too
+                // (not just at the top of the try) so this deliberate 1s
+                // backoff is never itself misattributed as a real stall on
+                // the next iteration.
+                lastError = "reqsync: " + t;
+                syncMbeanUnavailable.set(true);
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+                lastLoopAtMs = System.currentTimeMillis();
+                continue;
+            }
+            syncMbeanUnavailable.set(false);
+        }
+    }
+
+    // Fires a real, throwaway (never retained in CHUNKS) allocation burst
+    // sized against REAL-TIME free heap, never System.gc() -- preserves
+    // the real "Allocation Failure" GC-cause signature (System.gc()'s own
+    // distinct GC-cause would be a real, inspectable tell that the pause
+    // was engineered, the exact blinding leak review 61 v1 had and v2
+    // fixed).
+    private static void maybeFireSyncBurst() {
+        long now = System.currentTimeMillis();
+        if (now - syncLastTriggerAtMs < SYNC_DEBOUNCE_MS) {
+            return;
+        }
+        // Only meaningful while a real leak target is active -- this is
+        // part of the memory-leak fault mechanism, never a general
+        // shipping behavior that could fire outside an episode.
+        if (targetMb <= 0) {
+            return;
+        }
+
+        Runtime rt = Runtime.getRuntime();
+        long freeMib = (rt.maxMemory() - (rt.totalMemory() - rt.freeMemory())) / (1024 * 1024);
+        // Bounded by SYNC_BURST_MAX_MIB, not just headroom -- see that
+        // constant's own comment for why an unbounded (freeMib - margin)
+        // burst is a real problem, not just a theoretical one.
+        long burstMib = Math.min(freeMib - SYNC_BURST_MARGIN_MIB, SYNC_BURST_MAX_MIB);
+        if (burstMib <= 0) {
+            syncSkippedNoHeadroomCount.incrementAndGet();
+            return;
+        }
+
+        // Real per-event visibility (added 2026-08-22, per real tuning
+        // session need): a cumulative counter alone couldn't distinguish
+        // "debounce is suppressing real requests" from "fewer requests
+        // arrived this run" -- this line, tailed live via `kubectl logs
+        // -f`, gives the real gap-since-last-trigger directly, comparable
+        // against SYNC_DEBOUNCE_MS. gapMs is 0 for the very first real
+        // trigger of an episode (syncLastTriggerAtMs starts at 0), which
+        // is expected and not a real "instant re-trigger."
+        long gapMs = (syncLastTriggerAtMs == 0) ? 0 : (now - syncLastTriggerAtMs);
+        System.err.println("[wardence-leak-agent] reqsync FIRE: gapMs=" + gapMs
+            + " burstMib=" + burstMib + " freeMib=" + freeMib
+            + " heapUsedMib=" + ((rt.totalMemory() - rt.freeMemory()) / (1024 * 1024))
+            + " at=" + now);
+
+        // Debounce timestamp is set BEFORE the allocation attempt, not
+        // after -- a burst that throws OOM below still genuinely disturbed
+        // the heap and should still hold the debounce window, not retry
+        // immediately.
+        syncLastTriggerAtMs = now;
+        try {
+            // Built from the SAME CHUNK_BYTES-sized pieces the main leak
+            // mechanism uses (never one giant array) -- a single byte[] at
+            // burstMib scale would be a real humongous object (>=512KiB,
+            // see CHUNK_BYTES's own comment above), placed directly in
+            // old-gen and reclaimable only by a full/major GC instead of
+            // the brief, request-scoped pause this mechanism is meant to
+            // produce. Held in a local list (never CHUNKS, never a static
+            // field) so every piece goes out of scope together the instant
+            // this method returns -- real, throwaway garbage for the next
+            // collection, nothing retained.
+            long burstBytes = burstMib * 1024L * 1024L;
+            int numChunks = (int) (burstBytes / CHUNK_BYTES);
+            List<byte[]> burst = new ArrayList<byte[]>(numChunks);
+            for (int i = 0; i < numChunks; i++) {
+                byte[] chunk = new byte[CHUNK_BYTES];
+                Arrays.fill(chunk, (byte) 0xA5);
+                burst.add(chunk);
+            }
+            syncTriggerCount.incrementAndGet();
+            // Defeats dead-store elimination (a JIT that proves `burst` is
+            // never read again could otherwise skip the fill/allocation
+            // entirely) without retaining anything anywhere.
+            if (!burst.isEmpty() && (burst.get(0)[0] & 0xFF) != 0xA5) {
+                System.err.println("[wardence-leak-agent] reqsync: unexpected burst fill byte");
+            }
+        } catch (OutOfMemoryError oom) {
+            // Real, non-fatal: the free-heap estimate above was racy/stale
+            // (another allocator moved the goalposts between the read and
+            // the allocation) -- skip this trigger, the debounce window
+            // still holds so this doesn't hot-loop retrying.
+            lastError = "reqsync: OOM during sync burst (non-fatal, estimate was stale)";
+        }
+    }
+
     // ================= status/beat I/O =================
     private static void writeBeat() {
         try {
@@ -828,6 +1141,12 @@ public class LeakAgent {
             sb.append("worker_stuck=").append(workerStuck.get()).append('\n');
             sb.append("control_stuck=").append(controlStuck.get()).append('\n');
             sb.append("watchdog_releases=").append(watchdogReleases.get()).append('\n');
+            sb.append("sync_trigger_count=").append(syncTriggerCount.get()).append('\n');
+            sb.append("sync_skipped_no_headroom_count=").append(syncSkippedNoHeadroomCount.get()).append('\n');
+            sb.append("sync_mbean_unavailable=").append(syncMbeanUnavailable.get()).append('\n');
+            sb.append("sync_stall_count=").append(syncStallCount.get()).append('\n');
+            sb.append("sync_stall_ms_total=").append(syncStallMsTotal.get()).append('\n');
+            sb.append("sync_max_stall_ms=").append(syncMaxStallMs).append('\n');
             sb.append("last_io_read_ms=").append(lastIoReadMs).append('\n');
             sb.append("last_io_write_ms=").append(lastIoWriteMs).append('\n');
             sb.append("ttl_remaining_s=").append(ttlRemainingS).append('\n');
