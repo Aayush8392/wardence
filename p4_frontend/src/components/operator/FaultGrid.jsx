@@ -27,9 +27,28 @@ function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, crashLo
   const isLive = isActive && state && state !== "resolved" && state !== "failed";
 
   const [injectPending, setInjectPending] = useState(false);
+  // Real bug found live 2026-08-22, re-triggering memory-leak's own
+  // class twice in a row (the operator-tab recency-guard test): this
+  // effect used to key ONLY on `isActive`, which flips false->true
+  // once per class and then stays true across every subsequent
+  // episode of that SAME class -- retriggering while already isActive
+  // (no false->true transition to fire on) left injectPending stuck
+  // true forever, showing a permanent client-side "INJECTING" no real
+  // poll could ever override, even once the backend had long since
+  // reached resolved (confirmed: only a hard page refresh, which
+  // remounts the component and resets injectPending's own initial
+  // state, cleared it). Fixed by also keying on the real episode's own
+  // identity (`live?.episode_id`, from the shared /trigger/live-status
+  // poll) -- unlike `isActive`, this genuinely changes on every new
+  // trigger, same class or not, so the effect now always re-fires and
+  // clears the flag once the new episode's first live-status poll
+  // lands, regardless of how long "injecting" itself takes (this was
+  // never actually about the new recency guard specifically -- any
+  // same-class re-trigger without a page refresh in between would have
+  // hit this).
   useEffect(() => {
     if (isActive) setInjectPending(false);
-  }, [isActive]);
+  }, [isActive, live?.episode_id]);
 
   const elapsedS = useTickingElapsed(isActive ? live?.elapsed_in_state_s : null, isActive && Boolean(state));
 

@@ -83,6 +83,15 @@ from injector import (  # noqa: E402
     _restart_count,
 )
 import carts_rotation  # noqa: E402
+# Real single source of truth for memory-leak's diagnosis-recency margin
+# (see run_episodes.py's own dict comment for the full 330s derivation:
+# agent.py's heap_rise_kb query widened to [300s] on 2026-08-21, and this
+# constant was updated in lockstep the same session) -- reused here, not
+# re-declared, for the live-trigger contamination guard below.
+from run_episodes import (  # noqa: E402
+    DEFAULT_TARGET_RECENCY_WINDOW_S,
+    TARGET_RECENCY_WINDOW_S,
+)
 
 
 def _republish_to_r2() -> bool:
@@ -392,12 +401,17 @@ RESOLVE_SAFETY_BUFFER_S = 5
 # diagnosis query in agent.py has a genuine, bounded PromQL lookback
 # window (confirmed by reading the file, not assumed) -- [3m] for
 # restarts/OOM/eviction/connection-pool, [2m] for network-latency.
-# memory-leak's own window is [60s] as of the 2026-08-21 production
-# mechanism swap (was [3m], tied to the now-removed StressChaos
-# mechanism) -- narrower than every window this constant was originally
-# sized against, so the "just above the longest real query window"
-# reasoning below is now conservative for memory-leak specifically, not
-# invalidated by it. Wait too long past injection and the agent's own
+# memory-leak's own window is [300s] as of the 2026-08-21/22 session
+# (widened from [60s], itself a same-day replacement for the old [3m]
+# tied to the now-removed StressChaos mechanism, after a real live
+# false-negative traced the diagnosis query to a too-narrow lookback --
+# see agent.py's own comment on that query). This is now WIDER than the
+# "just above the longest real query window (3m)" reasoning below
+# assumes, not narrower -- stale-note corrected here rather than left to
+# mislead a future reader; harmless in practice only because
+# RESOLVE_WINDOW_MAX_S (the constant this reasoning actually sizes) is
+# confirmed unused by the real trigger flow, per the NOTE further down.
+# Wait too long past injection and the agent's own
 # queries will correctly see nothing, because the real evidence has
 # aged out of the window it checks -- producing a FALSE "wrong" that
 # reflects nothing about the system's real accuracy, only that the user
@@ -1078,6 +1092,57 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     return True
 
 
+def _memory_leak_recency_wait(episode_id: str) -> None:
+    """Live-check contamination guard for memory-leak re-triggers
+    (queued since the 2026-08-21/22 production-mechanism session --
+    real design already scoped in wardence_buildlog.md, built here).
+
+    The batch runner (run_batch_plan.py's _wait_for_target_recency)
+    already guards against this same bug using an in-memory
+    last_fault_time dict, but that dict doesn't exist here -- a live
+    /trigger/inject call can arrive from a cold server, or with no
+    batch ever having run in this process at all, so the DB is the
+    only place real prior-episode timing actually lives for this path.
+
+    Real, derived math (not a guess): without this, two live-triggered
+    memory-leak episodes close enough together could have the SECOND
+    one's diagnosis (agent.py's heap_rise_kb query, now [300s] wide --
+    widened 2026-08-21 to fix a real false-negative) read the FIRST
+    episode's still-elevated heap instead of its own -- the exact
+    cross-episode contamination bug already fixed for batch mode
+    (run_episodes.py's TARGET_RECENCY_WINDOW_S["memory-leak"]=330,
+    reused directly here, not re-derived) but never guarded on this
+    path until now.
+
+    A real state check, not a blind worst-case wait, matching this
+    project's own standing "check real state, don't just sleep a
+    constant" rule (same precedent as _ensure_oom_baseline/
+    _ensure_cpu_throttle_baseline): the common case -- no memory-leak
+    episode in the last 330s -- returns immediately with zero added
+    wait.
+    """
+    conn = _conn()
+    row = conn.execute(
+        "SELECT t0 FROM episodes WHERE fault_class = 'memory-leak' "
+        "AND t0 IS NOT NULL AND episode_id != ? ORDER BY t0 DESC LIMIT 1",
+        (episode_id,),
+    ).fetchone()
+    conn.close()
+    if row is None or row[0] is None:
+        return
+    last_t0 = datetime.datetime.fromisoformat(row[0])
+    window = TARGET_RECENCY_WINDOW_S.get("memory-leak", DEFAULT_TARGET_RECENCY_WINDOW_S)
+    remaining = window - (datetime.datetime.now(datetime.timezone.utc) - last_t0).total_seconds()
+    if remaining <= 0:
+        return
+    print(f"episode {episode_id}: waiting {remaining:.0f}s so memory-leak's last real "
+          f"episode (t0={row[0]}) clears the {window}s diagnosis-recency window")
+    while remaining > 0:
+        chunk = min(remaining, 5)
+        time.sleep(chunk)
+        remaining -= chunk
+
+
 def _run_live_episode(episode_id: str, fault_class: str, cfg: dict) -> None:
     """Real top-level exception guard (Kimi review 37 finding 2) around
     the actual logic in _run_live_episode_inner. Without this, ANY
@@ -1109,6 +1174,10 @@ def _run_live_episode_inner(episode_id: str, fault_class: str, cfg: dict) -> Non
     holding = fault_class in HOLDING_CLASSES
     wrapper_polled = fault_class in WRAPPER_POLLED_EVIDENCE_CLASSES
     evidence_file_class = fault_class in EVIDENCE_FILE_CLASSES
+
+    if fault_class == "memory-leak":
+        _memory_leak_recency_wait(episode_id)
+
     cmd = [sys.executable, str(INJECTOR_PATH), "--class", fault_class, "--episode-id", episode_id]
     if fault_class in LIVE_TRIGGER_DURATION_OVERRIDE_S:
         cmd += ["--duration-override", str(LIVE_TRIGGER_DURATION_OVERRIDE_S[fault_class])]
