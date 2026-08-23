@@ -91,7 +91,19 @@ COPY --from=build /build/target/*.jar ./app.jar
 # shell-form fix, which uses `exec` on purpose so java takes over PID 1
 # for $JAVA_OPTS expansion) -- here the whole point is for java to NOT be
 # PID 1.
-ENTRYPOINT ["sh", "-c", "java -Djava.security.egd=file:/dev/urandom -jar ./app.jar --port=80"]
+#
+# SECOND real bug found live on wardence-prod, same session: the plain
+# `sh -c "java ..."` form above still ended up with java as PID 1 anyway
+# -- confirmed via a real `ps aux` inside the running pod. Root cause:
+# Alpine's `sh` (BusyBox `ash`) performs an implicit tail-call exec
+# optimization -- when a `-c` script's body is a single simple command
+# with nothing after it, `ash` replaces itself via exec() with that
+# command even though `exec` was never written, collapsing straight back
+# to the exact bug this was supposed to fix. Real fix: background the
+# java process and `wait` on it, so the script has two real statements
+# and `ash` can no longer tail-call-optimize -- `sh` now genuinely forks
+# and stays PID 1 as a real parent, java runs as its real child.
+ENTRYPOINT ["sh", "-c", "java -Djava.security.egd=file:/dev/urandom -jar ./app.jar --port=80 & wait"]
 EOF
 echo "Patched Dockerfile:"
 cat Dockerfile
