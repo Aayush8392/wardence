@@ -73,12 +73,12 @@ COPY . .
 RUN go get -u github.com/FiloSottile/gvt && gvt restore
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build -a -installsuffix cgo \
-    -o /app/main github.com/microservices-demo/catalogue/cmd/cataloguesvc
+    -o /app github.com/microservices-demo/catalogue/cmd/cataloguesvc
 
 FROM alpine:3.19
-COPY --from=build /app/main /app/main
+COPY --from=build /app /app
 COPY --from=build /go/src/github.com/microservices-demo/catalogue/images/ /images/
-ENTRYPOINT ["/app/main", "-port=80"]
+ENTRYPOINT ["/app", "-port=80"]
 EXPOSE 80
 EOF
 
