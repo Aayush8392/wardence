@@ -76,7 +76,22 @@ FROM amazoncorretto:8-alpine
 WORKDIR /usr/src/app
 COPY --from=build /build/target/*.jar ./app.jar
 
-ENTRYPOINT ["java","-Djava.security.egd=file:/dev/urandom","-jar","./app.jar", "--port=80"]
+# Shell-form, deliberately WITHOUT `exec` (fixed 2026-08-2x, real bug
+# found live on wardence-prod): the original exec-form ENTRYPOINT made
+# `java` PID 1 directly. crash-loop's own real mechanism (`pkill -9 -f
+# app.jar`, injector.py) confirmed dead on arrival against that shape --
+# a PID-1 process inside a PID namespace silently discards any signal it
+# hasn't installed a handler for, INCLUDING SIGKILL (documented kernel
+# behavior, pid_namespaces(7) -- this project already hit and solved the
+# exact same problem once before, on the ORIGINAL x86 image, which
+# wrapped java in a java.sh shell as PID 1 for exactly this reason; the
+# arm64 rebuild silently dropped that wrapper). Fixed by restoring a
+# shell as PID 1 -- java runs as a real, normally-signalable child
+# process again. Deliberately NOT `exec java ...` (unlike shipping's own
+# shell-form fix, which uses `exec` on purpose so java takes over PID 1
+# for $JAVA_OPTS expansion) -- here the whole point is for java to NOT be
+# PID 1.
+ENTRYPOINT ["sh", "-c", "java -Djava.security.egd=file:/dev/urandom -jar ./app.jar --port=80"]
 EOF
 echo "Patched Dockerfile:"
 cat Dockerfile
