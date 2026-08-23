@@ -66,6 +66,36 @@ these were the real charts used originally, but re-add the repos
 trusting this section blindly; charts drift over time same as everything
 else in this project.
 
+## 1a. arm64-only: patch images to the rebuilt GHCR versions (skip on x86)
+
+The upstream `complete-demo.yaml` applied in section 1 pulls the
+ORIGINAL x86 `weaveworksdemos/*` images. On an arm64-only host (Oracle
+A1), run immediately after section 1, from the repo root:
+
+```bash
+bash deploy/patch_arm64_images.sh        # the 7 app-service images
+bash deploy/patch_infra_arm64_fixes.sh   # rabbitmq tag bump + catalogue-db/user-db
+```
+
+`patch_infra_arm64_fixes.sh` requires `catalogue-db`/`user-db`'s arm64
+images to already exist on GHCR -- if they don't yet, run
+`deploy/rebuild_arm64_catalogue_db.sh` and `deploy/rebuild_arm64_user_db.sh`
+first (from a docker+buildx machine, e.g. WSL2), same pattern as the
+original 7 app-service rebuilds.
+
+**Real, non-obvious arm64-specific bugs found and fixed during the
+2026-08-23 wardence-prod deployment, worth knowing before repeating this
+on a fresh host:**
+- `catalogue`'s Deployment hardcodes `command: ["/app"]` -- the real
+  published x86 image apparently has its binary at that exact path,
+  unlike its GitHub source's Dockerfile (which implies `/app/main`).
+  Already fixed at the image level in `rebuild_arm64_catalogue.sh`.
+- `mysql:5.7` (catalogue-db's real base) has NO arm64 build at all --
+  swapped to `mariadb:10.11`, a verified multi-arch, wire-compatible
+  replacement, in `rebuild_arm64_catalogue_db.sh`.
+- `rabbitmq:3.6.8-management` predates multi-arch manifest lists --
+  bumped to `3.13-management` in `patch_infra_arm64_fixes.sh`.
+
 ## 2. Apply every live cluster patch (real values, captured 2026-08-23)
 
 Run from `p2_readonly_loop/`, in this order (a few have real ordering
@@ -86,11 +116,28 @@ bash patch_enable_zipkin_tracing.sh
 bash patch_queue_master_ephemeral_limit.sh
 bash patch_catalogue_and_queue_master_readiness.sh
 bash patch_carts_readiness_and_jvm_tuning.sh
+bash patch_orders_jvm_tuning.sh
 bash patch_rollout_strategy_masking.sh
+
+# arm64-only: user's Mongo-host env var (see section 1a) -- the stock
+# manifest names it "mongo", but the real app source only reads
+# MONGO_HOST. Needed on x86 too if ever running from-source builds
+# instead of the original weaveworksdemos/user image, but only
+# discovered via the arm64 rebuild.
+bash patch_user_mongo_env.sh
 
 # New, permanent second deployment (crash-loop's warm-standby demo fix)
 bash deploy_carts_warm_standby.sh
 ```
+
+**Real, arm64-specific memory-limit bump, added 2026-08-23**:
+`patch_carts_readiness_and_jvm_tuning.sh` and the new
+`patch_orders_jvm_tuning.sh` both raise their deployment's memory limit
+to 1Gi (from the original 500Mi, tuned for the tight WSL2/laptop dev
+box) -- both OOMKilled repeatedly on wardence-prod even with a `-Xmx`
+heap cap already in place, and the Oracle host has real confirmed
+headroom (9.2GB free) to not need the squeeze. Re-verify this is still
+appropriate if ever deploying to a more memory-constrained host again.
 
 **Real gap, not yet closed**: `patch_catalogue_and_queue_master_readiness.sh`
 overlaps with `patch_queue_master_ephemeral_limit.sh` (both touch
