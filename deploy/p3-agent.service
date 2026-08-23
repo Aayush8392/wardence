@@ -1,0 +1,40 @@
+# systemd unit for p3_agent.py (real diagnosis/action endpoint, port 8001)
+# on the Oracle host -- same real process-supervision need as
+# operator-api.service: a bare `uvicorn` process has nothing else
+# restarting it on crash or reboot. Added 2026-08-2x after p3_agent.py
+# was found running only as a manually-started `nohup` process with no
+# supervision at all (see wardence_buildlog.md's matching session).
+#
+# NOT yet installed anywhere -- this is a template, same placeholder
+# convention as operator-api.service:
+#   - <WARDENCE_USER>: the real Linux user this should run as (never root)
+#   - <REPO_PATH>: real absolute path to the cloned repo on the Oracle host
+#   - <VENV_PATH>: real absolute path to the Python venv with dependencies
+#     installed
+#
+# Secrets are NOT set here -- both real .env files (repo-root .env for
+# LLM provider keys, p3_trust_action/.env for R2 credentials) are loaded
+# by the Python code itself, same as operator-api.service's own note.
+#
+# Install:
+#   sudo cp deploy/p3-agent.service /etc/systemd/system/wardence-p3-agent.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wardence-p3-agent
+
+[Unit]
+Description=Wardence P3 Agent (diagnosis/action)
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<WARDENCE_USER>
+WorkingDirectory=<REPO_PATH>/p3_trust_action
+Environment=PROMETHEUS_URL=http://localhost:30090
+Environment=WARDENCE_STATE_DIR=/var/lib/wardence/state
+ExecStart=<VENV_PATH>/bin/uvicorn p3_agent:app --host 0.0.0.0 --port 8001
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

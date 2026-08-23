@@ -47,7 +47,7 @@ from drain3.template_miner_config import TemplateMinerConfig
 
 from deeplog_service_config import PIPELINE_SERVICES, MASKING_INSTRUCTIONS, get_depth
 
-LOKI_URL = "http://localhost:3100"
+LOKI_URL = os.environ.get("LOKI_URL", "http://localhost:3100")
 NAMESPACE = "sock-shop"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

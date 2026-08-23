@@ -1,0 +1,42 @@
+# systemd unit for detector_service.py (real DL/HMM/SPC anomaly-detector
+# endpoint, port 8010, p5_dl_hardening) on the Oracle host -- same real
+# process-supervision need as operator-api.service/p3-agent.service.
+# Feeds the fallback anomaly signal for front-end/orders/user/catalogue/
+# queue-master targets (see agent.py's DL_DETECTOR_SERVICES) -- needed
+# for oom/bad-rollout/network-latency/network-partition/cpu-throttling/
+# under-provisioned-replicas, NOT needed for crash-loop (carts isn't in
+# that set).
+#
+# NOT yet installed anywhere -- this is a template, same placeholder
+# convention as operator-api.service:
+#   - <WARDENCE_USER>: the real Linux user this should run as (never root)
+#   - <REPO_PATH>: real absolute path to the cloned repo on the Oracle host
+#   - <VENV_PATH>: real absolute path to the Python venv with dependencies
+#     installed
+#
+# Reaches Loki via a real NodePort (p2_readonly_loop/patch_loki_nodeport.sh),
+# not a port-forward -- same reasoning as PROMETHEUS_URL. Run that script
+# once before starting this unit, and confirm the real NodePort matches
+# LOKI_URL below.
+#
+# Install:
+#   sudo cp deploy/detector-service.service /etc/systemd/system/wardence-detector-service.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wardence-detector-service
+
+[Unit]
+Description=Wardence DL/HMM/SPC Detector Service
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<WARDENCE_USER>
+WorkingDirectory=<REPO_PATH>/p5_dl_hardening
+Environment=LOKI_URL=http://localhost:30100
+ExecStart=<VENV_PATH>/bin/uvicorn detector_service:app --host 0.0.0.0 --port 8010
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
