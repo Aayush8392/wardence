@@ -54,6 +54,15 @@ Environment=PROMETHEUS_URL=http://localhost:30090
 # Must exist and be owned by <WARDENCE_USER> before first start:
 #   sudo mkdir -p /var/lib/wardence/state && sudo chown <WARDENCE_USER> /var/lib/wardence/state
 Environment=WARDENCE_STATE_DIR=/var/lib/wardence/state
+# Per-environment durability-window overrides (2026-08-2x) -- real
+# recovery timing differs by hardware (confirmed: crash-loop/carts
+# ~103-111s here vs. ~30s on the original WSL2/x86 dev machine, against
+# a shared 120s default in verifier.py's DURABILITY_WINDOWS). Uncomment
+# and set per class ONLY once that class's real recovery time has
+# actually been measured on this host -- do not guess ahead of real
+# data. See wardence_buildlog.md's matching session for the full
+# reasoning and the env var name for every other class.
+Environment=DURABILITY_WINDOW_CRASH_LOOP_S=180
 ExecStart=<VENV_PATH>/bin/uvicorn operator_api:app --host 0.0.0.0 --port 8002
 Restart=on-failure
 RestartSec=5

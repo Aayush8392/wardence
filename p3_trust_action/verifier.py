@@ -20,19 +20,29 @@ import requests
 
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
 
-# Seconds, per the locked fault taxonomy (wardence_context.md).
+# Seconds, per the locked fault taxonomy (wardence_context.md). Each
+# value is real-measured PER ENVIRONMENT (JVM cold-start/readinessProbe
+# delay costs genuinely differ by hardware -- confirmed 2026-08-2x,
+# `crash-loop`/`carts` alone measured ~103-111s real recovery on
+# wardence-prod's arm64 box vs. ~30s on the original WSL2/x86 dev
+# machine, ~3.5x). Individually env-overridable so a slower/faster
+# deployment can correct just the classes it's actually measured,
+# without touching the others or forking this file -- same pattern as
+# PROMETHEUS_URL. Unset env vars fall back to these original,
+# WSL2-dev-measured defaults, so local behavior is completely unchanged
+# unless a var is explicitly set.
 DURABILITY_WINDOWS = {
-    "crash-loop": 120,
-    "oom": 180,
-    "disk-full": 120,
+    "crash-loop": int(os.environ.get("DURABILITY_WINDOW_CRASH_LOOP_S", "120")),
+    "oom": int(os.environ.get("DURABILITY_WINDOW_OOM_S", "180")),
+    "disk-full": int(os.environ.get("DURABILITY_WINDOW_DISK_FULL_S", "120")),
     # cpu-throttling: a transient CPU-scheduling effect, not a lingering
     # leak/growth pattern -- matches crash-loop/disk-full's shorter tier
     # rather than oom/memory-leak's 3min.
-    "cpu-throttling": 120,
+    "cpu-throttling": int(os.environ.get("DURABILITY_WINDOW_CPU_THROTTLING_S", "120")),
     # Nominal target for the custom active-probe branch below -- not
     # used by the generic poll loop, since this class bypasses it.
-    "under-provisioned-replicas": 90,
-    "bad-rollout": 120,
+    "under-provisioned-replicas": int(os.environ.get("DURABILITY_WINDOW_UNDER_PROVISIONED_REPLICAS_S", "90")),
+    "bad-rollout": int(os.environ.get("DURABILITY_WINDOW_BAD_ROLLOUT_S", "120")),
 }
 
 # Same real-measured margin as injector.py's CPU_THROTTLE_MIN_PERIODS_INCREASE
