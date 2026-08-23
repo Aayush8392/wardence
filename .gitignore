@@ -160,6 +160,12 @@ p2_readonly_loop/cloudflare_model_version_log.jsonl
 # backfill if the state is ever lost).
 p5_dl_hardening/pipeline_state/
 
+# Oracle A1 instance SSH key pair -- never committed, only way in to the
+# real deployed host
+ssh-key-*.key
+ssh-key-*.key.pub
+*.pem
+
 # Live ServiceAccount credential -- never committed
 p3_trust_action/sa_token.txt
 
