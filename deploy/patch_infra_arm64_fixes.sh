@@ -31,16 +31,14 @@ echo
 echo "-- catalogue-db / user-db: real GHCR arm64 rebuilds --"
 for dep in catalogue-db user-db; do
   image="${REGISTRY}/${dep}:0.3.0-arm64"
-  echo "   checking ${image} exists before patching ${dep}..."
-  # A cheap existence check via crictl pull avoids patching the Deployment
-  # to a tag that doesn't exist yet, which would just trade one crash
-  # loop (ImagePullBackOff) for another.
-  if ! sudo k3s crictl pull "${image}" >/dev/null 2>&1; then
-    echo "ERROR: ${image} not found or not pullable." >&2
-    echo "       Run deploy/rebuild_arm64_${dep//-/_}.sh on your docker+buildx" >&2
-    echo "       machine (WSL2) first, then re-run this script." >&2
-    exit 1
-  fi
+  # NOTE: no pre-flight existence check here -- `k3s crictl pull` doesn't
+  # use the Kubernetes imagePullSecret (that's a kubelet-level mechanism
+  # via ghcr-pull-secret, wired up in provision_wardence_prod.sh); it only
+  # consults containerd's own registry auth config, which isn't set up.
+  # Against a real PRIVATE GHCR image that gives a false "not found"
+  # every time, even for an image that pulls fine via kubelet. If the
+  # image genuinely doesn't exist yet, `kubectl rollout status` below
+  # will time out and report it clearly instead.
   echo "   ${dep} -> ${image}"
   kubectl set image "deployment/${dep}" "${dep}=${image}" -n "${NAMESPACE}"
 done
