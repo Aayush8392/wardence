@@ -163,7 +163,7 @@ import requests
 
 from agent import OOM_STICKY_MAX_CONTAINER_AGE_S
 
-PROMETHEUS_URL = "http://localhost:9090"
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
 MAX_INJECT_ATTEMPTS = 3
 EFFECT_VERIFY_TIMEOUT_S = 35  # covers kube-state-metrics' ~30s scrape cycle
 EFFECT_VERIFY_POLL_S = 5

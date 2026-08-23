@@ -10,6 +10,7 @@ other two -- see _make_disk_full_check.
 """
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -17,7 +18,7 @@ import uuid
 
 import requests
 
-PROMETHEUS_URL = "http://localhost:9090"
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
 
 # Seconds, per the locked fault taxonomy (wardence_context.md).
 DURABILITY_WINDOWS = {

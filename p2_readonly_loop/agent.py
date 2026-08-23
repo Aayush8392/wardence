@@ -13,6 +13,7 @@ Usage:
     Then: POST http://localhost:8000/diagnose  {"target": "carts", "namespace": "sock-shop"}
 """
 
+import os
 import re
 import subprocess
 import uuid
@@ -21,7 +22,7 @@ import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-PROMETHEUS_URL = "http://localhost:9090"
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090")
 
 # p5_dl_hardening/detector_service.py -- plain hardcoded local constant,
 # matching PROMETHEUS_URL's own pattern (this project's standing local-
