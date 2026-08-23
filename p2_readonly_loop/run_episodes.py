@@ -74,7 +74,13 @@ class _Tee:
 # overnight batches -- this script previously had neither, which was
 # fine for short manual runs but a real gap for a multi-hour unattended
 # batch of report-only classes.
-PROMETHEUS_HEALTH_URL = "http://localhost:9090/-/healthy"
+# Env-overridable, same pattern/reasoning as injector.py's own
+# PROMETHEUS_URL (2026-08-2x, found on wardence-prod: this constant was
+# missed in that earlier fix pass -- a hardcoded localhost:9090 here
+# made run_batch_plan.py's own infra-readiness check unreachable on any
+# host using a different real Prometheus endpoint, e.g. wardence-prod's
+# NodePort at :30090, even with PROMETHEUS_URL correctly exported).
+PROMETHEUS_HEALTH_URL = os.environ.get("PROMETHEUS_URL", "http://localhost:9090") + "/-/healthy"
 # P2's agent (unlike p3_agent) has no dedicated lightweight health
 # endpoint -- /diagnose does real work, so hitting it as a health check
 # would be wasteful and could itself pollute the DB. /openapi.json is

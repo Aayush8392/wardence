@@ -261,7 +261,7 @@ re-validate). This resolves the placement ambiguity that used to block
   `PROMETHEUS_URL` env var (done, 2026-08-23 -- defaults to
   `http://localhost:9090`, unaffected until set) -> set to
   `http://localhost:30090` on the Oracle host.
-- **Process supervision**: three systemd unit templates, same
+- **Process supervision**: four systemd unit templates, same
   placeholder convention (user/paths, filled in with real values at
   install time) -- `deploy/operator-api.service` (port 8002),
   `deploy/p3-agent.service` (port 8001, the real diagnosis/action
@@ -269,8 +269,12 @@ re-validate). This resolves the placement ambiguity that used to block
   `deploy/detector-service.service` (port 8010, DL/HMM/SPC anomaly
   fallback -- needed for `oom`/`bad-rollout`/`network-latency`/
   `network-partition`/`cpu-throttling`/`under-provisioned-replicas`, not
-  needed for `crash-loop`). A bare `uvicorn` process has no self-healing
-  on its own; these restart it on crash and survive a reboot.
+  needed for `crash-loop`), `deploy/p2-agent.service` (port 8000, P2's
+  legacy standalone agent -- no real pipeline code calls it any more,
+  but `run_episodes.py`'s own infra pre-flight check, used by
+  `run_batch_plan.py`, does; found missing during `disk-full`
+  re-validation). A bare `uvicorn` process has no self-healing on its
+  own; these restart it on crash and survive a reboot.
   - `detector-service.service` needs its own Python deps
     (`pip install -r p5_dl_hardening/requirements.txt` -- **install
     torch separately first**, `pip install torch --index-url

@@ -1,0 +1,44 @@
+# systemd unit for p2_readonly_loop/agent.py (P2's legacy standalone
+# read-only diagnosis agent, port 8000) on the Oracle host -- same
+# process-supervision need as operator-api.service/p3-agent.service.
+#
+# Added 2026-08-2x, found while re-validating disk-full: nothing in the
+# real production pipeline calls this over HTTP any more (p3_agent.py
+# uses its own /diagnose + /act, never P2's agent.py) -- BUT
+# run_episodes.py's own wait_for_infra_ready() (used by
+# run_batch_plan.py, the real tool used to generate every historical
+# episode) DOES check this port's /openapi.json as part of its infra
+# pre-flight, alongside Prometheus. That dependency was missed in the
+# earlier systemd audit (which correctly found no OTHER real caller and
+# concluded "not needed") -- this closes that gap so run_batch_plan.py
+# works on wardence-prod the same way it always has on WSL2 dev, rather
+# than changing what the check itself verifies.
+#
+# NOT yet installed anywhere -- this is a template, same placeholder
+# convention as operator-api.service:
+#   - <WARDENCE_USER>: the real Linux user this should run as (never root)
+#   - <REPO_PATH>: real absolute path to the cloned repo on the Oracle host
+#   - <VENV_PATH>: real absolute path to the Python venv with dependencies
+#     installed
+#
+# Install:
+#   sudo cp deploy/p2-agent.service /etc/systemd/system/wardence-p2-agent.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wardence-p2-agent
+
+[Unit]
+Description=Wardence P2 Legacy Read-Only Agent (infra-check dependency only)
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<WARDENCE_USER>
+WorkingDirectory=<REPO_PATH>/p2_readonly_loop
+Environment=PROMETHEUS_URL=http://localhost:30090
+ExecStart=<VENV_PATH>/bin/uvicorn agent:app --host 0.0.0.0 --port 8000
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
