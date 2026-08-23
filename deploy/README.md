@@ -178,6 +178,46 @@ confirmation window is known too tight on this project's current hardware
 here means it failed; check the pod directly per the script's own printed
 guidance.
 
+**Real, non-obvious startup gaps found deploying this on `wardence-prod`
+(2026-08-23), all now fixed/documented so a future from-scratch deploy
+doesn't hit them blind:**
+- `python-dotenv` was missing from `p3_trust_action/requirements.txt`
+  despite `model_backend.py` (imported transitively via `operator_api.py`
+  -> `publish_to_r2.py` -> `circuit_breaker.py` -> `react_agent.py`)
+  requiring it -- crashed the service on first start. **Fixed**: added
+  to `requirements.txt` directly, no manual `pip install` needed going
+  forward.
+- **A genuinely fresh `wardence.db` has no `episodes` table** --
+  `operator_api.py`'s own startup reconciliation assumes the base schema
+  already exists (it does an `ALTER TABLE episodes ADD COLUMN ...`), but
+  nothing has ever run `injector.py`/`p3_scorer.py` against a brand-new
+  DB to create it. **Real, one-time fix needed before `operator_api.py`'s
+  very first start on ANY fresh deployment**:
+  ```bash
+  cd p2_readonly_loop
+  python3 -c "import injector; injector.ensure_db()"
+  ```
+  (safe, idempotent -- creates `episodes`/`system_lock`/etc. without
+  injecting any real fault.)
+- `jwt_secret.txt` doesn't exist until `mint_token.py` is run at least
+  once (even just `--help` triggers its auto-generation) -- confirmed
+  the real login flow 500s with `RuntimeError: jwt_secret.txt not found`
+  until this runs. Run once, before the systemd service's first start:
+  ```bash
+  cd p3_trust_action && python mint_token.py --help
+  ```
+- **Real, confirmed-benign finding, not a bug**: `memory-leak`'s
+  `LeakAgent` shows a persistent `last_error=... InstanceNotFoundException:
+  Tomcat:type=GlobalRequestProcessor,name="http-nio-80"` in its status
+  file even once healthy. Verified via a local-attach MBean probe (same
+  technique as the earlier `ThreadPoolTimingProbe.java` session) that the
+  real MBean genuinely exists and is being read successfully
+  (`sync_mbean_unavailable=false`) -- the sticky `last_error` field is
+  just never cleared after a one-time boot-race error (agent's `premain`
+  attaches before Spring Boot's embedded Tomcat connector finishes
+  registering). Don't chase this field if it shows up again on a future
+  redeploy; check `sync_mbean_unavailable` instead.
+
 ## 5. Backend config for public exposure
 
 **Placement decided 2026-08-23: `operator_api.py` runs as a bare process

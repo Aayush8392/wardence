@@ -7,3 +7,4 @@ boto3
 bcrypt
 pyotp
 httpx
+python-dotenv
