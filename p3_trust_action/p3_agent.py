@@ -482,7 +482,15 @@ def _build_llm_tools(
 # (operator_api.py's LIVE_TRIGGER_LOG_DIR), reused here rather than
 # inventing a second mechanism for the same "cross-process, low-latency,
 # no new infra" real need.
-REASONING_STREAM_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_reasoning_streams"
+# WARDENCE_STATE_DIR override (2026-08-23, Qwen review 63) -- must match
+# operator_api.py's identical logic exactly, since both processes need to
+# agree on the same real directory (same-machine, file-based IPC).
+_STATE_DIR_OVERRIDE = os.environ.get("WARDENCE_STATE_DIR")
+REASONING_STREAM_DIR = (
+    Path(_STATE_DIR_OVERRIDE) / "reasoning_streams"
+    if _STATE_DIR_OVERRIDE
+    else Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_reasoning_streams"
+)
 REASONING_STREAM_DIR.mkdir(parents=True, exist_ok=True)
 
 

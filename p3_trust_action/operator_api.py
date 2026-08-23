@@ -515,7 +515,17 @@ SCORER_TIMEOUT_S = 400
 # (Kimi review 36 finding 2/7 -- a file, not a DB poll, since injector.py
 # has no DB connection). One file per episode so a stale leftover file
 # from a previous episode can never fire on the wrong one.
-STOP_FILE_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_stop_files"
+# WARDENCE_STATE_DIR override (2026-08-23, Qwen review 63): on a deployed
+# host /tmp may be a tmpfs mount subject to systemd-tmpfiles age-based
+# cleanup, which could silently delete a stuck episode's stop/evidence
+# file. Unset (local WSL2 dev) -- identical behavior to before. Set
+# (deployment) -- points these dirs at a persistent, non-tmpfs path.
+_STATE_DIR_OVERRIDE = os.environ.get("WARDENCE_STATE_DIR")
+STOP_FILE_DIR = (
+    Path(_STATE_DIR_OVERRIDE) / "stop_files"
+    if _STATE_DIR_OVERRIDE
+    else Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_stop_files"
+)
 STOP_FILE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Real per-episode injector.py output, for live debugging (see
@@ -523,7 +533,11 @@ STOP_FILE_DIR.mkdir(parents=True, exist_ok=True)
 # earlier DEVNULL/PIPE attempt). Not auto-cleaned -- small, human-
 # readable text files, left for manual inspection/cleanup same as the
 # stop-file convention.
-LIVE_TRIGGER_LOG_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_trigger_logs"
+LIVE_TRIGGER_LOG_DIR = (
+    Path(_STATE_DIR_OVERRIDE) / "trigger_logs"
+    if _STATE_DIR_OVERRIDE
+    else Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_trigger_logs"
+)
 LIVE_TRIGGER_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Same real dir p3_agent.py's REASONING_STREAM_DIR resolves to (both
@@ -533,7 +547,11 @@ LIVE_TRIGGER_LOG_DIR.mkdir(parents=True, exist_ok=True)
 # existing "duplicated by hand, kept in sync" convention for the handful
 # of things genuinely shared between agent-side and API-side code
 # (FAULT_CLASSES, FIELD_GUIDANCE, DETERMINISTIC_ACTION_MAP).
-REASONING_STREAM_DIR = Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_reasoning_streams"
+REASONING_STREAM_DIR = (
+    Path(_STATE_DIR_OVERRIDE) / "reasoning_streams"
+    if _STATE_DIR_OVERRIDE
+    else Path("/tmp") if Path("/tmp").exists() else Path.home() / "wardence_reasoning_streams"
+)
 # Real polling cadence for tailing the reasoning-events file below --
 # fast enough to feel live (token-by-token gemma reasoning arrives in
 # a burst of small chunks), cheap enough not to matter (a few hundred
