@@ -69,8 +69,8 @@ ENV MONGO_HOST=mytestdb:27017
 ENV HATEAOS=user
 ENV USER_DATABASE=mongodb
 COPY --from=build /app/user /app/user
-ENTRYPOINT ["/app/user"]
-EXPOSE 8084
+ENTRYPOINT ["/app/user", "-port=80"]
+EXPOSE 80
 EOF
 
 echo "Building linux/arm64 image and pushing to ghcr.io/${GHCR_USER}/user:${IMAGE_TAG}-arm64 ..."
