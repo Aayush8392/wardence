@@ -23,6 +23,11 @@
 # WSL2 dev (x86 image, whatever limits are set there) and wardence-prod
 # (arm64 image, 1Gi) -- no per-environment values, no flags.
 #
+# imagePullPolicy fixed to Always 2026-08-2x (same reasoning as carts'
+# own patch, patch_carts_readiness_and_jvm_tuning.sh -- carts-warm
+# mirrors carts' image tag exactly, so it inherits the same same-tag
+# staleness risk on any rebuild-and-repush).
+#
 # Usage: bash deploy_carts_warm_standby.sh
 
 set -euo pipefail
@@ -80,7 +85,7 @@ spec:
       containers:
         - name: carts
           image: ${CARTS_IMAGE}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           ports:
             - containerPort: 80
               protocol: TCP

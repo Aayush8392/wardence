@@ -205,18 +205,24 @@ doesn't hit them blind:**
   requiring it -- crashed the service on first start. **Fixed**: added
   to `requirements.txt` directly, no manual `pip install` needed going
   forward.
-- **A genuinely fresh `wardence.db` has no `episodes` table** --
-  `operator_api.py`'s own startup reconciliation assumes the base schema
-  already exists (it does an `ALTER TABLE episodes ADD COLUMN ...`), but
-  nothing has ever run `injector.py`/`p3_scorer.py` against a brand-new
-  DB to create it. **Real, one-time fix needed before `operator_api.py`'s
-  very first start on ANY fresh deployment**:
+- **A genuinely fresh `wardence.db` is missing tables** -- not just
+  `episodes` (`operator_api.py`'s own startup reconciliation assumes the
+  base schema already exists, doing an `ALTER TABLE episodes ADD COLUMN
+  ...`), but every other table that's only ever lazily created as a side
+  effect of some code path actually running (`scores`/`episode_snapshots`
+  from `p3_scorer.py`, `comparison_sampling_log` from `p3_agent.py`, and
+  others) -- hit for real, twice, as two separate crashes on two separate
+  fresh-DB code paths (`wardence_buildlog.md`'s 2026-08-2x sessions).
+  **Real, one-time fix needed before ANY fresh deployment's first start**
+  (run once, before `operator_api.py`/`p3_agent.py`'s systemd units are
+  started for the first time):
   ```bash
-  cd p2_readonly_loop
-  python3 -c "import injector; injector.ensure_db()"
+  python3 deploy/bootstrap_fresh_db.py
   ```
-  (safe, idempotent -- creates `episodes`/`system_lock`/etc. without
-  injecting any real fault.)
+  (safe, idempotent -- every underlying `ensure_*_table` call is
+  `CREATE TABLE IF NOT EXISTS`; calls every known one across the codebase
+  in one pass, from the repo root with the venv activated, so a future
+  untested code path doesn't surface its own missing table blind.)
 - `jwt_secret.txt` doesn't exist until `mint_token.py` is run at least
   once (even just `--help` triggers its auto-generation) -- confirmed
   the real login flow 500s with `RuntimeError: jwt_secret.txt not found`
@@ -255,11 +261,34 @@ re-validate). This resolves the placement ambiguity that used to block
   `PROMETHEUS_URL` env var (done, 2026-08-23 -- defaults to
   `http://localhost:9090`, unaffected until set) -> set to
   `http://localhost:30090` on the Oracle host.
-- **Process supervision**: `deploy/operator-api.service` -- a systemd
-  unit template (placeholders for user/paths/domain, not yet filled in
-  with real values -- needs the real Vercel domain and a real venv path
-  first). A bare `uvicorn` process has no self-healing on its own; this
-  is what restarts it on crash.
+- **Process supervision**: three systemd unit templates, same
+  placeholder convention (user/paths, filled in with real values at
+  install time) -- `deploy/operator-api.service` (port 8002),
+  `deploy/p3-agent.service` (port 8001, the real diagnosis/action
+  endpoint every `/trigger` path calls through -- needed, not optional),
+  `deploy/detector-service.service` (port 8010, DL/HMM/SPC anomaly
+  fallback -- needed for `oom`/`bad-rollout`/`network-latency`/
+  `network-partition`/`cpu-throttling`/`under-provisioned-replicas`, not
+  needed for `crash-loop`). A bare `uvicorn` process has no self-healing
+  on its own; these restart it on crash and survive a reboot.
+  - `detector-service.service` needs its own Python deps
+    (`pip install -r p5_dl_hardening/requirements.txt` -- **install
+    torch separately first**, `pip install torch --index-url
+    https://download.pytorch.org/whl/cpu`, see that file's own header;
+    a plain `pip install torch` pulls the full GPU/CUDA build, wrong on
+    a CPU-only host) and its real trained model artifacts
+    (`p5_dl_hardening/pipeline_state/` -- gitignored, ~464MB, trained on
+    real historical Loki data on the original dev machine, not
+    reproducible on a fresh cluster with no log history yet -- `scp -r`
+    it over from the dev machine, same as the two `.env` files below).
+  - `detector-service.service` also needs Loki reachable via a NodePort
+    (`bash p2_readonly_loop/patch_loki_nodeport.sh`, same shape as
+    Prometheus' -- exposes it at `http://localhost:30100`, matching
+    `LOKI_URL` in the unit template).
+  - **Before starting `operator-api.service`/`p3-agent.service` for the
+    first time on any fresh DB**: `python3 deploy/bootstrap_fresh_db.py`
+    (see the fresh-`wardence.db` gotcha above -- creates every table
+    either process' first real request would otherwise hit blind).
 - **`--host 0.0.0.0`**: baked into the systemd unit's `ExecStart` above,
   not a separate step.
 - **Secrets**: NOT a new mechanism -- confirmed 2026-08-23 that two real

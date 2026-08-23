@@ -35,6 +35,16 @@
 #    same "don't assume timing/resource numbers transfer to new
 #    hardware" discipline as everything else in deploy/README.md.
 #
+# 4. Real imagePullPolicy fix, folded in 2026-08-2x: was previously only
+#    a live, uncommitted `kubectl patch` run by hand after discovering a
+#    same-tag arm64 rebuild (0.4.8-arm64) wasn't actually re-pulled on
+#    `rollout restart` (the node reused its locally-cached image under
+#    the reused tag -- see wardence_buildlog.md's matching session for
+#    the full `imageID`-diffing story). `IfNotPresent` (the k8s default
+#    when unset) is wrong for any image tag this project rebuilds and
+#    re-pushes without bumping the tag -- `Always` makes every rollout
+#    restart genuinely re-pull.
+#
 # Usage: bash patch_carts_readiness_and_jvm_tuning.sh
 
 set -euo pipefail
@@ -51,6 +61,7 @@ kubectl patch deployment "$DEPLOYMENT" -n "$NAMESPACE" --type=strategic -p '
         "containers": [
           {
             "name": "carts",
+            "imagePullPolicy": "Always",
             "env": [
               {"name": "JAVA_TOOL_OPTIONS", "value": "-Djava.security.egd=file:/dev/./urandom -Dspring.jmx.enabled=false"},
               {"name": "SPRING_MAIN_LAZY_INITIALIZATION", "value": "true"}

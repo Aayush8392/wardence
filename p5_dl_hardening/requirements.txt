@@ -1,0 +1,28 @@
+# Real dependencies for p5_dl_hardening (DeepLog/HMM/SPC detector +
+# detector_service.py), collected from the actual imports across this
+# directory's .py files -- never existed as a file before 2026-08-2x.
+# These were only ever installed ad hoc on the original WSL2 dev machine;
+# a fresh host (wardence-prod) had none of them, discovered only when
+# detector_service.py failed to start (see wardence_buildlog.md's
+# matching session).
+#
+# CPU-only torch, real and load-bearing, not a suggestion: `pip install
+# torch` with no index pin pulls the full GPU/CUDA build (several
+# hundred MB of nvidia-* packages) -- wrong for any host without a GPU,
+# confirmed live on wardence-prod (Oracle A1, arm64, CPU-only). Install
+# with:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r p5_dl_hardening/requirements.txt
+# (torch deliberately left out of this file so the CPU-index install
+# above is never accidentally skipped in favor of a plain
+# `pip install -r requirements.txt` pulling the GPU build instead.)
+
+fastapi
+uvicorn
+pydantic
+numpy
+pandas
+scipy
+scikit-learn
+hmmlearn
+drain3
