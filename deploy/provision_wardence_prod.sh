@@ -85,6 +85,19 @@ cp /etc/rancher/k3s/k3s.yaml "${REAL_HOME}/.kube/config"
 chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.kube/config"
 chmod 600 "${REAL_HOME}/.kube/config"
 
+# Real gotcha found live (2026-08-23): `k3s kubectl` (what the symlink
+# below actually runs) does NOT follow the standard kubectl convention of
+# defaulting to ~/.kube/config -- it only checks $KUBECONFIG, defaulting
+# to the root-only /etc/rancher/k3s/k3s.yaml if unset, which a non-root
+# user can't read ("permission denied" even with a valid ~/.kube/config
+# sitting right there). Must export KUBECONFIG explicitly.
+if ! grep -q "^export KUBECONFIG=" "${REAL_HOME}/.bashrc" 2>/dev/null; then
+  echo 'export KUBECONFIG=~/.kube/config' >> "${REAL_HOME}/.bashrc"
+  chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.bashrc"
+fi
+echo "   KUBECONFIG export added to ${REAL_HOME}/.bashrc -- start a new"
+echo "   shell (or 'source ~/.bashrc') before running kubectl commands."
+
 # k3s bundles its own kubectl; symlink so plain `kubectl` works too
 if ! command -v kubectl >/dev/null 2>&1; then
   ln -s "$(command -v k3s)" /usr/local/bin/kubectl
