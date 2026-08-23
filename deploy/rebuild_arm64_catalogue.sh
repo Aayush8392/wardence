@@ -86,6 +86,7 @@ echo "Building linux/arm64 image and pushing to ghcr.io/${GHCR_USER}/catalogue:$
 docker buildx build \
   --builder wardence-arm64-builder \
   --platform linux/arm64 \
+  --no-cache \
   -f Dockerfile.arm64 \
   -t "ghcr.io/${GHCR_USER}/catalogue:${IMAGE_TAG}-arm64" \
   --push \
