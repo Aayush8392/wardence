@@ -87,6 +87,8 @@ docker buildx build \
   --builder wardence-arm64-builder \
   --platform linux/arm64 \
   --no-cache \
+  --provenance=false \
+  --sbom=false \
   -f Dockerfile.arm64 \
   -t "ghcr.io/${GHCR_USER}/catalogue:${IMAGE_TAG}-arm64" \
   --push \
