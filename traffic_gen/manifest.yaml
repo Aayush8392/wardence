@@ -41,33 +41,34 @@ spec:
               value: "http://front-end.sock-shop.svc.cluster.local"
             # Request-synced GC trigger design (2026-08-22 session): lets
             # baseline.js pause just its own checkout step during a live
-            # memory-leak episode. Real, confirmed gap, not yet closed:
-            # operator_api.py runs as a bare `uvicorn` process on the WSL
-            # host (see its own module docstring), NOT as a cluster
-            # Service inside sock-shop -- and its usual launch command has
-            # no `--host 0.0.0.0`, so by default it's bound to loopback
-            # only and genuinely unreachable from any pod today, cluster-
-            # DNS or otherwise. Left empty deliberately -- baseline.js
-            # fails open when this is unset (checkout keeps firing
-            # normally, unchanged from before this feature existed).
-            # Real next step before this can work at all: confirm
-            # operator_api.py is launched with --host 0.0.0.0, then fill
-            # this in with the WSL2 node's real IP as seen from inside a
-            # pod (e.g. `kubectl exec` a shell in sock-shop and curl the
-            # candidate IP:8002/trust, which needs no auth) -- not guessed
-            # here, since it depends on this machine's real network
-            # topology at the time this is deployed.
-            # Real value confirmed reachable from inside a sock-shop pod,
-            # 2026-08-22 (wget from front-end -> 200 {"paused":false}) --
-            # this is the WSL2 node's own eth0 IP, where operator_api.py
-            # runs as a bare uvicorn process (--host 0.0.0.0 required, see
-            # the comment block above). NOT durable: this IP is assigned
-            # by WSL2 on each restart of the WSL2 instance and can change
-            # -- if traffic_gen's checkout-pause stops working after a
-            # reboot, re-verify with the same wget check before assuming a
-            # code regression.
+            # memory-leak episode. operator_api.py runs as a bare `uvicorn`
+            # process on the SAME NODE this pod is scheduled on (WSL2's
+            # node locally, the Oracle A1 VM on wardence-prod) -- never as
+            # a cluster Service, so there is no in-cluster DNS name for it
+            # in either environment. REQUIRES operator_api.py bound to
+            # `--host 0.0.0.0` (not the loopback-only default) in whichever
+            # environment this runs against, or the pod genuinely cannot
+            # reach it -- baseline.js fails open when unreachable (checkout
+            # keeps firing normally), so this degrades silently, not loudly.
+            #
+            # Fixed 2026-08-2x (superseding the old hardcoded-WSL2-IP
+            # version, `172.24.242.120`, confirmed non-durable across a
+            # WSL2 restart): resolved dynamically via the Downward API's
+            # `status.hostIP`, which is always the real IP of whichever
+            # node the pod lands on. On a single-node cluster (true for
+            # both WSL2 dev and wardence-prod today) that node IS the same
+            # host operator_api.py runs on -- so this needs no per-
+            # environment value and survives a WSL2 IP reassignment or a
+            # move to different hardware, as long as the cluster stays
+            # single-node. If this cluster is ever made multi-node, this
+            # stops being correct (the traffic-gen pod could land on a
+            # DIFFERENT node than operator_api.py) and needs revisiting.
+            - name: HOST_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             - name: OPERATOR_API_URL
-              value: "http://172.24.242.120:8002"
+              value: "http://$(HOST_IP):8002"
             - name: K6_PROMETHEUS_RW_SERVER_URL
               value: "http://monitoring-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090/api/v1/write"
             - name: K6_PROMETHEUS_RW_TREND_STATS

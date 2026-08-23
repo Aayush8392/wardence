@@ -149,19 +149,37 @@ after running both.
 
 ## 3. Traffic generator
 
-**Blocking real issue, not yet resolved**: `traffic_gen/manifest.yaml`'s
-`OPERATOR_API_URL` is hardcoded to a WSL2-internal IP
-(`172.24.242.120:8002`), confirmed non-durable even within the current
-environment (documented in the buildlog as a known caveat from the
-request-synced GC trigger work). Before deploying anywhere else, this
-needs to become the real in-cluster service DNS for `operator_api.py`
-(e.g. `wardence-operator-api.sock-shop.svc.cluster.local:8002`, once that
-service exists -- see section 5), not another hardcoded IP.
+**Fixed 2026-08-2x**: `traffic_gen/manifest.yaml`'s `OPERATOR_API_URL` used
+to be hardcoded to a WSL2-internal IP (`172.24.242.120:8002`), confirmed
+non-durable even within the WSL2 environment itself. Since
+`operator_api.py` runs as a bare host process (never an in-cluster
+Service, section 5) in both WSL2 dev and on `wardence-prod`, there is no
+in-cluster DNS name for it in either environment -- the real fix resolves
+the node's IP dynamically via the Downward API (`status.hostIP`), which is
+the same value in both places (the single node the pod is scheduled on IS
+the host `operator_api.py` runs on) and needs no per-environment edit.
+
+**Real prerequisite, either environment**: `operator_api.py` must be
+launched with `--host 0.0.0.0` (already baked into `deploy/operator-api.service`
+for wardence-prod; for local dev, override the docstring's default
+`uvicorn operator_api:app --reload --app-dir p3_trust_action --port 8002`
+command with `--host 0.0.0.0` added). Without this, the pod genuinely
+cannot reach it -- `baseline.js` fails open in that case (checkout keeps
+firing normally), so a misconfiguration here degrades silently, not
+loudly. Verify with a real request from inside the cluster, not assumed:
+`kubectl exec` a shell in any `sock-shop` pod and `wget -qO- $OPERATOR_API_URL/trust` (needs no auth).
+
+**Real, not-yet-checked risk specific to `wardence-prod`**: Oracle's Ubuntu
+image may have OS-level firewall rules (`iptables`/`ufw`) that block
+inbound port 8002 even for same-host/pod-originated traffic. If the wget
+check above fails with a connection timeout (not "connection refused"),
+check `sudo iptables -L -n | grep 8002` / `sudo ufw status` before assuming
+a code or networking bug.
 
 ```bash
 kubectl create configmap wardence-traffic-gen-scripts -n sock-shop \
   --from-file=traffic_gen/baseline.js --from-file=traffic_gen/burst.js --from-file=traffic_gen/run.sh
-kubectl apply -f traffic_gen/manifest.yaml   # after fixing OPERATOR_API_URL above
+kubectl apply -f traffic_gen/manifest.yaml
 ```
 
 ## 4. Memory-leak's production mechanism (JVM-attach agent)
