@@ -95,8 +95,27 @@ if ! grep -q "^export KUBECONFIG=" "${REAL_HOME}/.bashrc" 2>/dev/null; then
   echo 'export KUBECONFIG=~/.kube/config' >> "${REAL_HOME}/.bashrc"
   chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.bashrc"
 fi
-echo "   KUBECONFIG export added to ${REAL_HOME}/.bashrc -- start a new"
-echo "   shell (or 'source ~/.bashrc') before running kubectl commands."
+
+# Same class of gap, found 2026-08-2x during oom re-validation: manual CLI
+# runs of injector.py/p3_scorer.py/verifier.py have no connection to
+# operator-api.service's own systemd Environment=PROMETHEUS_URL (that only
+# covers the supervised process, not an interactive shell) -- every fresh
+# shell fell back to the code's own localhost:9090 default, which is
+# WSL2 dev's port-forward, not this host's real NodePort. Can't just
+# change the code's own default (would silently break WSL2 dev, which
+# uses a different port) -- same "no per-environment hardcoding" rule as
+# everything else in this file. Fixed the same way as KUBECONFIG above:
+# a permanent .bashrc export, safe to add even before section 1's Helm
+# install/patch_prometheus_nodeport.sh actually runs, since 30090 is a
+# fixed, hardcoded NodePort value (patch_prometheus_nodeport.sh's own
+# NODE_PORT constant), not something discovered at runtime.
+if ! grep -q "^export PROMETHEUS_URL=" "${REAL_HOME}/.bashrc" 2>/dev/null; then
+  echo 'export PROMETHEUS_URL=http://localhost:30090' >> "${REAL_HOME}/.bashrc"
+  chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.bashrc"
+fi
+echo "   KUBECONFIG + PROMETHEUS_URL exports added to ${REAL_HOME}/.bashrc --"
+echo "   start a new shell (or 'source ~/.bashrc') before running kubectl or"
+echo "   any manual injector.py/p3_scorer.py/verifier.py CLI command."
 
 # k3s bundles its own kubectl; symlink so plain `kubectl` works too
 if ! command -v kubectl >/dev/null 2>&1; then
