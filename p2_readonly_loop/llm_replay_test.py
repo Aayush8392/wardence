@@ -28,6 +28,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -50,6 +51,8 @@ FAULT_CLASSES = [
     "bad-rollout", "none",
 ]
 
+NETWORK_PARTITION_MAX_THROUGHPUT_BPS = int(os.environ.get("NETWORK_PARTITION_MAX_THROUGHPUT_BPS", "200"))
+
 PROMPT_TEMPLATE = """You are an SRE diagnosing a fault in a Kubernetes microservices cluster (Sock Shop). You are given raw tool output from Prometheus queries. Diagnose which ONE of these fault classes is present, or "none" if no anomaly is present:
 
 {classes}
@@ -62,7 +65,7 @@ Field meanings, WITH the real thresholds used to interpret each one (a null/fals
 - evicted_pods: non-empty -> disk-full.
 - crashlooping_pods: non-empty (and oom_pods/evicted_pods are empty) -> crash-loop.
 - p95_latency_ms (orders only): >= 300ms -> network-latency.
-- combined_throughput_bps (orders only): < 200 bytes/s -> network-partition (check this before network-latency).
+- combined_throughput_bps (orders only): < {network_partition_bps} bytes/s -> network-partition (check this before network-latency).
 - payment_stuck_not_ready: true -> init-failure.
 - session_db_replicas_hit_zero: true -> session-cart-failure.
 - heap_rise_kb (shipping only): >= 20000 KB (20 MiB) above the episode's own captured pre-injection heap floor -> memory-leak.
@@ -79,6 +82,7 @@ def build_prompt(tool_output: dict) -> str:
     return PROMPT_TEMPLATE.format(
         classes=", ".join(FAULT_CLASSES),
         tool_output=json.dumps(tool_output, indent=2),
+        network_partition_bps=NETWORK_PARTITION_MAX_THROUGHPUT_BPS,
     )
 
 

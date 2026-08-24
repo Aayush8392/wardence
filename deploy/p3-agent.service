@@ -32,6 +32,13 @@ User=<WARDENCE_USER>
 WorkingDirectory=<REPO_PATH>/p3_trust_action
 Environment=PROMETHEUS_URL=http://localhost:30090
 Environment=WARDENCE_STATE_DIR=/var/lib/wardence/state
+# network-partition's combined_throughput_bps diagnosis threshold: WSL2 dev's
+# real baseline was ~1900-2400 bytes/s (200 threshold, ~10-20x margin). Real
+# measurement on wardence-prod's hardware/CNI found a genuinely different-
+# magnitude baseline (~32-70 bytes/s, real fault reading 0) -- confirmed
+# via 3 baseline + 4 real-fault samples on 2026-08-24. 20 sits with clean
+# margin below the lowest observed real baseline and above the real fault.
+Environment=NETWORK_PARTITION_MAX_THROUGHPUT_BPS=20
 ExecStart=<VENV_PATH>/bin/uvicorn p3_agent:app --host 0.0.0.0 --port 8001
 Restart=on-failure
 RestartSec=5

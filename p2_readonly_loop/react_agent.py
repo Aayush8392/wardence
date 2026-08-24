@@ -66,6 +66,7 @@ NOT built here (Phase 2 IS built now, in a separate module):
   handful of times, don't trust the old single-shot-derived estimate.
 """
 import json
+import os
 from typing import Callable, Optional
 
 from model_backend import (
@@ -96,12 +97,14 @@ FAULT_CLASSES = [
 # CONNECTION_POOL_THRESHOLD/NETWORK_PARTITION_MAX_THROUGHPUT_BPS/
 # NETWORK_PARTITION_LATENCY_SATURATION_MS/CPU_THROTTLE_INCREASE_THRESHOLD/
 # UNDER_PROVISIONED_PROBE_THRESHOLD_MS by hand if any of those ever change.
-FIELD_GUIDANCE = """Field meanings and thresholds (a null/false/empty field means that signal did not fire):
+NETWORK_PARTITION_MAX_THROUGHPUT_BPS = int(os.environ.get("NETWORK_PARTITION_MAX_THROUGHPUT_BPS", "200"))
+
+FIELD_GUIDANCE = f"""Field meanings and thresholds (a null/false/empty field means that signal did not fire):
 - oom_pods: non-empty -> oom.
 - evicted_pods: non-empty -> disk-full.
 - crashlooping_pods: non-empty (and oom_pods/evicted_pods/front_end_image_pull_failing all empty/false) -> crash-loop. Check front_end_image_pull_failing (below) BEFORE concluding crash-loop -- a bad-rollout episode's own image-reset step can leave residual restart activity on front-end that satisfies this signal even when nothing is actually crash-looping; front_end_image_pull_failing is the more specific, direct signal and wins.
 - p95_latency_ms (orders only), if NOT null: >= 10000ms -> network-partition (a request hanging until client timeout, not organic latency -- the real network-latency mechanism only ever injects 500ms+jitter, so nothing that high can be real latency). >= 300ms and < 10000ms -> network-latency. Check p95_latency_ms BEFORE combined_throughput_bps below when p95_latency_ms is present -- confirmed via real production data (Kimi review 20) that combined_throughput_bps alone cannot reliably distinguish these two classes (real network-partition and real network-latency episodes' throughput readings genuinely overlap), but a present, non-null p95_latency_ms in either band above is a clean, reliable signal -- across all real ground-truth network-partition episodes checked, none ever showed a mid-range p95 value.
-- combined_throughput_bps (orders only): < 200 bytes/s -> network-partition, but ONLY if p95_latency_ms above is null or did not already give you an answer. This is a weaker, fallback signal, not a primary one, for this specific pair of classes.
+- combined_throughput_bps (orders only): < {NETWORK_PARTITION_MAX_THROUGHPUT_BPS} bytes/s -> network-partition, but ONLY if p95_latency_ms above is null or did not already give you an answer. This is a weaker, fallback signal, not a primary one, for this specific pair of classes.
 - payment_stuck_not_ready: true -> init-failure.
 - session_db_replicas_hit_zero: true -> session-cart-failure.
 - heap_rise_kb (shipping only): >= 20000 KB (20 MiB) above the episode's own captured pre-injection heap floor -> memory-leak.

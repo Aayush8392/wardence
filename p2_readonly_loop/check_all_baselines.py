@@ -24,6 +24,7 @@ tool, not something the agent itself calls.
 """
 
 import argparse
+import os
 import subprocess
 import sys
 
@@ -37,7 +38,7 @@ NAMESPACE = "sock-shop"
 OOM_BASELINE_MEMORY_LIMIT = "200Mi"
 CPU_THROTTLE_BASELINE_CPU_LIMIT = "300m"
 UNDER_PROVISIONED_BASELINE_REPLICAS = 1
-FRONT_END_IMAGE_BASELINE = "weaveworksdemos/front-end:0.3.12"
+FRONT_END_IMAGE_BASELINE = os.environ.get("FRONT_END_IMAGE_BASELINE", "weaveworksdemos/front-end:0.3.12")
 PAYMENT_READINESS_PATH_BASELINE = "/health"
 SESSION_DB_BASELINE_REPLICAS = 1
 QUEUE_MASTER_EPHEMERAL_LIMIT_BASELINE = "300Mi"

@@ -549,8 +549,8 @@ UNDER_PROVISIONED_LIVE_TRIGGER_VUS = 130
 # "old healthy pod keeps serving, new broken one never comes online"
 # realism as init-failure -- confirmed by the same RollingUpdate
 # mechanics already proven there.
-FRONT_END_IMAGE_BASELINE = "weaveworksdemos/front-end:0.3.12"
-FRONT_END_IMAGE_FAULT = "weaveworksdemos/front-end:0.3.12-wardence-badtag"
+FRONT_END_IMAGE_BASELINE = os.environ.get("FRONT_END_IMAGE_BASELINE", "weaveworksdemos/front-end:0.3.12")
+FRONT_END_IMAGE_FAULT = FRONT_END_IMAGE_BASELINE + "-wardence-badtag"
 
 
 def _parse_k6_p95_ms(stdout_text: str) -> float | None:

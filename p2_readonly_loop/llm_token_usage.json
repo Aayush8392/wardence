@@ -1,15 +1,15 @@
 {
   "network-partition": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 110,
-      "total_tokens": 539892,
+      "count": 112,
+      "total_tokens": 551966,
       "min_tokens": 0,
       "max_tokens": 7015,
-      "total_neurons": 8523.109006881714,
+      "total_neurons": 8721.236278533936,
       "min_neurons": 0.0,
       "max_neurons": 125.04545593261719,
-      "avg_tokens": 4908.109090909091,
-      "avg_neurons": 77.48280915347013
+      "avg_tokens": 4928.267857142857,
+      "avg_neurons": 77.8681810583387
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 134,
@@ -159,25 +159,25 @@
   },
   "disk-full": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 93,
-      "total_tokens": 397938,
+      "count": 96,
+      "total_tokens": 413417,
       "min_tokens": 0,
-      "max_tokens": 5767,
-      "total_neurons": 5304.054484367371,
+      "max_tokens": 7279,
+      "total_neurons": 5529.68175983429,
       "min_neurons": 0.0,
-      "max_neurons": 90.21817779541016,
-      "avg_tokens": 4278.903225806452,
-      "avg_neurons": 57.032843917928716
+      "max_neurons": 120.48181915283203,
+      "avg_tokens": 4306.427083333333,
+      "avg_neurons": 57.600851664940514
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
-      "count": 123,
-      "total_tokens": 530095,
+      "count": 124,
+      "total_tokens": 532266,
       "min_tokens": 0,
       "max_tokens": 7441,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 4309.715447154472,
+      "avg_tokens": 4292.467741935484,
       "avg_neurons": 0.0
     },
     "gemini:gemini-3-flash-preview": {
@@ -214,25 +214,25 @@
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 108,
-      "total_tokens": 48032,
+      "count": 110,
+      "total_tokens": 50475,
       "min_tokens": 0,
-      "max_tokens": 1096,
+      "max_tokens": 1350,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 444.74074074074076,
+      "avg_tokens": 458.8636363636364,
       "avg_neurons": 0.0
     },
     "openrouter:openai/gpt-oss-20b:free": {
-      "count": 12,
+      "count": 14,
       "total_tokens": 9379,
       "min_tokens": 0,
       "max_tokens": 970,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 781.5833333333334,
+      "avg_tokens": 669.9285714285714,
       "avg_neurons": 0.0
     }
   },

@@ -63,6 +63,7 @@ Environment=WARDENCE_STATE_DIR=/var/lib/wardence/state
 # data. See wardence_buildlog.md's matching session for the full
 # reasoning and the env var name for every other class.
 Environment=DURABILITY_WINDOW_CRASH_LOOP_S=180
+Environment=FRONT_END_IMAGE_BASELINE=ghcr.io/aayush8392/front-end:0.3.12-arm64
 ExecStart=<VENV_PATH>/bin/uvicorn operator_api:app --host 0.0.0.0 --port 8002
 Restart=on-failure
 RestartSec=5

@@ -75,7 +75,7 @@ CONNECTION_POOL_THRESHOLD = 100
 # blocks both). 200 sits with a large (~10-20x) real margin below
 # baseline and well above the small residual noise observed during a
 # real fault.
-NETWORK_PARTITION_MAX_THROUGHPUT_BPS = 200
+NETWORK_PARTITION_MAX_THROUGHPUT_BPS = int(os.environ.get("NETWORK_PARTITION_MAX_THROUGHPUT_BPS", "200"))
 
 # Real bug found live (2026-07-31, overnight batch): the throughput
 # check above can still miss a genuine partition -- confirmed via two
