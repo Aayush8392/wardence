@@ -66,7 +66,10 @@ CPU_THROTTLE_DURABILITY_MIN_INCREASE = 50
 K6_IMAGE = "grafana/k6:latest"
 UNDER_PROVISIONED_PROBE_VUS = 20
 UNDER_PROVISIONED_PROBE_DURATION_S = 20
-UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 200
+UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 140  # recalibrated 2026-08-25 from 200,
+# real post-CPU-fix (shipping @ 500m) measurements: healthy ceiling
+# 128.7ms (check_upr_post_scale_warmup.py, 8-rep post-Ready sweep),
+# under-provisioned floor 155.19ms (this session's earlier 3-run check).
 UNDER_PROVISIONED_PROBE_COUNT = 3
 UNDER_PROVISIONED_INTER_PROBE_SLEEP_S = 15
 # Real bug found and fixed (2026-07-24): scale_deployment (the fix
