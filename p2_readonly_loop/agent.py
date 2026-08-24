@@ -518,7 +518,37 @@ def query_prometheus(
         latency_result = _prom_instant_query(latency_query, snapshot_at)
         # k6's exported value is in SECONDS -- confirmed empirically
         # (2026-07-21), see injector.py's _orders_p95_latency_ms docstring.
-        p95_latency_ms = max((float(e["value"][1]) * 1000 for e in latency_result), default=None)
+        #
+        # Real fix (2026-08-24, after the checkout-flow /orders 500 bug
+        # was fixed -- see wardence_buildlog.md's network-latency
+        # validation session): before that fix, EVERY /orders request
+        # failed in ~4ms and this max() only ever saw fast-failing
+        # series, so a k6 client-timeout series (status="0", 60000ms,
+        # k6's own hard request-timeout ceiling, not an organic
+        # percentile) could never occur here in practice. Now that
+        # checkout succeeds, real congestion under a genuine 500ms
+        # network-latency fault can push a handful of individual
+        # requests all the way to that 60s ceiling -- confirmed live,
+        # a real network-latency episode produced a status="0" series
+        # pinned at exactly 60001ms. Since this p95_latency_ms feeds
+        # NETWORK_PARTITION_LATENCY_SATURATION_MS's ">= 10000ms ->
+        # network-partition" rule below, an un-filtered max() would
+        # misdiagnose that real network-latency episode as a partition.
+        # A k6 timeout is "we never got an answer," not "how slow was
+        # the answer" -- excluding status="0" (k6's convention for no
+        # real HTTP response received) restores the intended meaning.
+        # Real-tested both directions before locking: during a genuine
+        # network-partition, real completed (non-timeout) requests
+        # still land alongside the timeouts (confirmed live, p95~175ms
+        # on the surviving series) -- filtering doesn't produce None
+        # for a real partition, it correctly falls through to the
+        # combined_throughput_bps check below instead, which already
+        # cleanly separates partition from baseline.
+        completed_latency_result = [e for e in latency_result if e.get("metric", {}).get("status") != "0"]
+        p95_latency_ms = (
+            max(float(e["value"][1]) * 1000 for e in completed_latency_result)
+            if completed_latency_result else None
+        )
     else:
         p95_latency_ms = None
 
