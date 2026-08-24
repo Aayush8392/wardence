@@ -48,6 +48,30 @@ git clone --branch "${IMAGE_TAG}" --depth 1 "${SRC_REPO}" "${WORKDIR}/user"
 
 cd "${WORKDIR}/user"
 
+# Real fix (2026-08-24): the upstream Href struct's field is an
+# anonymous, unexported "string" -- confirmed via a live WSL2-vs-Oracle
+# comparison that the arm64 rebuild (golang:1.21) always serializes
+# _links as empty {} while WSL2's original image (built with the
+# original old Go toolchain) does not. Renaming to an exported field
+# name fixes this deterministically on any Go version -- see
+# wardence_buildlog.md's network-latency validation session for the
+# full investigation.
+echo "Patching users/links.go: Href.string -> Href.Href (exported field)..."
+python3 - <<'INNER'
+import re
+with open("users/links.go") as f:
+    src = f.read()
+new_src = src.replace(
+    'type Href struct {\n\tstring `json:"href"`\n}',
+    'type Href struct {\n\tHref string `json:"href"`\n}'
+)
+if new_src == src:
+    raise SystemExit("PATCH FAILED: exact string not found in links.go -- inspect file manually before continuing")
+with open("users/links.go", "w") as f:
+    f.write(new_src)
+print("Patched users/links.go successfully.")
+INNER
+
 echo "Real upstream Dockerfile (repo root) for reference:"
 cat Dockerfile
 
