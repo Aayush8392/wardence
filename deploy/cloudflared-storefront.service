@@ -1,0 +1,44 @@
+# systemd unit for a Cloudflare quick tunnel fronting the Sock Shop
+# storefront (the `front-end` pod) so a real visitor can reach it
+# directly, not just via kubectl port-forward / SSH tunnel.
+#
+# Depends on p2_readonly_loop/patch_frontend_nodeport.sh having been run
+# first -- that creates the NodePort (30079 -> 8079) this tunnel points
+# at, same "one-node-cluster, NodePort is reachable from the host
+# itself" reasoning as the Prometheus/Loki NodePorts.
+#
+# Same real quick-tunnel tradeoff as cloudflared-operator-api.service:
+# stable while this unit runs, changes to a new random URL if it ever
+# restarts. See that file's header for the full reasoning -- not
+# repeated here.
+#
+# Getting the real URL after first start:
+#   sudo journalctl -u wardence-tunnel-storefront -f
+# Look for a line like:
+#   https://some-random-words.trycloudflare.com
+# That URL is what goes into Vercel's VITE_STOREFRONT_URL env var.
+#
+# NOT yet installed anywhere -- this is a template. Assumes cloudflared
+# is already installed (see cloudflared-operator-api.service's header
+# for the one-time install steps -- same binary, don't reinstall).
+#
+# Install:
+#   bash p2_readonly_loop/patch_frontend_nodeport.sh   # do this FIRST
+#   sudo cp deploy/cloudflared-storefront.service /etc/systemd/system/wardence-tunnel-storefront.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wardence-tunnel-storefront
+#   sudo journalctl -u wardence-tunnel-storefront -f   # grab the printed URL, then Ctrl+C
+
+[Unit]
+Description=Wardence Cloudflare Quick Tunnel -- Storefront (NodePort 30079)
+After=network-online.target k3s.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:30079
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
