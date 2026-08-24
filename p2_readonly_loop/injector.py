@@ -2512,13 +2512,20 @@ def _restore_init_failure(cfg: dict):
     and waits for `kubectl rollout status` to confirm real recovery --
     never just assumes the patch API call succeeding means the fix
     landed (same 'verify real completion, not just API acceptance'
-    discipline as restore_from_disk_full). Confirmed empirically this
-    DOES succeed quickly on revert (unlike the fault-injecting patch,
-    which structurally can never succeed) -- the reverted template
-    matches the still-present, still-healthy OLD ReplicaSet exactly, so
-    Kubernetes just scales the broken one back to 0 rather than
-    creating a new pod. The broken ReplicaSet itself is left scaled to
-    0 afterward -- normal Kubernetes revision history, auto-pruned at
+    discipline as restore_from_disk_full). The reverted template
+    matches the still-present, still-healthy OLD ReplicaSet's hash, so
+    Kubernetes reuses that revision rather than creating a new one --
+    but scaling that revision back from 0 to 1 still spawns a genuinely
+    fresh Pod object either way (real, confirmed on wardence-prod,
+    2026-08-24 -- corrects this docstring's earlier "no new pod
+    creation" claim, which described the REVISION being reused, not the
+    pod), which must clear payment's own real readinessProbe
+    initialDelaySeconds=180s before it can report Ready -- the 90s
+    timeout below used to time out on this every single time
+    (cosmetic only, the pod always finished recovering correctly a few
+    seconds later) until bumped to clear that real floor with margin.
+    The broken ReplicaSet itself is left scaled to 0 afterward --
+    normal Kubernetes revision history, auto-pruned at
     revisionHistoryLimit (default 10), confirmed NOT to accumulate the
     same way the NetworkChaos iptables chains did -- no active purge
     needed, checked per the fault-injection cleanup discipline rather
@@ -2527,7 +2534,7 @@ def _restore_init_failure(cfg: dict):
     result = subprocess.run(
         [
             "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
-            "--timeout=90s",
+            "--timeout=240s",
         ],
         capture_output=True, text=True,
     )
