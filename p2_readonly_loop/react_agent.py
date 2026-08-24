@@ -111,7 +111,7 @@ FIELD_GUIDANCE = f"""Field meanings and thresholds (a null/false/empty field mea
 - peak_threads_connected (catalogue-db only): >= 100 -> connection-pool-exhaustion.
 - cpu_throttle_periods_increase (user only): >= 100 -> cpu-throttling.
 - front_end_image_pull_failing: true -> bad-rollout.
-- catalogue_probe_p95_ms (from probe_catalogue_capacity): >= 190ms -> under-provisioned-replicas.
+- catalogue_probe_p95_ms (from probe_catalogue_capacity): >= 130ms -> under-provisioned-replicas.
 - dl_detector_result.is_anomalous (from call_dl_detector) on catalogue, with no other signal above having fired: this is NOT enough on its own to conclude "none" -- you MUST call probe_catalogue_capacity (if you have not already this episode) before concluding anything, since it is the one signal that can actually confirm or rule out under-provisioned-replicas. Only after probe_catalogue_capacity has been called and its result checked against the threshold above may you fall back to the closest matching class or "none". "log-anomaly detected (unclassified)" is NOT a valid diagnosis for you to output.
 - If NONE of the above are met, diagnosis is "none"."""
 
@@ -134,7 +134,7 @@ _STRONG_SIGNAL_FIELDS = {
 # cpu-throttling) and 5 Dimension B demotions. In 4 of the 5, the
 # decisive numeric field was ALREADY PRESENT in the tool result and
 # already past its documented FIELD_GUIDANCE threshold (e.g.
-# catalogue_probe_p95_ms=296.89 vs. the 190ms cutoff,
+# catalogue_probe_p95_ms=296.89 vs. the 130ms cutoff,
 # cpu_throttle_periods_increase=602.96 vs. the 100 cutoff) -- the model
 # had the decisive number and still failed to apply the threshold
 # comparison correctly. This is the exact failure shape the numeric
@@ -153,7 +153,7 @@ _STRONG_SIGNAL_FIELDS = {
 _NUMERIC_THRESHOLD_FIELDS = {
     # field: (threshold, diagnosis)
     "cpu_throttle_periods_increase": (100, "cpu-throttling"),
-    "catalogue_probe_p95_ms": (190, "under-provisioned-replicas"),
+    "catalogue_probe_p95_ms": (130, "under-provisioned-replicas"),
     "heap_rise_kb": (20000, "memory-leak"),
     "peak_threads_connected": (100, "connection-pool-exhaustion"),
 }

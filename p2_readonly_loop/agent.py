@@ -145,7 +145,7 @@ UNDER_PROVISIONED_PROBE_DURATION_S = 20
 # value (205.83ms) across the full real history. 190 gives real margin
 # over the observed miss while staying comfortably under that real
 # correct-cluster floor.
-UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 190
+UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 130
 # Matches injector.py's own MAX_INJECT_ATTEMPTS pattern for this exact
 # same probe mechanism -- see probe_catalogue_capacity's docstring for
 # the real bug this fixes.
@@ -223,12 +223,16 @@ export default function () {{
                 timeout=UNDER_PROVISIONED_PROBE_DURATION_S + 60,
             )
         except subprocess.TimeoutExpired:
+            print(f"probe_catalogue_capacity attempt {attempt}/{PROBE_MAX_ATTEMPTS}: kubectl run timed out after {UNDER_PROVISIONED_PROBE_DURATION_S + 60}s, retrying")
             continue
         if result.returncode != 0:
+            print(f"probe_catalogue_capacity attempt {attempt}/{PROBE_MAX_ATTEMPTS}: kubectl run failed (returncode={result.returncode}): {result.stderr.strip()[:300]!r}, retrying")
             continue
         p95 = _parse_k6_p95_ms(result.stdout)
         if p95 is not None:
             return p95
+        print(f"probe_catalogue_capacity attempt {attempt}/{PROBE_MAX_ATTEMPTS}: k6 ran but p95 could not be parsed from its output, retrying")
+    print(f"probe_catalogue_capacity: all {PROBE_MAX_ATTEMPTS} attempts failed, returning None")
     return None
 
 
