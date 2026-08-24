@@ -30,6 +30,16 @@ echo "Waiting for rollout..."
 kubectl rollout status deployment/"$DEPLOYMENT" -n "$NAMESPACE" --timeout=200s
 
 echo
+echo "Patching $DEPLOYMENT: imagePullPolicy -> Always (real bug found"
+echo "2026-08-24: IfNotPresent let the node reuse a stale cached image"
+echo "under the same tag after an arm64 rebuild -- see"
+echo "wardence_buildlog.md's network-latency validation session, the"
+echo "user Href-struct fix)..."
+kubectl patch deployment "$DEPLOYMENT" -n "$NAMESPACE" -p \
+  '{"spec":{"template":{"spec":{"containers":[{"name":"user","imagePullPolicy":"Always"}]}}}}'
+kubectl rollout status deployment/"$DEPLOYMENT" -n "$NAMESPACE" --timeout=200s
+
+echo
 echo "Done. Confirm with:"
 echo "  kubectl get deployment user -n $NAMESPACE -o jsonpath='{.spec.template.spec.containers[0].env}{\"\n\"}'"
 echo "  (expect: [{\"name\":\"MONGO_HOST\",\"value\":\"user-db:27017\"}])"
