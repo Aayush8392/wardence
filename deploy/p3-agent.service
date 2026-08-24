@@ -39,6 +39,8 @@ Environment=WARDENCE_STATE_DIR=/var/lib/wardence/state
 # via 3 baseline + 4 real-fault samples on 2026-08-24. 20 sits with clean
 # margin below the lowest observed real baseline and above the real fault.
 Environment=NETWORK_PARTITION_MAX_THROUGHPUT_BPS=500 # real-recalibrated 2026-08-24 after the checkout-flow /orders 500 bug was fixed -- baseline throughput jumped ~2700-6900 bytes/s (was masked to 32-70 by the broken checkout), fault stays ~20-36
+Environment=PYTHONUNBUFFERED=1
+Environment=KUBECONFIG=/home/ubuntu/.kube/config
 ExecStart=<VENV_PATH>/bin/uvicorn p3_agent:app --host 0.0.0.0 --port 8001
 Restart=on-failure
 RestartSec=5

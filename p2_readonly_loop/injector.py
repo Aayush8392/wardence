@@ -494,7 +494,7 @@ CPU_THROTTLE_BASELINE_CPU_LIMIT = "300m"
 K6_IMAGE = "grafana/k6:latest"
 UNDER_PROVISIONED_VUS = 20
 UNDER_PROVISIONED_DURATION_S = 20
-UNDER_PROVISIONED_MIN_P95_MS = 190
+UNDER_PROVISIONED_MIN_P95_MS = 130
 UNDER_PROVISIONED_BASELINE_REPLICAS = 1
 # Real bug found and fixed 2026-08-06: check_safe()'s scale_deployment
 # bound used to only require proposed > current_replicas (1) -- "safe"

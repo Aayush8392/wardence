@@ -284,47 +284,47 @@
   },
   "under-provisioned-replicas": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 83,
-      "total_tokens": 732360,
+      "count": 91,
+      "total_tokens": 800693,
       "min_tokens": 0,
       "max_tokens": 11316,
-      "total_neurons": 10387.727204322815,
+      "total_neurons": 11446.154465675354,
       "min_neurons": 0.0,
       "max_neurons": 174.39999771118164,
-      "avg_tokens": 8823.614457831325,
-      "avg_neurons": 125.15333981111826
+      "avg_tokens": 8798.824175824177,
+      "avg_neurons": 125.78191720522366
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
-      "count": 105,
-      "total_tokens": 562955,
+      "count": 106,
+      "total_tokens": 567448,
       "min_tokens": 2004,
       "max_tokens": 8418,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 5361.476190476191,
+      "avg_tokens": 5353.2830188679245,
       "avg_neurons": 0.0
     },
     "openrouter:openai/gpt-oss-20b:free": {
-      "count": 11,
+      "count": 19,
       "total_tokens": 10225,
       "min_tokens": 0,
       "max_tokens": 1206,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 929.5454545454545,
+      "avg_tokens": 538.1578947368421,
       "avg_neurons": 0.0
     },
     "groq:openai/gpt-oss-120b": {
-      "count": 107,
-      "total_tokens": 73948,
+      "count": 108,
+      "total_tokens": 75131,
       "min_tokens": 0,
       "max_tokens": 1221,
       "total_neurons": 0.0,
       "min_neurons": 0.0,
       "max_neurons": 0.0,
-      "avg_tokens": 691.1028037383178,
+      "avg_tokens": 695.6574074074074,
       "avg_neurons": 0.0
     }
   },
@@ -512,15 +512,15 @@
   },
   "memory-leak": {
     "cloudflare:@cf/google/gemma-4-26b-a4b-it": {
-      "count": 116,
-      "total_tokens": 317062,
+      "count": 122,
+      "total_tokens": 338060,
       "min_tokens": 0,
-      "max_tokens": 3451,
-      "total_neurons": 4679.018117904663,
+      "max_tokens": 4032,
+      "total_neurons": 4993.9817543029785,
       "min_neurons": 0.0,
-      "max_neurons": 51.77272605895996,
-      "avg_tokens": 2733.293103448276,
-      "avg_neurons": 40.336363085385024
+      "max_neurons": 67.34545707702637,
+      "avg_tokens": 2770.9836065573772,
+      "avg_neurons": 40.93427667461458
     },
     "deepinfra:nvidia/Nemotron-3-Nano-30B-A3B": {
       "count": 123,

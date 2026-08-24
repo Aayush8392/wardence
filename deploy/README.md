@@ -118,6 +118,7 @@ bash patch_catalogue_and_queue_master_readiness.sh
 bash patch_carts_readiness_and_jvm_tuning.sh
 bash patch_orders_jvm_tuning.sh
 bash patch_rollout_strategy_masking.sh
+bash patch_shipping_cpu_limit.sh
 
 # arm64-only: user's Mongo-host env var (see section 1a) -- the stock
 # manifest names it "mongo", but the real app source only reads
@@ -138,6 +139,25 @@ box) -- both OOMKilled repeatedly on wardence-prod even with a `-Xmx`
 heap cap already in place, and the Oracle host has real confirmed
 headroom (9.2GB free) to not need the squeeze. Re-verify this is still
 appropriate if ever deploying to a more memory-constrained host again.
+
+**Real, cross-class CPU-contention finding, added 2026-08-24**:
+`shipping`'s CPU limit went 300m -> 1000m (memory-leak session, fixed
+`shipping`'s own `/health` starving itself) -> 500m (under-provisioned-replicas
+re-validation session, `patch_shipping_cpu_limit.sh`). At 1000m, `shipping`'s
+always-on `LeakAgent` reqsync thread (20ms poll, runs the pod's entire
+lifetime, not just during episodes) was permanently consuming ~950m of the
+Oracle host's only 2000m total CPU -- starving the whole node, not just
+`shipping`, and silently corrupting `under-provisioned-replicas`' own
+diagnosis signal (catalogue's real p95 became dominated by node-wide
+contention rather than replica count, at one point even reversed direction
+under load). 500m confirmed via real live testing to keep both `shipping`'s
+own health AND the memory-leak mechanism clean, while freeing enough node
+CPU for `under-provisioned-replicas`' signal to separate cleanly again
+(catalogue p95: ~107ms healthy vs ~155-160ms under-provisioned, real margin
+both sides). `UNDER_PROVISIONED_PROBE_THRESHOLD_MS`/`UNDER_PROVISIONED_MIN_P95_MS`
+recalibrated 190 -> 130ms to match. If any future fault-class work on this
+host shows the same kind of noisy/inverted timing signal, check this first
+before assuming a new problem.
 
 **Real gap, not yet closed**: `patch_catalogue_and_queue_master_readiness.sh`
 overlaps with `patch_queue_master_ephemeral_limit.sh` (both touch
