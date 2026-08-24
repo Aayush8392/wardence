@@ -216,6 +216,7 @@ p2_readonly_loop/check_fault_class_configurability.py
 p2_readonly_loop/check_upr_intensity_tuning.py
 p2_readonly_loop/check_upr_sustained_hold_test.py
 p2_readonly_loop/check_upr_post_scale_warmup.py
+p2_readonly_loop/resolve_stats_conflict.py
 p2_readonly_loop/poll_orders_real_ready.sh
 p2_readonly_loop/check_network_latency_scoped_target.sh
 p2_readonly_loop/check_cpu_throttle_via_limit_cut.sh
