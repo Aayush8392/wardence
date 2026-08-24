@@ -249,3 +249,4 @@ p2_readonly_loop/check_shipping_heap_organic_baseline.sh
 p2_readonly_loop/check_shipping_synthetic_load_no_leak.sh
 p2_readonly_loop/check_shipping_requestcount_timing.sh
 p2_readonly_loop/ThreadPoolTimingProbe.java
+p3_trust_action/.venv/
