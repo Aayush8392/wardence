@@ -478,12 +478,22 @@ def main():
     # trigger-time restoration instead of an immediate background one.
     if actual_class == "crash-loop":
         try:
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).parent / "restore_carts_active.py")],
-                cwd=str(Path(__file__).parent),
-                start_new_session=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            # Real fix (2026-08-25): was previously stdout=DEVNULL,
+            # stderr=DEVNULL -- a real incident (2026-08-23/24) left the
+            # carts Service selector stuck on "carts-warm" for 39+ hours,
+            # undetected, because this detached process's own success/
+            # failure output (including carts_rotation.py's internal
+            # "real failure, treating as unknown" prints) went nowhere.
+            # Redirecting to a real log file means the next failure is
+            # actually diagnosable instead of silent.
+            restore_log_path = Path(__file__).parent / "carts_restore_last_run.log"
+            with open(restore_log_path, "wb") as restore_logf:
+                subprocess.Popen(
+                    [sys.executable, str(Path(__file__).parent / "restore_carts_active.py")],
+                    cwd=str(Path(__file__).parent),
+                    start_new_session=True,
+                    stdout=restore_logf, stderr=subprocess.STDOUT,
+                )
         except Exception as e:
             print(f"  crash-loop restoration: failed to spawn background reconciler: {e}")
 

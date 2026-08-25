@@ -966,6 +966,16 @@ def trigger_status(request: Request):
     # would just be a second source of truth that can drift from it).
     # Lets the frontend grey out/explain the crash-loop button proactively
     # instead of only finding out via a rejected click.
+    # Real self-heal (2026-08-25): the ONLY existing self-heal for a stuck
+    # selector lived in injector.py's _ensure_crash_loop_baseline, which
+    # only runs once a new crash-loop trigger is actually attempted -- but
+    # the frontend disables the trigger button BEFORE that request is ever
+    # made, so a stuck selector could leave the button permanently
+    # disabled with no path to self-heal. Calling the same idempotent
+    # flip_to_carts() here (already fail-closed: no-op if already "carts",
+    # no-op if carts isn't Ready) means it self-heals on the next status
+    # poll instead of staying stuck indefinitely.
+    carts_rotation.flip_to_carts()
     crash_loop_active_label = carts_rotation.get_active_label()
     crash_loop_ready = (
         crash_loop_active_label == "carts" and carts_rotation.is_carts_ready()
