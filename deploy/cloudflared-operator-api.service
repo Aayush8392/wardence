@@ -41,7 +41,6 @@
 Description=Wardence Cloudflare Quick Tunnel -- Operator API (port 8002)
 After=network-online.target wardence-operator-api.service
 Wants=network-online.target
-Requires=wardence-operator-api.service
 
 [Service]
 Type=simple
