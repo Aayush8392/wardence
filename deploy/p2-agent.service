@@ -36,6 +36,7 @@ Type=simple
 User=<WARDENCE_USER>
 WorkingDirectory=<REPO_PATH>/p2_readonly_loop
 Environment=PROMETHEUS_URL=http://localhost:30090
+Environment=KUBECONFIG=/home/ubuntu/.kube/config
 ExecStart=<VENV_PATH>/bin/uvicorn agent:app --host 0.0.0.0 --port 8000
 Restart=on-failure
 RestartSec=5

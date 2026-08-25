@@ -54,6 +54,7 @@ Environment=PROMETHEUS_URL=http://localhost:30090
 # Must exist and be owned by <WARDENCE_USER> before first start:
 #   sudo mkdir -p /var/lib/wardence/state && sudo chown <WARDENCE_USER> /var/lib/wardence/state
 Environment=WARDENCE_STATE_DIR=/var/lib/wardence/state
+Environment=KUBECONFIG=/home/ubuntu/.kube/config
 # Per-environment durability-window overrides (2026-08-2x) -- real
 # recovery timing differs by hardware (confirmed: crash-loop/carts
 # ~103-111s here vs. ~30s on the original WSL2/x86 dev machine, against
