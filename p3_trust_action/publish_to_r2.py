@@ -88,6 +88,7 @@ from pathlib import Path
 import boto3
 
 from circuit_breaker import FAILURE_THRESHOLD, FAILURE_WINDOW_S, ensure_circuit_breaker_table
+from phase_e_apply_corrections import ensure_phase_e_columns
 from tool_call_validator import MAX_MEMORY_LIMIT_MI, MAX_CPU_LIMIT_M, MAX_REPLICAS
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "p2_readonly_loop"))
@@ -1177,6 +1178,13 @@ def main():
 
     conn = sqlite3.connect(DB_PATH)
     ensure_circuit_breaker_table(conn)  # in case this DB has never had a failure recorded yet
+    # Real fix (2026-08-25): scores.phase_e_status/phase_e_note/original_correct/
+    # original_trust_correct are added by phase_e_apply_corrections.py's own
+    # one-off script, which had never been run against this Oracle DB --
+    # every real publish attempt failed with "no such column: phase_e_status"
+    # until this was called defensively here, same pattern as
+    # ensure_circuit_breaker_table above.
+    ensure_phase_e_columns(conn)
 
     trust_ladder = build_trust_ladder(conn)
     trust_history = build_trust_history(conn)
