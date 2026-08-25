@@ -418,6 +418,20 @@ SETTLE_SECONDS = 35
 # the original 35s via .get()'s default.
 SETTLE_SECONDS_OVERRIDE = {
     "network-partition": 60,
+    # Real fix, 2026-08-25 (episodes aa30d274/28dad6f7): oom's real kill
+    # timing is genuinely variable (kernel-level, non-deterministic) --
+    # live-measured this session at 3-9s, but the class's own OOM_VERIFY_
+    # CEILING_S=200 and the historical two data points that sized it
+    # (97s/119s, see injector.py's _inject_and_verify_oom docstring) show
+    # a real slow tail up toward ~120s. oom_pods/crashlooping_pods
+    # (agent.py's oom_query) is a STICKY signal -- last_terminated_reason
+    # gated by increase(restarts_total[3m]) -- so a later snapshot doesn't
+    # risk missing a fast kill the way it would for an instant-state
+    # check; it only needs to land AFTER the real kill, not tightly after
+    # it. 150s comfortably covers both the fast (3-9s) and slow (~120s)
+    # ends of the real observed range while staying inside the query's
+    # own 3-minute lookback.
+    "oom": 150,
 }
 
 # Extra margin added on top of whatever's left of SETTLE_SECONDS when
@@ -699,9 +713,9 @@ TERMINAL_EPISODE_STATES = {"resolved", "failed"}
 # plus all 6 report-only classes (same session extension, after
 # confirming each one's own injector function already has a real
 # verification step whose "confirmed" moment can be signaled out).
-# Every other auto-fix class (oom/disk-full/under-provisioned-replicas/
-# bad-rollout) goes straight from injecting to awaiting_fix once its
-# own subprocess call returns -- no extendable hold to interrupt.
+# Every other auto-fix class (disk-full/bad-rollout) goes straight from
+# injecting to awaiting_fix once its own subprocess call returns -- no
+# extendable hold to interrupt.
 HOLDING_CLASSES = {
     "crash-loop", "cpu-throttling",
     "network-latency", "network-partition", "memory-leak",
@@ -715,6 +729,15 @@ HOLDING_CLASSES = {
     # not coupled the way SAFE_DEMO_CLASSES/AUTO_FIX_CLASSES used to be
     # before that was deliberately fixed.
     "under-provisioned-replicas",
+    # Added 2026-08-25 -- real live-measured kill timing (episodes
+    # aa30d274/28dad6f7, test_oom_real_live_window.py) showed the actual
+    # OOM kill now lands in ~3-9s with catalogue recovering in ~17-25s
+    # total, so a one-shot injection no longer produces the persistent
+    # storefront degradation every other holding class has. Real sustained
+    # re-kill hold, see injector.py's _inject_and_verify_oom -- diagnosis
+    # safety already covered by the pre-existing oom_pods-before-
+    # crashlooping_pods ordering in agent.py/react_agent.py.
+    "oom",
 }
 
 # Real bug found and fixed the same session: FAULT_CONFIG's own
@@ -755,6 +778,11 @@ LIVE_TRIGGER_DURATION_OVERRIDE_S = {
     # docstring for the real data) -- batch runs are unaffected, this dict
     # is only ever consulted for live triggers.
     "under-provisioned-replicas": 180,
+    # Real, live-measured 2026-08-25 -- see HOLDING_CLASSES's own comment
+    # for the real kill/recovery timing that made this necessary. 180s
+    # matches the rest of the holding roster; not yet live-tested at this
+    # exact value (batch runs are unaffected either way).
+    "oom": 180,
 }
 
 # Two different real evidence SOURCES for the 8 holding classes, not

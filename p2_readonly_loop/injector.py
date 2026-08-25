@@ -3878,7 +3878,9 @@ def _pod_oom_killed(pod_name: str, namespace: str, container: str, baseline_rest
     return result.stdout.strip() == "OOMKilled"
 
 
-def _inject_and_verify_oom(cfg: dict) -> str | None:
+def _inject_and_verify_oom(
+    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+) -> str | None:
     """Real redesign, 2026-08-01 (Kimi review 19, reviews/19_oom_verification_race_kimi_review.md)
     -- replaces the old fixed-sleep-then-Prometheus-poll approach
     (_inject_and_verify_chaos_mesh), which failed 9 real injection
@@ -3902,47 +3904,134 @@ def _inject_and_verify_oom(cfg: dict) -> str | None:
     the same guess, a backstop for a loop that's actively watching the
     real signal the whole time). Re-resolves the pod name each
     iteration in case of pod churn under memory pressure (same
-    old-pod/new-pod bug class already found elsewhere in this file)."""
+    old-pod/new-pod bug class already found elsewhere in this file).
+
+    stop_file/evidence_file, added 2026-08-25: when either is given (a
+    live trigger), branches into a real SUSTAINED hold -- real
+    live-measured kill timing this session (episodes aa30d274/28dad6f7,
+    plus test_oom_real_live_window.py runs) showed the actual kill now
+    lands in ~3-9s and catalogue recovers within ~17-25s total, so a
+    one-shot injection (the batch-run behavior below) no longer produces
+    a persistently-broken storefront the way every other holding class
+    does -- confirmed via direct comparison with the demo-visibility
+    history in wardence_frontend.md, which describes oom's original
+    2026-08-15 confirmation as already fast-recovering even then, not a
+    regression. The live-trigger path keeps the StressChaos resource
+    APPLIED for the full hold window (or until stop_file appears)
+    instead of tearing it down after the first confirmed kill --
+    Chaos Mesh's mode: one selector re-targets whichever pod currently
+    matches, so a freshly-restarted catalogue pod should keep climbing
+    back toward the 200Mi limit and get re-killed, producing a genuine
+    repeating flap for the whole window rather than one brief dip.
+    Diagnostically safe: agent.py's stub_diagnose and react_agent.py's
+    prompt both already check oom_pods (and evicted_pods/
+    front_end_image_pull_failing) BEFORE crashlooping_pods, specifically
+    because crash_query's restart-increase signal fires on any restart
+    for any reason -- a pre-existing safeguard, not something new
+    needed here. Batch runs (both None) are completely untouched --
+    same original one-shot loop as before, zero behavior change."""
     chaos_kind = "stresschaos"
     namespace = cfg["namespace"]
     target = cfg["target"]
     container = cfg["container"]
 
-    for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
-        pod_name = _current_pod_name(target, namespace)
-        baseline_restart_count = (
-            _pod_restart_count_direct(pod_name, namespace, container) if pod_name is not None else None
-        )
-        chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
-        manifest = build_oom_manifest(chaos_name, cfg)
-        apply_manifest(manifest)
-        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: stressor active, polling for a real "
-              f"OOM kill (ceiling {OOM_VERIFY_CEILING_S}s, baseline restartCount={baseline_restart_count})...")
-        verified = False
-        elapsed = 0
-        try:
-            while elapsed <= OOM_VERIFY_CEILING_S:
-                current_pod_name = _current_pod_name(target, namespace)
-                if (
-                    current_pod_name is not None
-                    and baseline_restart_count is not None
-                    and _pod_oom_killed(current_pod_name, namespace, container, baseline_restart_count)
-                ):
-                    verified = True
-                    break
-                time.sleep(OOM_VERIFY_POLL_S)
-                elapsed += OOM_VERIFY_POLL_S
-        finally:
-            # Cleanup must run even if the poll loop throws -- an
-            # active memory stressor left behind would keep pressuring
-            # (and potentially OOM-killing) the target indefinitely.
-            delete_chaos_resource(chaos_kind, chaos_name)
-        if verified:
-            print(f"  attempt {attempt}: real OOMKilled confirmed after ~{elapsed}s")
-            return chaos_name
-        suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
-        print(f"  attempt {attempt}: no OOM kill detected within {OOM_VERIFY_CEILING_S}s{suffix}")
-    return None
+    if stop_file is None and evidence_file is None:
+        # Original, untouched batch-run path.
+        for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
+            pod_name = _current_pod_name(target, namespace)
+            baseline_restart_count = (
+                _pod_restart_count_direct(pod_name, namespace, container) if pod_name is not None else None
+            )
+            chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
+            manifest = build_oom_manifest(chaos_name, cfg)
+            apply_manifest(manifest)
+            print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: stressor active, polling for a real "
+                  f"OOM kill (ceiling {OOM_VERIFY_CEILING_S}s, baseline restartCount={baseline_restart_count})...")
+            verified = False
+            elapsed = 0
+            try:
+                while elapsed <= OOM_VERIFY_CEILING_S:
+                    current_pod_name = _current_pod_name(target, namespace)
+                    if (
+                        current_pod_name is not None
+                        and baseline_restart_count is not None
+                        and _pod_oom_killed(current_pod_name, namespace, container, baseline_restart_count)
+                    ):
+                        verified = True
+                        break
+                    time.sleep(OOM_VERIFY_POLL_S)
+                    elapsed += OOM_VERIFY_POLL_S
+            finally:
+                # Cleanup must run even if the poll loop throws -- an
+                # active memory stressor left behind would keep pressuring
+                # (and potentially OOM-killing) the target indefinitely.
+                delete_chaos_resource(chaos_kind, chaos_name)
+            if verified:
+                print(f"  attempt {attempt}: real OOMKilled confirmed after ~{elapsed}s")
+                return chaos_name
+            suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
+            print(f"  attempt {attempt}: no OOM kill detected within {OOM_VERIFY_CEILING_S}s{suffix}")
+        return None
+
+    # Live-trigger sustained-hold path.
+    #
+    # Real, live-verified correction, 2026-08-25 (manual StressChaos test
+    # against catalogue): a StressChaos CR does NOT re-inject its stress
+    # process after the target container restarts, even though the CR
+    # object itself stays "applied" -- confirmed directly, ~5 real
+    # minutes of flat 2-6MiB memory (no climb at all) after the first
+    # kill, same CR, untouched. The original design (leave one CR applied
+    # and just keep polling) was WRONG and would have silently done
+    # nothing after the first kill. Fixed: re-apply a FRESH CR (new name)
+    # after every confirmed kill, same manifest each time -- same
+    # apply-then-verify shape as the batch-run path's own per-attempt
+    # loop above, just looped continuously for the hold window instead of
+    # returning after one success.
+    duration_s = cfg["duration_s"]
+    evidence_written = False
+    interrupted = False
+    elapsed = 0
+    tick_s = OOM_VERIFY_POLL_S
+    active_chaos_name = None
+    last_chaos_name = None
+    try:
+        while elapsed < duration_s:
+            if stop_file is not None and os.path.exists(stop_file):
+                interrupted = True
+                break
+            if active_chaos_name is None:
+                pod_name = _current_pod_name(target, namespace)
+                baseline_restart_count = (
+                    _pod_restart_count_direct(pod_name, namespace, container) if pod_name is not None else None
+                )
+                active_chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
+                manifest = build_oom_manifest(active_chaos_name, cfg)
+                apply_manifest(manifest)
+                last_chaos_name = active_chaos_name
+                print(f"  live hold [t={elapsed}s]: fresh stressor applied, "
+                      f"baseline restartCount={baseline_restart_count}...")
+            current_pod_name = _current_pod_name(target, namespace)
+            if (
+                current_pod_name is not None
+                and baseline_restart_count is not None
+                and _pod_oom_killed(current_pod_name, namespace, container, baseline_restart_count)
+            ):
+                if not evidence_written:
+                    evidence_written = True
+                    _write_evidence_file_once(evidence_file)
+                print(f"  live hold [t={elapsed}s]: real OOM kill confirmed, re-applying a fresh stressor...")
+                delete_chaos_resource(chaos_kind, active_chaos_name)
+                active_chaos_name = None  # triggers a fresh apply next tick
+            time.sleep(tick_s)
+            elapsed += tick_s
+    finally:
+        if active_chaos_name is not None:
+            delete_chaos_resource(chaos_kind, active_chaos_name)
+
+    if interrupted:
+        print("  early-stop requested -- not retrying")
+
+    return last_chaos_name if evidence_written else None
 
 
 def main():
@@ -3978,10 +4067,12 @@ def main():
             "plus the 6 report-only classes) -- the hold loop checks "
             "os.path.exists(stop_file) once per tick and exits cleanly, "
             "running its own finally-block cleanup, if the file appears. "
-            "Ignored by disk-full/bad-rollout/oom (no extendable hold to "
+            "Ignored by disk-full/bad-rollout (no extendable hold to "
             "interrupt). Also honored by under-provisioned-replicas as of "
             "2026-08-15 (its own real sustained-load hold, see "
-            "_inject_and_verify_under_provisioned). Omit for batch runs."
+            "_inject_and_verify_under_provisioned) and oom as of 2026-08-25 "
+            "(its own real sustained re-kill hold, see "
+            "_inject_and_verify_oom). Omit for batch runs."
         ),
     )
     parser.add_argument(
@@ -3995,8 +4086,9 @@ def main():
             "under-provisioned-replicas (its own real active probe -- a "
             "k6 burst, not a cheap Prometheus read, hence the same "
             "evidence-file pattern, not crash-loop/cpu-throttling's "
-            "cheap-read wrapper-polled pattern). Ignored by every other "
-            "class. Omit for batch runs."
+            "cheap-read wrapper-polled pattern), plus oom as of 2026-08-25 "
+            "(a real k8s-API OOM-kill check, same reasoning). Ignored by "
+            "every other class. Omit for batch runs."
         ),
     )
     args = parser.parse_args()
@@ -4104,7 +4196,9 @@ def main():
             # Resetting both dimensions before injecting either class now.
             _ensure_catalogue_replica_baseline(cfg)
             _ensure_oom_baseline(cfg)
-            chaos_name = _inject_and_verify_oom(cfg)
+            chaos_name = _inject_and_verify_oom(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
         else:
             # Unreachable in practice -- argparse's choices=FAULT_CONFIG.keys()
             # and every real key above already has its own explicit branch.
