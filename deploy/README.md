@@ -348,10 +348,64 @@ python create_viewer_account.py
 
 ## 7. Frontend
 
-Not started. `p4_frontend/.env` still points at localhost. Needs a real
-Vercel project + `VITE_R2_BASE_URL`/`VITE_OPERATOR_API_URL`/
-`VITE_STOREFRONT_URL` set to real values, plus a CORS domain update on the
-backend (section 5) once the real Vercel URL is known.
+**Real TLS gap found 2026-08-25, closed via Cloudflare quick tunnels.**
+`operator_api.py` and the storefront are both plain HTTP on the Oracle
+host. Vercel serves the frontend over HTTPS, and a browser hard-blocks
+any `fetch()` from an HTTPS page to a plain `http://` API (mixed
+content) -- so `VITE_OPERATOR_API_URL` can't just be the bare Oracle
+IP:port, something needs to terminate real TLS in front of it first.
+
+**Decided: Cloudflare quick tunnels, not a named tunnel** -- confirmed
+live 2026-08-25 that this Cloudflare account (the same one already used
+for R2) has zero domains registered, and a named tunnel needs one for a
+stable hostname. Quick tunnels are free and need no domain, but the
+URL they hand out (`https://<random-words>.trycloudflare.com`) only
+stays stable for as long as the tunnel process keeps running -- it
+changes to a new random URL if the process ever restarts (crash,
+reboot, manual stop). Accepted tradeoff for now; a cheap domain +
+named tunnel is a small, isolated upgrade later if URL churn becomes
+annoying, not a re-architecture.
+
+Real steps, in order:
+
+```bash
+# 1. Install cloudflared once (arm64 -- swap to -amd64 if the host is x86)
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -o cloudflared
+chmod +x cloudflared
+sudo mv cloudflared /usr/local/bin/cloudflared
+
+# 2. Expose the storefront via a NodePort (operator_api's Prometheus/Loki
+#    NodePorts already exist from section 5 -- this is the same pattern,
+#    just for front-end, which had none yet)
+bash p2_readonly_loop/patch_frontend_nodeport.sh
+
+# 3. Install both tunnel units
+sudo cp deploy/cloudflared-operator-api.service /etc/systemd/system/wardence-tunnel-operator-api.service
+sudo cp deploy/cloudflared-storefront.service /etc/systemd/system/wardence-tunnel-storefront.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now wardence-tunnel-operator-api
+sudo systemctl enable --now wardence-tunnel-storefront
+
+# 4. Grab the real URLs (one at a time, Ctrl+C once you see the URL)
+sudo journalctl -u wardence-tunnel-operator-api -f
+sudo journalctl -u wardence-tunnel-storefront -f
+```
+
+Then:
+- Set `CORS_ORIGINS` on `operator_api.py`'s systemd unit
+  (`deploy/operator-api.service`'s `<REAL_VERCEL_DOMAIN>` placeholder)
+  to the real Vercel domain once it exists (chicken-and-egg with the
+  step below -- Vercel domain is known after the first deploy, then
+  come back and set this, then `daemon-reload` + restart).
+- Create a real Vercel project pointed at `p4_frontend/` (root
+  directory setting in Vercel's project config, since this is a
+  monorepo).
+- Set 3 real env vars in Vercel's project settings:
+  `VITE_R2_BASE_URL` (already known, see `p4_frontend/.env`),
+  `VITE_OPERATOR_API_URL` (the operator-api quick tunnel URL from step 4),
+  `VITE_STOREFRONT_URL` (the storefront quick tunnel URL from step 4).
+- Deploy. Confirm the Operator tab actually loads real data (not just
+  that the build succeeded) before considering this done.
 
 ## 8. Explicitly NOT covered by this runbook, still open
 

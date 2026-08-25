@@ -1,0 +1,58 @@
+# systemd unit for a Cloudflare quick tunnel fronting operator_api.py
+# with real HTTPS. Real reason this exists at all: Vercel serves the
+# frontend over HTTPS, and browsers hard-block any fetch() from an
+# HTTPS page to a plain http:// API (mixed content) -- operator_api.py
+# itself has no TLS, so something has to terminate it in front.
+#
+# Locked 2026-08-25: quick tunnel, not a named tunnel, because this
+# Cloudflare account has zero domains registered (confirmed live via
+# the dashboard's Domains page). Real, accepted tradeoff: the URL this
+# prints (https://<random-words>.trycloudflare.com) is stable for as
+# long as this systemd unit keeps running, but changes to a NEW random
+# URL if the process ever restarts (crash, reboot, manual stop) --
+# unlike a named tunnel, there's no way to pin it without buying a
+# domain. If that churn ever becomes annoying, upgrading to a named
+# tunnel later is a small, isolated change (this file + Cloudflare
+# dashboard config), not a re-architecture.
+#
+# Getting the real URL after first start:
+#   sudo systemctl status wardence-tunnel-operator-api
+#   -- or --
+#   sudo journalctl -u wardence-tunnel-operator-api -f
+# Look for a line like:
+#   https://some-random-words.trycloudflare.com
+# That URL is what goes into Vercel's VITE_OPERATOR_API_URL env var.
+#
+# NOT yet installed anywhere -- this is a template.
+#
+# Prerequisite (one-time, real):
+#   curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -o cloudflared
+#   chmod +x cloudflared
+#   sudo mv cloudflared /usr/local/bin/cloudflared
+#   (use cloudflared-linux-amd64 instead if the Oracle host is x86, not arm64)
+#
+# Install:
+#   sudo cp deploy/cloudflared-operator-api.service /etc/systemd/system/wardence-tunnel-operator-api.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wardence-tunnel-operator-api
+#   sudo journalctl -u wardence-tunnel-operator-api -f   # grab the printed URL, then Ctrl+C
+
+[Unit]
+Description=Wardence Cloudflare Quick Tunnel -- Operator API (port 8002)
+After=network-online.target wardence-operator-api.service
+Wants=network-online.target
+Requires=wardence-operator-api.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:8002
+Restart=on-failure
+RestartSec=5
+# No User= set deliberately -- cloudflared needs no elevated access and
+# no repo/venv paths, runs fine as the default systemd-assigned user.
+# If this unit is ever adjusted to run as a specific non-root user,
+# match whatever <WARDENCE_USER> resolves to in operator-api.service
+# for consistency, but it's not required for correctness here.
+
+[Install]
+WantedBy=multi-user.target
