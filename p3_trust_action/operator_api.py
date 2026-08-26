@@ -1782,6 +1782,7 @@ def trigger_reasoning_stream(episode_id: str, token: str):
         start = time.monotonic()
         pos = 0
         saw_done = False
+        last_data_at = time.monotonic()
         while True:
             if path.exists():
                 with path.open("r") as f:
@@ -1793,6 +1794,7 @@ def trigger_reasoning_stream(episode_id: str, token: str):
                     if not line:
                         continue
                     yield f"data: {line}\n\n"
+                    last_data_at = time.monotonic()
                     try:
                         if json.loads(line).get("type") == "done":
                             saw_done = True
@@ -1800,6 +1802,25 @@ def trigger_reasoning_stream(episode_id: str, token: str):
                         pass
             if saw_done or (time.monotonic() - start) > REASONING_STREAM_MAX_S:
                 return
+            # Real fix, 2026-08-26: for holding classes (oom/crash-loop/etc.)
+            # the diagnosis call -- the ONLY source of real events on this
+            # stream -- doesn't start until the hold itself ends, up to
+            # 300s in. With zero bytes flowing for that whole stretch, real
+            # infra sitting in front of this endpoint (Cloudflare's tunnel,
+            # ~100s idle timeout -- same real number already flagged for
+            # blocking calls in Kimi review 34 finding #4) silently drops
+            # the connection well before any real content arrives, and the
+            # frontend's onerror handler closes rather than reconnecting --
+            # confirmed live, episode e84df728: real events were written
+            # correctly to the file (verified directly), but the panel
+            # never showed them. A comment line (SSE spec: any line
+            # starting with `:` is a no-op, ignored by EventSource, but is
+            # still real bytes on the wire) sent well inside that ~100s
+            # window keeps the connection alive without inventing fake
+            # data.
+            if time.monotonic() - last_data_at >= 20:
+                yield ": keep-alive\n\n"
+                last_data_at = time.monotonic()
             time.sleep(REASONING_STREAM_POLL_S)
 
     return StreamingResponse(_tail(), media_type="text/event-stream")
