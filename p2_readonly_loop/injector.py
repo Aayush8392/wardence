@@ -153,6 +153,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import platform
 import sys
 import time
 import uuid
@@ -329,7 +330,27 @@ OOM_BASELINE_MEMORY_LIMIT = "200Mi"
 #    and repeats cleanly on restart. This is the real, narrow band between
 #    "too low to even start" (1Mi) and "high enough to idle indefinitely"
 #    (5Mi).
-OOM_FORCED_KILL_MEMORY_LIMIT = "3Mi"
+#
+# Real, separate arm64 finding (Oracle, 2026-08-27): the x86-locked 3Mi value
+# above causes real, repeated `FailedCreatePodSandBox` events on arm64
+# ("cannot start a stopped process" / "container process is already dead")
+# -- the same class of failure as the 1Mi overcorrection above (container
+# init OOM-killed before a real Terminated/OOMKilled reason ever exists),
+# just triggered by a different real per-arch init-time memory floor, not a
+# repeat of the same numeric mistake. Confirmed live via a Prometheus
+# `container_memory_working_set_bytes` range query against a real running
+# arm64 pod (not guessed): working set climbs 2.4MiB -> 6.5-7.2MiB over the
+# first ~150-200s and visibly flattens there -- so arm64's real steady-state
+# ceiling is lower than x86's (~7-10MiB, from the original 5Mi/1Mi/3Mi
+# investigation above) but still comfortably above 3Mi. 5Mi sits in the real
+# gap between arm64's init floor (which 8Mi confirmed clears) and its
+# ~6.5-7.2MiB steady-state ceiling -- not yet live-verified end to end with
+# a real Terminated/OOMKilled event, the next real trigger on Oracle is the
+# actual test. Keyed on real architecture, not a manual per-host toggle,
+# since the root cause is the CPU architecture itself, not a deployment
+# choice -- self-correct if either environment's hardware ever changes.
+_IS_ARM64 = platform.machine() in ("aarch64", "arm64")
+OOM_FORCED_KILL_MEMORY_LIMIT = "5Mi" if _IS_ARM64 else "3Mi"
 # catalogue's real requests.memory is 100Mi (confirmed live,
 # `kubectl get deployment catalogue -o jsonpath='{.spec.template.spec.containers[0].resources}'`)
 # -- k8s requires requests <= limits, so a patch touching ONLY limits down
@@ -338,8 +359,9 @@ OOM_FORCED_KILL_MEMORY_LIMIT = "3Mi"
 # this file's known raw-kubectl-call gotcha) -- confirmed live 2026-08-26:
 # 3/3 forced-kill cycles produced zero kills because the patch never
 # actually applied, the pod kept coming back under the unchanged
-# 100Mi/200Mi spec. requests must be patched down together with limits.
-OOM_FORCED_KILL_MEMORY_REQUEST = "3Mi"
+# 100Mi/200Mi spec. requests must be patched down together with limits,
+# and must match OOM_FORCED_KILL_MEMORY_LIMIT (k8s requires requests <= limits).
+OOM_FORCED_KILL_MEMORY_REQUEST = OOM_FORCED_KILL_MEMORY_LIMIT
 # Recovery-only default, used by _ensure_oom_baseline when a forced-kill
 # hold died before restoring the strategy it captured live. The hold's own
 # normal path restores the REAL captured value, never this one -- this is
