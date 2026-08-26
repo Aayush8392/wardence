@@ -111,7 +111,7 @@ FIELD_GUIDANCE = f"""Field meanings and thresholds (a null/false/empty field mea
 - peak_threads_connected (catalogue-db only): >= 100 -> connection-pool-exhaustion.
 - cpu_throttle_periods_increase (user only): >= 100 -> cpu-throttling.
 - front_end_image_pull_failing: true -> bad-rollout.
-- catalogue_probe_p95_ms (from probe_catalogue_capacity): >= 130ms -> under-provisioned-replicas.
+- catalogue_probe_p95_ms (from probe_catalogue_capacity): >= 130ms -> under-provisioned-replicas, but ONLY after you have already called query_prometheus at least once this episode and confirmed oom_pods/crashlooping_pods/evicted_pods are all empty. A degraded or dying catalogue pod (oom, crash-loop, disk-full) can ALSO show an elevated capacity-probe reading right before it's killed -- oom_pods/crashlooping_pods/evicted_pods are the more specific, direct signals and win. Never diagnose under-provisioned-replicas from catalogue_probe_p95_ms alone without having called query_prometheus first this episode.
 - dl_detector_result.is_anomalous (from call_dl_detector) on catalogue, with no other signal above having fired: this is NOT enough on its own to conclude "none" -- you MUST call probe_catalogue_capacity (if you have not already this episode) before concluding anything, since it is the one signal that can actually confirm or rule out under-provisioned-replicas. Only after probe_catalogue_capacity has been called and its result checked against the threshold above may you fall back to the closest matching class or "none". "log-anomaly detected (unclassified)" is NOT a valid diagnosis for you to output.
 - If NONE of the above are met, diagnosis is "none"."""
 
