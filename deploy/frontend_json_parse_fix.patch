@@ -1,0 +1,230 @@
+diff --git a/api/cart/index.js b/api/cart/index.js
+index a1f3b63..2b2bb72 100644
+--- a/api/cart/index.js
++++ b/api/cart/index.js
+@@ -76,7 +76,16 @@
+         function (callback) {
+           request(endpoints.catalogueUrl + "/catalogue/" + req.body.id.toString(), function (error, response, body) {
+             console.log(body);
+-            callback(error, JSON.parse(body));
++            // NOTE: this used to be `callback(error, JSON.parse(body))`.
++            // JSON.parse was evaluated as an ARGUMENT, so it ran before
++            // callback could ever inspect `error` -- passing the error
++            // along was useless. An unreachable catalogue therefore
++            // killed the whole front-end process. See helpers.parseUpstream.
++            var parsed = helpers.parseUpstream(error, body);
++            if (parsed.err) {
++              return callback(parsed.err);
++            }
++            callback(null, parsed.data);
+           });
+         },
+         function (item, callback) {
+@@ -124,7 +133,12 @@
+         function (callback) {
+           request(endpoints.catalogueUrl + "/catalogue/" + req.body.id.toString(), function (error, response, body) {
+             console.log(body);
+-            callback(error, JSON.parse(body));
++            // Same fatal pattern as POST /cart above -- see that comment.
++            var parsed = helpers.parseUpstream(error, body);
++            if (parsed.err) {
++              return callback(parsed.err);
++            }
++            callback(null, parsed.data);
+           });
+         },
+         function (item, callback) {
+diff --git a/api/orders/index.js b/api/orders/index.js
+index f52e26c..11598d5 100644
+--- a/api/orders/index.js
++++ b/api/orders/index.js
+@@ -28,7 +28,17 @@
+               console.log("No orders found for user: " + custId);
+               return callback(null, []);
+             }
+-            callback(null, JSON.parse(body)._embedded.customerOrders);
++            var parsed = helpers.parseUpstream(error, body);
++            if (parsed.err) {
++              return callback(parsed.err);
++            }
++            // `_embedded` is absent whenever orders returns a non-list
++            // payload (e.g. a 500 error object) -- dereferencing
++            // .customerOrders on undefined threw a TypeError from inside
++            // this callback and took the whole process down. Treat a
++            // missing collection as "no orders", same as the 404 above.
++            var embedded = parsed.data._embedded;
++            callback(null, (embedded && embedded.customerOrders) ? embedded.customerOrders : []);
+           });
+         }
+     ],
+@@ -63,7 +73,14 @@
+               return;
+             }
+             console.log("Received response: " + JSON.stringify(body));
+-            var jsonBody = JSON.parse(body);
++            var parsed = helpers.parseUpstream(error, body);
++            if (parsed.err) {
++              return callback(parsed.err);
++            }
++            var jsonBody = parsed.data;
++            if (!jsonBody._links || !jsonBody._links.customer) {
++              return callback(new Error("Customer response missing _links (user service degraded)"));
++            }
+             var customerlink = jsonBody._links.customer.href;
+             var addressLink = jsonBody._links.addresses.href;
+             var cardLink = jsonBody._links.cards.href;
+@@ -86,8 +103,13 @@
+                     return;
+                   }
+                   console.log("Received response: " + JSON.stringify(body));
+-                  var jsonBody = JSON.parse(body);
+-                  if (jsonBody.status_code !== 500 && jsonBody._embedded.address[0] != null) {
++                  var parsed = helpers.parseUpstream(error, body);
++                  if (parsed.err) {
++                    return callback(parsed.err);
++                  }
++                  var jsonBody = parsed.data;
++                  if (jsonBody.status_code !== 500 && jsonBody._embedded &&
++                      jsonBody._embedded.address && jsonBody._embedded.address[0] != null) {
+                     order.address = jsonBody._embedded.address[0]._links.self.href;
+                   }
+                   callback();
+@@ -101,8 +123,13 @@
+                     return;
+                   }
+                   console.log("Received response: " + JSON.stringify(body));
+-                  var jsonBody = JSON.parse(body);
+-                  if (jsonBody.status_code !== 500 && jsonBody._embedded.card[0] != null) {
++                  var parsed = helpers.parseUpstream(error, body);
++                  if (parsed.err) {
++                    return callback(parsed.err);
++                  }
++                  var jsonBody = parsed.data;
++                  if (jsonBody.status_code !== 500 && jsonBody._embedded &&
++                      jsonBody._embedded.card && jsonBody._embedded.card[0] != null) {
+                     order.card = jsonBody._embedded.card[0]._links.self.href;
+                   }
+                   callback();
+diff --git a/api/user/index.js b/api/user/index.js
+index 8a706e9..7d22374 100644
+--- a/api/user/index.js
++++ b/api/user/index.js
+@@ -72,8 +72,13 @@
+             if (error) {
+                 return next(error);
+             }
+-            var data = JSON.parse(body);
+-            if (data.status_code !== 500 && data._embedded.card.length !== 0 ) {
++            var parsed = helpers.parseUpstream(error, body);
++            if (parsed.err) {
++                return next(parsed.err);
++            }
++            var data = parsed.data;
++            if (data.status_code !== 500 && data._embedded &&
++                data._embedded.card && data._embedded.card.length !== 0 ) {
+                 var resp = {
+                     "number": data._embedded.card[0].longNum.slice(-4)
+                 };
+@@ -95,8 +100,13 @@
+             if (error) {
+                 return next(error);
+             }
+-            var data = JSON.parse(body);
+-            if (data.status_code !== 500 && data._embedded.address.length !== 0 ) {
++            var parsed = helpers.parseUpstream(error, body);
++            if (parsed.err) {
++                return next(parsed.err);
++            }
++            var data = parsed.data;
++            if (data.status_code !== 500 && data._embedded &&
++                data._embedded.address && data._embedded.address.length !== 0 ) {
+                 var resp = data._embedded.address[0];
+                 return helpers.respondSuccessBody(res, JSON.stringify(resp));
+             }
+@@ -265,7 +275,12 @@
+                         }
+                         if (response.statusCode == 200 && body != null && body != "") {
+                             console.log(body);
+-                            var customerId = JSON.parse(body).user.id;
++                            var parsed = helpers.parseUpstream(error, body);
++                            if (parsed.err || !parsed.data.user) {
++                                return callback(parsed.err ||
++                                    new Error("Login response missing user (user service degraded)"));
++                            }
++                            var customerId = parsed.data.user.id;
+                             console.log(customerId);
+                             req.session.customerId = customerId;
+                             callback(null, customerId);
+diff --git a/helpers/index.js b/helpers/index.js
+index 348e785..66079f0 100644
+--- a/helpers/index.js
++++ b/helpers/index.js
+@@ -82,6 +82,38 @@
+     }.bind({res: res}));
+   }
+ 
++  /* Public: safely turns a `request` callback's (error, body) pair into
++   * either an error or parsed data. NEVER throws.
++   *
++   * Why this exists: every JSON.parse(body) in this app used to run
++   * inside an async `request` callback with no try/catch. When an
++   * upstream service is unreachable, `request` invokes the callback with
++   * error set and body === undefined -- JSON.parse(undefined) then
++   * throws "SyntaxError: Unexpected token u" from inside an EventEmitter,
++   * where Express's error middleware cannot reach it. That is an
++   * UNCAUGHT exception, so the whole Node process exits(1) and the
++   * entire storefront goes down because one backend blipped.
++   *
++   * Returns: {err: Error|null, data: parsed|null}
++   */
++  helpers.parseUpstream = function(error, body) {
++    if (error) {
++      return { err: error, data: null };
++    }
++    if (body === undefined || body === null || body === "") {
++      return { err: new Error("Upstream returned an empty body (service unreachable)"), data: null };
++    }
++    // Some callers use request's `json: true`, which pre-parses for us.
++    if (typeof body === "object") {
++      return { err: null, data: body };
++    }
++    try {
++      return { err: null, data: JSON.parse(body) };
++    } catch (e) {
++      return { err: new Error("Upstream returned a non-JSON body: " + String(body).slice(0, 200)), data: null };
++    }
++  }
++
+   /* TODO: Add documentation */
+   helpers.getCustomerId = function(req, env) {
+     // Check if logged in. Get customer Id
+diff --git a/server.js b/server.js
+index 929f7a4..a7797bd 100644
+--- a/server.js
++++ b/server.js
+@@ -16,6 +16,25 @@ var request      = require("request")
+   , app          = express()
+ 
+ 
++/* Last-resort safety net (Wardence patch).
++ *
++ * Express's error middleware can only catch throws on the synchronous
++ * request path. A throw inside an async `request` callback is an
++ * UNCAUGHT exception, and Node's default behaviour is to exit the
++ * process -- so one unreachable backend service used to take the entire
++ * storefront down, not just the one route that depends on it.
++ *
++ * The individual call sites are now guarded (see helpers.parseUpstream),
++ * so this should never fire. It exists so that any instance we have NOT
++ * found degrades to "one request fails" instead of "whole site down".
++ * Deliberately does not exit: this app holds no cross-request state in
++ * process (sessions live in redis), so continuing is safe here.
++ */
++process.on("uncaughtException", function (err) {
++  console.error("UNCAUGHT EXCEPTION (process kept alive by Wardence patch):",
++                err && err.stack ? err.stack : err);
++});
++
+ app.use(helpers.rewriteSlash);
+ app.use(metrics);
+ app.use(express.static("public"));

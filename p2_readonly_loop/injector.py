@@ -287,6 +287,67 @@ OOM_STRESS_SIZE = "250M"  # catalogue's memory limit is 200Mi; stress-ng format,
 # persistent config -- so this reset is oom-specific, not generic.
 OOM_BASELINE_MEMORY_LIMIT = "200Mi"
 
+# Real redesign, 2026-08-26 -- the live-trigger sustained hold used to
+# keep re-applying a StressChaos CR after every confirmed kill, racing
+# the stressor's growth rate against the kernel's own OOM-kill timing.
+# Confirmed via repeated real testing (test_oom_stress_and_interrupt.py,
+# 6 total back-to-back cycles across two duration settings) that this
+# race is genuinely unreliable, not flaky-but-fine: 2 of 6 cycles
+# produced ZERO kills over their full window, and the cycles that DID
+# kill landed anywhere from <10s to 135s -- nowhere near the ~3-9s
+# figure the original 180s hold duration was sized against (that number
+# came from only 2-3 sample episodes, not a real distribution). Fixed
+# by patching the deployment's memory LIMIT itself down to a value well
+# below catalogue's real idle baseline (confirmed via Prometheus,
+# ~7-10Mi) for the whole hold window, instead of racing a stressor
+# against a fixed limit. Any real memory the process allocates during
+# ordinary startup already exceeds this limit, so the kernel's cgroup
+# OOM killer fires deterministically on ~every restart attempt -- no
+# race, continuously down for the hold window instead of flapping
+# between brief kills and full recovery.
+# Real value-finding history, 2026-08-26, two corrections in one session --
+# left on record so neither wrong number gets tried again:
+# 1st (5Mi): chosen on a WRONG premise ("idle baseline ~7-10Mi, well above
+#    this"). Real measurement (`kubectl top pods`) says catalogue idles at
+#    ~5Mi, so this was marginal not fatal -- episode 93495bf3 ran healthy
+#    for ~126s before an eventual OOM, reintroducing the slow race this
+#    redesign existed to remove.
+# 2nd (1Mi): overcorrected into a DIFFERENT failure mode entirely, not just
+#    "more aggressive." Real event captured live (episode 54ab943b):
+#    `runc create failed: unable to start container process: container
+#    init was OOM-killed (memory limit too low?)` -- the container never
+#    reaches Running, so k8s never populates `lastState.terminated.reason`
+#    with anything _pod_oom_killed can match (there IS no valid terminated
+#    state, the container failed at containerd/runc INIT, before the app
+#    process -- or the check -- ever exists). The entire 180s hold ran
+#    silently and correctly found nothing, every single time.
+# 3rd (3Mi, LOCKED): real, live-verified via `kubectl patch` + `-w` watch
+#    directly against the deployment (not assumed): pod reaches Running
+#    cleanly (~13-17s), serves normally, then a genuine in-process
+#    `Last State: Terminated / Reason: OOMKilled / Exit Code: 137` lands
+#    ~17-34s later -- exactly the signature _pod_oom_killed checks for --
+#    and repeats cleanly on restart. This is the real, narrow band between
+#    "too low to even start" (1Mi) and "high enough to idle indefinitely"
+#    (5Mi).
+OOM_FORCED_KILL_MEMORY_LIMIT = "3Mi"
+# catalogue's real requests.memory is 100Mi (confirmed live,
+# `kubectl get deployment catalogue -o jsonpath='{.spec.template.spec.containers[0].resources}'`)
+# -- k8s requires requests <= limits, so a patch touching ONLY limits down
+# to 5Mi is an invalid spec and gets silently rejected by admission
+# validation (subprocess.run below doesn't check the return code, matching
+# this file's known raw-kubectl-call gotcha) -- confirmed live 2026-08-26:
+# 3/3 forced-kill cycles produced zero kills because the patch never
+# actually applied, the pod kept coming back under the unchanged
+# 100Mi/200Mi spec. requests must be patched down together with limits.
+OOM_FORCED_KILL_MEMORY_REQUEST = "3Mi"
+# Recovery-only default, used by _ensure_oom_baseline when a forced-kill
+# hold died before restoring the strategy it captured live. The hold's own
+# normal path restores the REAL captured value, never this one -- this is
+# just a sane fallback matching catalogue's real deployed strategy
+# (confirmed live: {"maxSurge":"25%","maxUnavailable":"25%"}).
+OOM_BASELINE_ROLLOUT_STRATEGY = '{"maxSurge":"25%","maxUnavailable":"25%"}'
+OOM_BASELINE_MEMORY_REQUEST = "100Mi"
+
 DISK_FULL_FIRE_INTERVAL_S = 15  # wait between write attempts, giving kubelet time to detect+evict
 DISK_STRESS_BYTES = 450_000_000  # queue-master's ephemeral-storage limit is 300Mi
 
@@ -549,7 +610,20 @@ UNDER_PROVISIONED_LIVE_TRIGGER_VUS = 130
 # "old healthy pod keeps serving, new broken one never comes online"
 # realism as init-failure -- confirmed by the same RollingUpdate
 # mechanics already proven there.
-FRONT_END_IMAGE_BASELINE = os.environ.get("FRONT_END_IMAGE_BASELINE", "weaveworksdemos/front-end:0.3.12")
+# Default moved off upstream weaveworksdemos/front-end:0.3.12, 2026-08-26:
+# that image crashes its whole Node process whenever a backend service
+# becomes unreachable (JSON.parse(undefined) thrown from inside a `request`
+# callback, uncaught -> exit 1), so faulting ANY single service took the
+# entire storefront down instead of just that service's pages. Replaced by
+# a patched multi-arch rebuild -- see deploy/rebuild_wardence_frontend.sh
+# and deploy/frontend_json_parse_fix.patch. The tag is a manifest list
+# covering amd64 (WSL2) + arm64 (Oracle), so BOTH hosts now use this one
+# value; previously they ran different images and therefore different code.
+# Rollback = point this (and the 3 other places listed in the rebuild
+# script) back at the previous tag.
+FRONT_END_IMAGE_BASELINE = os.environ.get(
+    "FRONT_END_IMAGE_BASELINE", "ghcr.io/aayush8392/front-end:0.3.12-wardence1"
+)
 FRONT_END_IMAGE_FAULT = FRONT_END_IMAGE_BASELINE + "-wardence-badtag"
 
 
@@ -1502,30 +1576,71 @@ def delete_chaos_resource(kind: str, name: str):
 
 
 def _ensure_oom_baseline(cfg: dict):
-    """Resets catalogue's memory limit back to OOM_BASELINE_MEMORY_LIMIT
-    before injecting, if it's currently anything else -- see the
-    constant's docstring for why this is needed (a real successful fix
-    permanently raises the limit, and nothing else reverts it).
-    Idempotent: does nothing if the limit is already at baseline, which
-    is the common case (only matters right after a real fix cycle).
-    """
-    result = subprocess.run(
+    """Resets catalogue's memory limit AND request back to
+    OOM_BASELINE_MEMORY_LIMIT/OOM_BASELINE_MEMORY_REQUEST before
+    injecting, if either is currently anything else -- see
+    OOM_BASELINE_MEMORY_LIMIT's docstring for why the limit check is
+    needed (a real successful fix permanently raises it, nothing else
+    reverts it) and OOM_FORCED_KILL_MEMORY_REQUEST's docstring for why
+    the request also needs checking, added 2026-08-26 (the live-trigger
+    forced-kill hold patches requests down too; the hold's own `finally`
+    block restores both on a normal exit, but this is the safety net for
+    an abnormal one -- e.g. a hard process kill that skips `finally`).
+    Idempotent: does nothing if both are already at baseline, which is
+    the common case."""
+    # Same abnormal-termination safety net for the rollout strategy: the
+    # forced-kill hold sets maxSurge=0/maxUnavailable=1 so the healthy pod
+    # is replaced rather than joined, and restores the original in its
+    # `finally`. If that never ran, catalogue would be left permanently
+    # surge-disabled -- every future rollout of it (including
+    # under-provisioned-replicas', which shares this target) would then
+    # take real downtime it isn't supposed to. Cheap unconditional reset.
+    surge = subprocess.run(
+        [
+            "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "-o", "jsonpath={.spec.strategy.rollingUpdate.maxSurge}",
+        ],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if surge == "0":
+        print(f"  {cfg['target']}'s rollout strategy is still surge-disabled from an "
+              f"interrupted forced-kill hold -- restoring {OOM_BASELINE_ROLLOUT_STRATEGY}...")
+        subprocess.run(
+            [
+                "kubectl", "patch", "deployment", cfg["target"], "-n", cfg["namespace"],
+                "--type=strategic",
+                "-p", '{"spec":{"strategy":{"rollingUpdate":' + OOM_BASELINE_ROLLOUT_STRATEGY + '}}}',
+            ],
+            capture_output=True, text=True,
+        )
+
+    limit_result = subprocess.run(
         [
             "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
             "-o", "jsonpath={.spec.template.spec.containers[0].resources.limits.memory}",
         ],
         capture_output=True, text=True,
     )
-    current_limit = result.stdout.strip()
-    if current_limit == OOM_BASELINE_MEMORY_LIMIT:
+    request_result = subprocess.run(
+        [
+            "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
+            "-o", "jsonpath={.spec.template.spec.containers[0].resources.requests.memory}",
+        ],
+        capture_output=True, text=True,
+    )
+    current_limit = limit_result.stdout.strip()
+    current_request = request_result.stdout.strip()
+    if current_limit == OOM_BASELINE_MEMORY_LIMIT and current_request == OOM_BASELINE_MEMORY_REQUEST:
         return
 
-    print(f"  {cfg['target']}'s memory limit is {current_limit or '(unknown)'}, not the "
-          f"{OOM_BASELINE_MEMORY_LIMIT} baseline -- resetting before injecting "
-          f"(a prior real fix likely raised it)...")
+    print(f"  {cfg['target']}'s memory limit/request is {current_limit or '(unknown)'}/"
+          f"{current_request or '(unknown)'}, not the {OOM_BASELINE_MEMORY_LIMIT}/"
+          f"{OOM_BASELINE_MEMORY_REQUEST} baseline -- resetting before injecting "
+          f"(a prior real fix or an abnormally-terminated forced-kill hold likely changed it)...")
     patch_body = (
         '{"spec":{"template":{"spec":{"containers":[{"name":"' + cfg["container"] + '",'
-        '"resources":{"limits":{"memory":"' + OOM_BASELINE_MEMORY_LIMIT + '"}}}]}}}}'
+        '"resources":{"limits":{"memory":"' + OOM_BASELINE_MEMORY_LIMIT + '"},'
+        '"requests":{"memory":"' + OOM_BASELINE_MEMORY_REQUEST + '"}}}]}}}}'
     )
     subprocess.run(
         [
@@ -3906,30 +4021,32 @@ def _inject_and_verify_oom(
     iteration in case of pod churn under memory pressure (same
     old-pod/new-pod bug class already found elsewhere in this file).
 
-    stop_file/evidence_file, added 2026-08-25: when either is given (a
-    live trigger), branches into a real SUSTAINED hold -- real
-    live-measured kill timing this session (episodes aa30d274/28dad6f7,
-    plus test_oom_real_live_window.py runs) showed the actual kill now
-    lands in ~3-9s and catalogue recovers within ~17-25s total, so a
-    one-shot injection (the batch-run behavior below) no longer produces
-    a persistently-broken storefront the way every other holding class
-    does -- confirmed via direct comparison with the demo-visibility
-    history in wardence_frontend.md, which describes oom's original
-    2026-08-15 confirmation as already fast-recovering even then, not a
-    regression. The live-trigger path keeps the StressChaos resource
-    APPLIED for the full hold window (or until stop_file appears)
-    instead of tearing it down after the first confirmed kill --
-    Chaos Mesh's mode: one selector re-targets whichever pod currently
-    matches, so a freshly-restarted catalogue pod should keep climbing
-    back toward the 200Mi limit and get re-killed, producing a genuine
-    repeating flap for the whole window rather than one brief dip.
-    Diagnostically safe: agent.py's stub_diagnose and react_agent.py's
-    prompt both already check oom_pods (and evicted_pods/
-    front_end_image_pull_failing) BEFORE crashlooping_pods, specifically
-    because crash_query's restart-increase signal fires on any restart
-    for any reason -- a pre-existing safeguard, not something new
-    needed here. Batch runs (both None) are completely untouched --
-    same original one-shot loop as before, zero behavior change."""
+    stop_file/evidence_file, added 2026-08-25, REDESIGNED 2026-08-26: when
+    either is given (a live trigger), branches into a real SUSTAINED
+    hold -- so a one-shot injection (the batch-run behavior below)
+    doesn't just produce one brief dip the way it originally did.
+    First design (keep re-applying a StressChaos CR after every
+    confirmed kill, racing the stressor's growth rate against the
+    kernel's own OOM-kill timing) was live-tested repeatedly
+    (test_oom_stress_and_interrupt.py) and found genuinely unreliable,
+    not flaky-but-usable: 2 of 6 back-to-back cycles across two
+    duration settings produced ZERO kills over their whole window, and
+    the cycles that did kill landed anywhere from <10s to 135s -- see
+    OOM_FORCED_KILL_MEMORY_LIMIT's own comment for the full real data.
+    Redesigned to patch the deployment's memory LIMIT itself down to
+    OOM_FORCED_KILL_MEMORY_LIMIT for the whole hold window instead of
+    racing a stressor against a fixed limit -- any real memory the
+    process allocates during ordinary startup already exceeds this
+    limit, so the kernel's cgroup OOM killer fires deterministically on
+    ~every restart attempt, continuously down for the hold window
+    rather than flapping. Diagnostically safe: agent.py's stub_diagnose
+    and react_agent.py's prompt both already check oom_pods (and
+    evicted_pods/front_end_image_pull_failing) BEFORE crashlooping_pods,
+    specifically because crash_query's restart-increase signal fires on
+    any restart for any reason -- a pre-existing safeguard, not
+    something new needed here. Batch runs (both None) are completely
+    untouched -- same original one-shot StressChaos loop as before,
+    zero behavior change."""
     chaos_kind = "stresschaos"
     namespace = cfg["namespace"]
     target = cfg["target"]
@@ -3973,43 +4090,91 @@ def _inject_and_verify_oom(
             print(f"  attempt {attempt}: no OOM kill detected within {OOM_VERIFY_CEILING_S}s{suffix}")
         return None
 
-    # Live-trigger sustained-hold path.
-    #
-    # Real, live-verified correction, 2026-08-25 (manual StressChaos test
-    # against catalogue): a StressChaos CR does NOT re-inject its stress
-    # process after the target container restarts, even though the CR
-    # object itself stays "applied" -- confirmed directly, ~5 real
-    # minutes of flat 2-6MiB memory (no climb at all) after the first
-    # kill, same CR, untouched. The original design (leave one CR applied
-    # and just keep polling) was WRONG and would have silently done
-    # nothing after the first kill. Fixed: re-apply a FRESH CR (new name)
-    # after every confirmed kill, same manifest each time -- same
-    # apply-then-verify shape as the batch-run path's own per-attempt
-    # loop above, just looped continuously for the hold window instead of
-    # returning after one success.
+    # Live-trigger sustained-hold path -- forced-limit redesign, 2026-08-26.
+    # See OOM_FORCED_KILL_MEMORY_LIMIT's docstring for why the old
+    # re-apply-a-StressChaos-CR-per-kill approach was replaced. Patches
+    # the deployment's memory limit down for the whole hold window
+    # instead of applying/deleting chaos CRs -- chaos_kind/build_oom_manifest
+    # are unused on this path now (still used by the batch-run path above).
     duration_s = cfg["duration_s"]
+    tick_s = OOM_VERIFY_POLL_S
     evidence_written = False
     interrupted = False
     elapsed = 0
-    tick_s = OOM_VERIFY_POLL_S
-    active_chaos_name = None
-    last_chaos_name = None
+
+    old_pod_name = _current_pod_name(target, namespace)
+
+    # Capture the REAL current rollout strategy so it can be restored
+    # verbatim, rather than hardcoding values that would silently go stale
+    # (same duplicate-constant-drift trap this project has already been
+    # bitten by twice).
+    original_strategy = subprocess.run(
+        [
+            "kubectl", "get", "deployment", target, "-n", namespace,
+            "-o", "jsonpath={.spec.strategy.rollingUpdate}",
+        ],
+        capture_output=True, text=True,
+    ).stdout.strip() or '{"maxSurge":"25%","maxUnavailable":"25%"}'
+
+    # Real bug found live 2026-08-26 (episode 93495bf3) and fixed here:
+    # target's rollout strategy is maxSurge=25%/maxUnavailable=25%, which
+    # at replicas=1 rounds surge UP to 1 and unavailable DOWN to 0. The
+    # previous approach (patch resources, then `kubectl delete pod <old>`)
+    # therefore produced TWO pods, not one: the new forced-kill pod from
+    # the new ReplicaSet, AND a freshly-recreated *baseline-spec* pod,
+    # because deleting a pod while its old ReplicaSet is still scaled to 1
+    # just makes that ReplicaSet replace it. Both matched the Service
+    # selector, so catalogue stayed partly healthy for ~17s -- and worse,
+    # _current_pod_name (items[0], name-sorted) resolved to the HEALTHY
+    # one, so the OOM baseline was captured off a pod that would never be
+    # killed. Fixed by patching the STRATEGY to maxSurge=0/maxUnavailable=1
+    # in the same call: the controller then terminates the old pod BEFORE
+    # creating the replacement, so exactly one pod exists at all times and
+    # no manual delete (and no recreate race) is involved at all.
+    forced_patch = (
+        '{"spec":{"strategy":{"rollingUpdate":{"maxSurge":0,"maxUnavailable":1}},'
+        '"template":{"spec":{"containers":[{"name":"' + container + '",'
+        '"resources":{"limits":{"memory":"' + OOM_FORCED_KILL_MEMORY_LIMIT + '"},'
+        '"requests":{"memory":"' + OOM_FORCED_KILL_MEMORY_REQUEST + '"}}}]}}}}'
+    )
+    print(f"  live hold: patching {target}'s memory limit to {OOM_FORCED_KILL_MEMORY_LIMIT} "
+          f"(forced-kill; surge disabled so the healthy pod is replaced, not joined)...")
+    subprocess.run(
+        ["kubectl", "patch", "deployment", target, "-n", namespace, "--type=strategic", "-p", forced_patch],
+        capture_output=True, text=True,
+    )
+
+    # Re-resolve baseline against the REPLACEMENT pod, not the old one --
+    # its restartCount starts fresh at 0, so a baseline carried over from
+    # the old pod's (much higher) count would make _pod_oom_killed's
+    # `current > baseline` check never fire. Deliberately does NOT filter
+    # on phase=Running the way _current_pod_name does: under a 1Mi limit
+    # the replacement is expected to be OOM-killed essentially instantly,
+    # so waiting for it to look healthy would be waiting for something
+    # that never happens.
+    pod_name = None
+    for _ in range(30):
+        candidate = subprocess.run(
+            [
+                "kubectl", "get", "pods", "-n", namespace, "-l", f"name={target}",
+                "-o", "jsonpath={.items[0].metadata.name}",
+            ],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        if candidate and candidate != old_pod_name:
+            pod_name = candidate
+            break
+        time.sleep(1)
+    baseline_restart_count = (
+        _pod_restart_count_direct(pod_name, namespace, container) if pod_name is not None else 0
+    )
+    print(f"  live hold: replacement pod {pod_name!r}, baseline restartCount={baseline_restart_count}")
+
     try:
         while elapsed < duration_s:
             if stop_file is not None and os.path.exists(stop_file):
                 interrupted = True
                 break
-            if active_chaos_name is None:
-                pod_name = _current_pod_name(target, namespace)
-                baseline_restart_count = (
-                    _pod_restart_count_direct(pod_name, namespace, container) if pod_name is not None else None
-                )
-                active_chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
-                manifest = build_oom_manifest(active_chaos_name, cfg)
-                apply_manifest(manifest)
-                last_chaos_name = active_chaos_name
-                print(f"  live hold [t={elapsed}s]: fresh stressor applied, "
-                      f"baseline restartCount={baseline_restart_count}...")
             current_pod_name = _current_pod_name(target, namespace)
             if (
                 current_pod_name is not None
@@ -4019,19 +4184,55 @@ def _inject_and_verify_oom(
                 if not evidence_written:
                     evidence_written = True
                     _write_evidence_file_once(evidence_file)
-                print(f"  live hold [t={elapsed}s]: real OOM kill confirmed, re-applying a fresh stressor...")
-                delete_chaos_resource(chaos_kind, active_chaos_name)
-                active_chaos_name = None  # triggers a fresh apply next tick
+                    print(f"  live hold [t={elapsed}s]: real OOM kill confirmed "
+                          f"(forced-limit hold, continuously down for the rest of the window)")
+                # Re-baseline to the current pod/count so the NEXT restart in
+                # this same continuous crash-loop is still detected as a
+                # fresh kill, not silently ignored as "still above baseline".
+                pod_name = current_pod_name
+                baseline_restart_count = _pod_restart_count_direct(pod_name, namespace, container)
             time.sleep(tick_s)
             elapsed += tick_s
     finally:
-        if active_chaos_name is not None:
-            delete_chaos_resource(chaos_kind, active_chaos_name)
+        # Real bug found and fixed 2026-08-26, live episode 6700510c: this
+        # used to also block here on `kubectl rollout status --timeout=300s`
+        # before returning. catalogue's real readinessProbe has
+        # initialDelaySeconds=180 (see _ensure_oom_baseline's own comment),
+        # so that wait alone could add up to ~180s of dead time AFTER the
+        # user clicks "Diagnose & Fix" and BEFORE diagnosis can even run --
+        # confirmed live: the episode took ~239s total despite an early
+        # interrupt, well past oom_pods' own 3-minute sticky lookback
+        # window, so by the time diagnosis finally ran, the real OOM
+        # evidence had already aged out and the diagnoser fell through to
+        # catalogue's genuinely-elevated mid-rollout latency instead,
+        # misdiagnosing as under-provisioned-replicas (both the stub and
+        # the LLM independently landed on the same wrong answer, same
+        # reasoning -- confirmed via llm_diagnosis_log/scores/
+        # misdispatch_log). Fixed: patch and return immediately, don't
+        # block the diagnosis-critical path on full rollout health --
+        # _ensure_oom_baseline (called before the NEXT injection) is the
+        # correct place for that wait, not here.
+        print(f"  live hold: restoring {target}'s memory limit to {OOM_BASELINE_MEMORY_LIMIT} "
+              f"and its original rollout strategy (not waiting for rollout -- see comment above)...")
+        # Restores BOTH the resources and the rollout strategy captured
+        # before injecting -- leaving maxSurge=0 behind would permanently
+        # change how every future catalogue rollout behaves, a silent
+        # side effect well outside this fault's intended blast radius.
+        restore_patch = (
+            '{"spec":{"strategy":{"rollingUpdate":' + original_strategy + '},'
+            '"template":{"spec":{"containers":[{"name":"' + container + '",'
+            '"resources":{"limits":{"memory":"' + OOM_BASELINE_MEMORY_LIMIT + '"},'
+            '"requests":{"memory":"' + OOM_BASELINE_MEMORY_REQUEST + '"}}}]}}}}'
+        )
+        subprocess.run(
+            ["kubectl", "patch", "deployment", target, "-n", namespace, "--type=strategic", "-p", restore_patch],
+            capture_output=True, text=True,
+        )
 
     if interrupted:
-        print("  early-stop requested -- not retrying")
+        print("  early-stop requested -- baseline limit restored")
 
-    return last_chaos_name if evidence_written else None
+    return "forced-limit-hold" if evidence_written else None
 
 
 def main():

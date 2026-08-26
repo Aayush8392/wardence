@@ -418,19 +418,19 @@ SETTLE_SECONDS = 35
 # the original 35s via .get()'s default.
 SETTLE_SECONDS_OVERRIDE = {
     "network-partition": 60,
-    # Real fix, 2026-08-25 (episodes aa30d274/28dad6f7): oom's real kill
-    # timing is genuinely variable (kernel-level, non-deterministic) --
-    # live-measured this session at 3-9s, but the class's own OOM_VERIFY_
-    # CEILING_S=200 and the historical two data points that sized it
-    # (97s/119s, see injector.py's _inject_and_verify_oom docstring) show
-    # a real slow tail up toward ~120s. oom_pods/crashlooping_pods
-    # (agent.py's oom_query) is a STICKY signal -- last_terminated_reason
-    # gated by increase(restarts_total[3m]) -- so a later snapshot doesn't
-    # risk missing a fast kill the way it would for an instant-state
-    # check; it only needs to land AFTER the real kill, not tightly after
-    # it. 150s comfortably covers both the fast (3-9s) and slow (~120s)
-    # ends of the real observed range while staying inside the query's
-    # own 3-minute lookback.
+    # DEAD for oom as of 2026-08-26 -- kept only so .get()'s default
+    # doesn't silently change for anyone still reading this dict; the real
+    # oom snapshot_at is now computed in _attempt_resolve from the real
+    # evidence-confirmed timestamp, never from this override. Original
+    # 2026-08-25 reasoning ("later is safer, the signal is sticky") was
+    # true under the OLD CR-based hold, which never deleted the pod during
+    # its own lifetime. The 2026-08-26 forced-kill redesign's own
+    # interrupt/restore step DOES delete the pod (a clean replace, not an
+    # in-place restart) -- once gone, Prometheus marks its OOMKilled
+    # series stale almost immediately, so a later snapshot is now the
+    # WORSE choice, the opposite of what this entry assumed. Confirmed
+    # live, episode 2416ce44: this exact 150s value walked straight past
+    # the pod's real ~105s teardown and produced a genuine misdiagnosis.
     "oom": 150,
 }
 
@@ -1129,23 +1129,76 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     ).fetchone()
     conn.close()
     t0 = datetime.datetime.fromisoformat(t0_row[0])
-    settle_seconds = SETTLE_SECONDS_OVERRIDE.get(t0_row[1], SETTLE_SECONDS)
-    # Real evidence-freezing timestamp -- the moment evidence was
-    # genuinely ready (t0 + settle_seconds), computed here regardless of
-    # how much real wall-clock time passes AFTER this point waiting for
-    # a manual resolve click or the abandonment ceiling. This is the
-    # actual fix for a genuine live-tested bug: a real crash-loop
-    # episode's restart evidence aged out of agent.py's own [3m]
-    # diagnosis query because the real elapsed time from injection to
-    # diagnosis (holding's own duration + up to the full 300s ceiling)
-    # can exceed 8 minutes -- the query was always evaluated against
-    # live "now", however much later "now" turned out to be. Passed
-    # through to p3_scorer.py --snapshot-at -> p3_agent.py /diagnose ->
-    # every PromQL query in agent.py's query_prometheus, all of which
-    # now evaluate against this fixed point instead of live "now".
-    snapshot_at = (t0 + datetime.timedelta(seconds=settle_seconds)).isoformat()
-    elapsed_s = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds()
-    remaining_s = settle_seconds - elapsed_s
+    fault_class = t0_row[1]
+
+    # Real bug found and fixed 2026-08-26, live episode 2416ce44:
+    # oom's forced-kill hold (injector.py's _inject_and_verify_oom) is
+    # DIFFERENT from every other class this t0+settle_seconds formula was
+    # designed around -- its own interrupt/restore step DELETES the
+    # forced-kill pod object entirely (maxSurge=0/maxUnavailable=1 forces
+    # a clean replace, not an in-place restart). Once that pod is gone,
+    # kube-state-metrics stops scraping it and Prometheus marks its
+    # OOMKilled series stale almost immediately -- confirmed live via
+    # direct Prometheus queries: real restart-count samples existed for
+    # the forced-kill pod up to t0+90s, the series was entirely gone by
+    # t0+105s, and diagnosis at t0+174s (using the OLD "oom":150 override)
+    # saw nothing. A LATER snapshot_at makes this WORSE, not safer, the
+    # exact opposite of every other class's own reasoning below -- that
+    # reasoning ("sticky signal, later is safer") was true under the OLD
+    # CR-based design where the pod persisted through its own fix; it
+    # does not hold for a class whose own cleanup deletes the evidence.
+    #
+    # Real fix: for oom, don't compute snapshot_at from t0 at all -- read
+    # the REAL evidence-confirmed timestamp injector.py's own
+    # _write_evidence_file_once already wrote (str(time.time()), the
+    # instant a kubectl-API-level, sub-second, no-scrape-lag check first
+    # confirmed a genuine OOMKilled) and add one scrape cycle's worth of
+    # buffer so kube-state-metrics has definitely captured it. This lands
+    # the query INSIDE the window where the pod still genuinely existed,
+    # which is all that matters -- Prometheus retains historical samples
+    # for a since-deleted series at their own correct timestamps; only
+    # querying AT OR AFTER the staleness marker's own insertion point
+    # (which is what querying "now", long after cleanup, does) returns
+    # empty. Confirmed directly: a query_range covering the hold's real
+    # window successfully returned the forced-kill pod's historical
+    # restart-count samples well after it had been deleted.
+    if fault_class == "oom":
+        evidence_file = _evidence_file_path(episode_id)
+        if evidence_file.exists():
+            evidence_epoch = float(evidence_file.read_text().strip())
+            target_dt = datetime.datetime.fromtimestamp(
+                evidence_epoch + SETTLE_SECONDS, tz=datetime.timezone.utc
+            )
+        else:
+            # No evidence file (shouldn't happen -- oom is in
+            # EVIDENCE_FILE_CLASSES -- but never silently fall through to
+            # the stale t0-based formula this whole fix exists to avoid).
+            target_dt = t0 + datetime.timedelta(seconds=SETTLE_SECONDS)
+        snapshot_at = target_dt.isoformat()
+        # Almost always already in the past by the time resolve actually
+        # runs (evidence_confirmed has to flip before "Diagnose & Fix" is
+        # even clickable) -- computed properly anyway, not hardcoded to 0,
+        # for the rare case of an automated/instant click landing before
+        # this buffer has elapsed in real time.
+        remaining_s = (target_dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+    else:
+        settle_seconds = SETTLE_SECONDS_OVERRIDE.get(fault_class, SETTLE_SECONDS)
+        # Real evidence-freezing timestamp -- the moment evidence was
+        # genuinely ready (t0 + settle_seconds), computed here regardless of
+        # how much real wall-clock time passes AFTER this point waiting for
+        # a manual resolve click or the abandonment ceiling. This is the
+        # actual fix for a genuine live-tested bug: a real crash-loop
+        # episode's restart evidence aged out of agent.py's own [3m]
+        # diagnosis query because the real elapsed time from injection to
+        # diagnosis (holding's own duration + up to the full 300s ceiling)
+        # can exceed 8 minutes -- the query was always evaluated against
+        # live "now", however much later "now" turned out to be. Passed
+        # through to p3_scorer.py --snapshot-at -> p3_agent.py /diagnose ->
+        # every PromQL query in agent.py's query_prometheus, all of which
+        # now evaluate against this fixed point instead of live "now".
+        snapshot_at = (t0 + datetime.timedelta(seconds=settle_seconds)).isoformat()
+        elapsed_s = (datetime.datetime.now(datetime.timezone.utc) - t0).total_seconds()
+        remaining_s = settle_seconds - elapsed_s
     if remaining_s > 0:
         time.sleep(remaining_s + RESOLVE_SAFETY_BUFFER_S)
 

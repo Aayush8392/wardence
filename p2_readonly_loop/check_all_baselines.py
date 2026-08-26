@@ -38,7 +38,15 @@ NAMESPACE = "sock-shop"
 OOM_BASELINE_MEMORY_LIMIT = "200Mi"
 CPU_THROTTLE_BASELINE_CPU_LIMIT = "300m"
 UNDER_PROVISIONED_BASELINE_REPLICAS = 1
-FRONT_END_IMAGE_BASELINE = os.environ.get("FRONT_END_IMAGE_BASELINE", "weaveworksdemos/front-end:0.3.12")
+# Kept deliberately standalone (see this file's docstring) -- so it must be
+# updated in lockstep with injector.py's own copy. Moved off upstream
+# weaveworksdemos/front-end:0.3.12, 2026-08-26, to the patched multi-arch
+# rebuild; see injector.py's copy for the full reasoning. NOTE: this file's
+# drift-check REVERTS front-end to whatever this value is -- on 2026-08-24
+# a stale value here silently re-broke a just-applied image fix mid-session.
+FRONT_END_IMAGE_BASELINE = os.environ.get(
+    "FRONT_END_IMAGE_BASELINE", "ghcr.io/aayush8392/front-end:0.3.12-wardence1"
+)
 PAYMENT_READINESS_PATH_BASELINE = "/health"
 SESSION_DB_BASELINE_REPLICAS = 1
 QUEUE_MASTER_EPHEMERAL_LIMIT_BASELINE = "300Mi"

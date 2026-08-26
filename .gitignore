@@ -192,6 +192,7 @@ test_trigger_endpoint_timeout.py
 test_untested_class_timeouts.py
 test_oom_baseline_reset_timing.py
 test_oom_sustained_hold.py
+test_oom_stress_and_interrupt.py
 test_upr_worst_case_timing.py
 
 # Real trust-state safety-net snapshots (snapshot_restore_trust_state.py's
