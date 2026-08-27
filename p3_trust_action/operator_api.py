@@ -321,19 +321,18 @@ INJECT_SUBPROCESS_TIMEOUT_S = {
     # demo-visibility fix landed (see injector.py's CPU_THROTTLE_LIVE_
     # TRIGGER_*/_inject_and_verify_cpu_throttling_live_trigger). Real,
     # NOT YET LIVE-MEASURED reasoning, sized generously on purpose: the
-    # live-trigger path now brackets the 300s hold with TWO real
-    # Deployment rollouts (loosen before, restore after), and each
-    # fresh replacement pod still has to wait out user's real
-    # readinessProbe.initialDelaySeconds=180s before `kubectl rollout
-    # status` reports success (only periodSeconds/timeoutSeconds/
-    # failureThreshold are patched, initialDelaySeconds is never
-    # touched -- confirmed live, every probe dump this session still
-    # showed the real 180s value). 900 = 300s hold + 2x240s (each
-    # rollout's own internal timeout, itself already padded past the
-    # real 180s floor) + margin. Revisit with a real live timing test
-    # (same discipline as oom's/UPR's own recalibration entries above)
-    # before trusting this number under real pressure -- it is a safe
-    # upper bound, not a measured one.
+    # live-trigger path brackets the 300s hold with real Deployment
+    # rollouts (loosen before, restore after), and the loosen rollout's
+    # fresh pod has to wait out its own readiness delay before `kubectl
+    # rollout status` reports success. 900 = 300s hold + 240s loosen
+    # rollout + generous margin. As of 2026-08-27 the RESTORE rollout is
+    # no longer blocking (_restore_user_probes fires the patch and
+    # returns -- see its docstring, identical to oom's 2026-08-26 bug #3
+    # fix), so the second 240s wait this budget originally padded for is
+    # gone and 900 now has even more headroom. Still NOT live-measured;
+    # revisit with a real live timing test (same discipline as oom's/
+    # UPR's own recalibration entries above) before trusting it under
+    # real pressure -- it is a safe upper bound, not a measured one.
     "cpu-throttling": 900,
     # under-provisioned-replicas: RECALIBRATED 150 -> 300, 2026-08-1x
     # (Kimi review 34 finding #8's scope extended past the review itself,

@@ -3718,24 +3718,35 @@ def _loosen_user_probes_for_fault(cfg: dict) -> str | None:
 
 
 def _restore_user_probes(cfg: dict):
-    """Reverts user's probes back to the real tight production values,
-    verified via real rollout status -- same 'verify real completion,
-    not just API acceptance' discipline as restore_from_disk_full.
-    240s timeout, not 90s: real bug found live during this design's own
-    validation -- the reverted pod must wait out the real
-    readinessProbe.initialDelaySeconds=180s before it reports Ready, so
-    anything shorter than that (plus margin) was structurally
-    guaranteed to time out even on a clean revert."""
+    """Reverts user's probes back to the real tight production values.
+
+    Fires the strategic-merge patch (which initiates a genuine
+    RollingUpdate on the k8s side) and returns immediately -- it does
+    NOT block on `kubectl rollout status`.
+
+    Why non-blocking (changed 2026-08-27, identical bug shape to oom's
+    2026-08-26 bug #3): this runs inside
+    _inject_and_verify_cpu_throttling_live_trigger's finally block, i.e.
+    right before Operator's diagnosis/scoring fires. The revert's fresh
+    pod has to wait out user's real readinessProbe.initialDelaySeconds
+    =180s before `kubectl rollout status` can report success -- so
+    blocking here dumped that entire ~180s of dead time between the
+    user's "Diagnose & Fix" click and the LLM reasoning actually
+    starting. Confirmed live 2026-08-27 (~2 min gap).
+
+    Safe to not wait: (1) cpu-throttling's diagnosis query is a
+    backward-looking increase(container_cpu_cfs_throttled_periods_total
+    [6m]) -- it reads throttling that already happened during the hold,
+    it does not care what state the pod is in right now; (2) the
+    StressChaos is already deleted earlier in the same finally block, so
+    throttling has stopped regardless; (3) _ensure_cpu_throttle_probe_
+    baseline at the NEXT episode's start is the real safety net for
+    drift -- and it still does its own blocking rollout wait, at
+    injection time when nothing is watching a clock. traffic_gen keeps
+    hitting user via Service DNS throughout (the old pod stays Ready
+    during a default RollingUpdate), so nothing external breaks while
+    the revert settles in the background."""
     _patch_user_probes(cfg, CPU_THROTTLE_TIGHT_READINESS_PROBE, CPU_THROTTLE_TIGHT_LIVENESS_PROBE)
-    result = subprocess.run(
-        [
-            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
-            "--timeout=240s",
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        print(f"  WARNING: probe-restore rollout did not confirm cleanly: {result.stderr.strip()[:300]}")
 
 
 def _ensure_cpu_throttle_login_user_exists(cfg: dict):
