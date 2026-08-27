@@ -2275,7 +2275,12 @@ export default function () {{
             "-n", namespace, f"--image={K6_IMAGE}", "--image-pull-policy=IfNotPresent",
             "--", "run", "--quiet", "-",
         ],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # stdout/stderr -> DEVNULL: this proc's output is never read, and
+        # DEVNULL means the caller can reap with proc.wait() (never
+        # communicate() -- stdin is closed just below and communicate()
+        # re-flushes it, raising ValueError on Python 3.12; hit live on
+        # Oracle 2026-08-27) with zero pipe-buffer-deadlock risk.
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
     )
     proc.stdin.write(script)
     proc.stdin.close()
@@ -2519,9 +2524,12 @@ def _inject_and_verify_under_provisioned(
             except Exception:
                 pass
         else:
+            # wait(), not communicate(): stdin was closed in the launcher
+            # and communicate() re-flushes it -> ValueError on Python 3.12
+            # (Oracle). DEVNULL stdout/stderr means wait() can't deadlock.
             try:
-                burst_proc.communicate(timeout=30)
-            except subprocess.TimeoutExpired:
+                burst_proc.wait(timeout=30)
+            except Exception:
                 burst_proc.kill()
 
     if interrupted:
@@ -3814,7 +3822,12 @@ export default function () {{
             "-n", namespace, f"--image={K6_IMAGE}", "--image-pull-policy=IfNotPresent",
             "--", "run", "--quiet", "-",
         ],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        # stdout/stderr -> DEVNULL: this proc's output is never read, and
+        # DEVNULL means the caller can reap with proc.wait() (never
+        # communicate() -- stdin is closed just below and communicate()
+        # re-flushes it, raising ValueError on Python 3.12; hit live on
+        # Oracle 2026-08-27) with zero pipe-buffer-deadlock risk.
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
     )
     proc.stdin.write(script)
     proc.stdin.close()
@@ -3974,9 +3987,14 @@ def _inject_and_verify_cpu_throttling_live_trigger(cfg: dict, stop_file: str) ->
         if load_pod is not None:
             _kill_pod_now(namespace, load_pod)
         if load_proc is not None:
+            # wait(), not communicate(): stdin was closed in the launcher
+            # and communicate() re-flushes it -> ValueError on Python 3.12
+            # (Oracle, 2026-08-27 -- this exact line crashed the whole
+            # injector, skipping _restore_user_probes below). DEVNULL
+            # stdout/stderr means wait() can't deadlock.
             try:
-                load_proc.communicate(timeout=15)
-            except subprocess.TimeoutExpired:
+                load_proc.wait(timeout=15)
+            except Exception:
                 load_proc.kill()
         # Probes restored LAST, unconditionally, regardless of how the
         # hold ended -- the one thing that must never be skipped, same
