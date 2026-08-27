@@ -2910,7 +2910,7 @@ def record_episode(
     conn.commit()
 
 
-def _inject_and_verify_disk_full(cfg: dict) -> bool:
+def _inject_and_verify_disk_full(cfg: dict, evidence_file: str | None = None) -> bool:
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
         baseline_pod_name = _current_pod_name(cfg["target"], cfg["namespace"])
         if baseline_pod_name is None:
@@ -2939,6 +2939,20 @@ def _inject_and_verify_disk_full(cfg: dict) -> bool:
             # this whole verify-before-record fix exists to prevent.
             _cleanup_disk_full_files(cfg["target"], cfg["namespace"], cfg["container"])
         if verified:
+            # Real bug found and fixed 2026-08-27, live episodes ca34c1d2/
+            # 59ed73ab: the real eviction confirmed HERE (a fast,
+            # kubectl-API-level check) is not yet visible in Prometheus --
+            # kube-state-metrics needs its own scrape cycle to catch up,
+            # confirmed live to take well past 35s (the real diagnosis
+            # snapshot_at used to be a blind t0+35s, landing before this
+            # confirmation in both real cases). Same root shape as oom's
+            # own evidence-file fix (2026-08-26) -- write the real
+            # confirmation instant so operator_api.py's _attempt_resolve
+            # can compute snapshot_at from IT instead of t0. Unlike oom,
+            # the evicted pod object here is deliberately NOT deleted
+            # before diagnosis (cleanup deferred to the next injection),
+            # so there's no "later is worse" risk -- purely additive safety.
+            _write_evidence_file_once(evidence_file)
             # Real gap found 2026-07-31: Kubernetes does NOT auto-delete
             # an evicted pod's Failed object (same "lingers indefinitely"
             # behavior agent.py's own oom_query/evicted_query docstrings
@@ -4359,7 +4373,7 @@ def main():
 
         if fault_class == "disk-full":
             _ensure_queue_master_pod_cleanup(cfg)
-            verified = _inject_and_verify_disk_full(cfg)
+            verified = _inject_and_verify_disk_full(cfg, evidence_file=args.evidence_file)
             chaos_name = "manual-exec" if verified else None
         elif fault_class == "crash-loop":
             if not _ensure_crash_loop_baseline():

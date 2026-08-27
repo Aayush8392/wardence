@@ -99,7 +99,7 @@ FAULT_CLASSES = [
 # UNDER_PROVISIONED_PROBE_THRESHOLD_MS by hand if any of those ever change.
 NETWORK_PARTITION_MAX_THROUGHPUT_BPS = int(os.environ.get("NETWORK_PARTITION_MAX_THROUGHPUT_BPS", "200"))
 
-FIELD_GUIDANCE = f"""Field meanings and thresholds (a null/false/empty field means that signal did not fire):
+_FIELD_GUIDANCE_BASE = f"""Field meanings and thresholds (a null/false/empty field means that signal did not fire):
 - oom_pods: non-empty -> oom.
 - evicted_pods: non-empty -> disk-full.
 - crashlooping_pods: non-empty (and oom_pods/evicted_pods/front_end_image_pull_failing all empty/false) -> crash-loop. Check front_end_image_pull_failing (below) BEFORE concluding crash-loop -- a bad-rollout episode's own image-reset step can leave residual restart activity on front-end that satisfies this signal even when nothing is actually crash-looping; front_end_image_pull_failing is the more specific, direct signal and wins.
@@ -110,10 +110,41 @@ FIELD_GUIDANCE = f"""Field meanings and thresholds (a null/false/empty field mea
 - heap_rise_kb (shipping only): >= 20000 KB (20 MiB) above the episode's own captured pre-injection heap floor -> memory-leak.
 - peak_threads_connected (catalogue-db only): >= 100 -> connection-pool-exhaustion.
 - cpu_throttle_periods_increase (user only): >= 100 -> cpu-throttling.
-- front_end_image_pull_failing: true -> bad-rollout.
+- front_end_image_pull_failing: true -> bad-rollout."""
+
+# Real bug found and fixed 2026-08-27, live disk-full episodes (evicted_pods
+# investigation): these 2 bullets reference catalogue_probe_p95_ms/
+# probe_catalogue_capacity, a tool ONLY ever added to `tools` when
+# target=="catalogue" (see p3_agent.py's _build_llm_tools) -- but
+# FIELD_GUIDANCE used to be one flat constant sent verbatim to EVERY
+# class's prompt regardless of target, so a disk-full (target=queue-master)
+# episode's real transcript showed the model independently reasoning about
+# being told to call a tool its own tool list never actually offered,
+# before falling back to "none". Cosmetic on disk-full specifically once
+# evicted_pods' own snapshot-timing bug (same investigation) was fixed --
+# the model now diagnoses off evicted_pods before ever reaching this part
+# of the prompt -- but a real, standing inconsistency for every non-
+# catalogue target regardless. Fixed by gating these 2 bullets on the same
+# real condition the tool list itself uses, so this can't drift out of
+# sync with it again: whether probe_catalogue_capacity is actually IN this
+# call's own `tools` dict, not a separately-checked target string.
+_CATALOGUE_PROBE_GUIDANCE = """
 - catalogue_probe_p95_ms (from probe_catalogue_capacity): >= 130ms -> under-provisioned-replicas, but ONLY after you have already called query_prometheus at least once this episode and confirmed oom_pods/crashlooping_pods/evicted_pods are all empty. A degraded or dying catalogue pod (oom, crash-loop, disk-full) can ALSO show an elevated capacity-probe reading right before it's killed -- oom_pods/crashlooping_pods/evicted_pods are the more specific, direct signals and win. Never diagnose under-provisioned-replicas from catalogue_probe_p95_ms alone without having called query_prometheus first this episode.
-- dl_detector_result.is_anomalous (from call_dl_detector) on catalogue, with no other signal above having fired: this is NOT enough on its own to conclude "none" -- you MUST call probe_catalogue_capacity (if you have not already this episode) before concluding anything, since it is the one signal that can actually confirm or rule out under-provisioned-replicas. Only after probe_catalogue_capacity has been called and its result checked against the threshold above may you fall back to the closest matching class or "none". "log-anomaly detected (unclassified)" is NOT a valid diagnosis for you to output.
+- dl_detector_result.is_anomalous (from call_dl_detector) on catalogue, with no other signal above having fired: this is NOT enough on its own to conclude "none" -- you MUST call probe_catalogue_capacity (if you have not already this episode) before concluding anything, since it is the one signal that can actually confirm or rule out under-provisioned-replicas. Only after probe_catalogue_capacity has been called and its result checked against the threshold above may you fall back to the closest matching class or "none". "log-anomaly detected (unclassified)" is NOT a valid diagnosis for you to output."""
+
+_FIELD_GUIDANCE_TAIL = """
 - If NONE of the above are met, diagnosis is "none"."""
+
+
+def _field_guidance(tools: dict) -> str:
+    """FIELD_GUIDANCE, scoped to what this episode's own `tools` dict
+    actually offers -- see _CATALOGUE_PROBE_GUIDANCE's comment above for
+    the real bug this replaced (a flat constant sent to every class
+    regardless of target)."""
+    guidance = _FIELD_GUIDANCE_BASE
+    if "probe_catalogue_capacity" in tools:
+        guidance += _CATALOGUE_PROBE_GUIDANCE
+    return guidance + _FIELD_GUIDANCE_TAIL
 
 # Fields checked for a real, non-subjective "you already have an
 # unambiguous signal" shortcut -- see _has_strong_signal below. List/
@@ -279,7 +310,7 @@ def _run_episode_with_provider(
             turns_left=MAX_TURNS - turn_num + 1,
             tools_desc=_tool_desc(tools),
             classes=", ".join(FAULT_CLASSES),
-            field_guidance=FIELD_GUIDANCE,
+            field_guidance=_field_guidance(tools),
             evidence_rule=_evidence_rule(tools),
             transcript="\n".join(transcript_lines) if transcript_lines else "(none yet)",
             turn_num=turn_num,

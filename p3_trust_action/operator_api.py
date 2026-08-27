@@ -1162,7 +1162,17 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     # empty. Confirmed directly: a query_range covering the hold's real
     # window successfully returned the forced-kill pod's historical
     # restart-count samples well after it had been deleted.
-    if fault_class == "oom":
+    # disk-full added 2026-08-27 (live episodes ca34c1d2/59ed73ab): same
+    # real bug, different root cause than oom's -- not a deleted-evidence
+    # problem, but kube-state-metrics' own scrape lag on the Evicted/
+    # fresh-replacement-pod signals confirmed to regularly exceed the
+    # blind t0+SETTLE_SECONDS formula below (real gap measured 65-145s
+    # across 2 live episodes, both misdiagnosed "none" as a direct
+    # result). disk-full's evicted pod is deliberately NOT deleted before
+    # diagnosis (cleanup deferred to the next injection), so there's no
+    # "later is worse" risk the way oom has -- this reuses the exact same
+    # evidence-epoch + SETTLE_SECONDS formula, not a separately-tuned one.
+    if fault_class in ("oom", "disk-full"):
         evidence_file = _evidence_file_path(episode_id)
         if evidence_file.exists():
             evidence_epoch = float(evidence_file.read_text().strip())
@@ -1170,9 +1180,10 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
                 evidence_epoch + SETTLE_SECONDS, tz=datetime.timezone.utc
             )
         else:
-            # No evidence file (shouldn't happen -- oom is in
-            # EVIDENCE_FILE_CLASSES -- but never silently fall through to
-            # the stale t0-based formula this whole fix exists to avoid).
+            # No evidence file (shouldn't happen -- both classes are in
+            # EVIDENCE_FILE_CLASSES/evidence_file_class -- but never
+            # silently fall through to the stale t0-based formula this
+            # whole fix exists to avoid).
             target_dt = t0 + datetime.timedelta(seconds=SETTLE_SECONDS)
         snapshot_at = target_dt.isoformat()
         # Almost always already in the past by the time resolve actually
@@ -1339,7 +1350,13 @@ def _run_live_episode_inner(episode_id: str, fault_class: str, cfg: dict) -> Non
     evidence_file = _evidence_file_path(episode_id)
     holding = fault_class in HOLDING_CLASSES
     wrapper_polled = fault_class in WRAPPER_POLLED_EVIDENCE_CLASSES
-    evidence_file_class = fault_class in EVIDENCE_FILE_CLASSES
+    # disk-full is NOT a holding class (no extendable hold to interrupt --
+    # `holding` stays False for it, so none of the evidence_confirmed
+    # early-stop polling below ever runs for it either) -- it's added here
+    # purely so injector.py gets handed an --evidence-file path, for
+    # _attempt_resolve's real-confirmation-timestamp fix below (2026-08-27),
+    # not because it supports a hold/early-stop flow.
+    evidence_file_class = fault_class in EVIDENCE_FILE_CLASSES or fault_class == "disk-full"
 
     if fault_class == "memory-leak":
         _memory_leak_recency_wait(episode_id)
