@@ -218,6 +218,7 @@ p2_readonly_loop/check_fault_class_configurability.py
 p2_readonly_loop/check_upr_intensity_tuning.py
 p2_readonly_loop/check_upr_sustained_hold_test.py
 p2_readonly_loop/check_upr_post_scale_warmup.py
+p2_readonly_loop/check_upr_oracle_intensity_sweep.py
 p2_readonly_loop/resolve_stats_conflict.py
 scratch_apply_crash_loop_fixes.py
 scratch_apply_operator_api_fix.py
