@@ -154,8 +154,17 @@ export default function Operator() {
           // moves the episode to awaiting_fix, and fires the real
           // /trigger/resolve call the instant that's true -- never
           // guessed off a fixed delay.
+          // `d.stop_hold_requested` (2026-08-29): the backend-persisted
+          // twin of autoResolveRequestedRef -- a page refresh wipes the
+          // ref, so without this an auto-fix holding class the user
+          // already clicked "Diagnose & Fix" on would sit in awaiting_fix
+          // until the 5-min abandon ceiling instead of resolving now.
+          // (Report-only classes self-resolve on the backend, so this
+          // only matters for the 4 auto-fix holding classes.) Safe if the
+          // backend also acts on the flag -- the redundant resolve just
+          // 409s and is swallowed below.
           if (
-            autoResolveRequestedRef.current &&
+            (autoResolveRequestedRef.current || d.stop_hold_requested) &&
             !autoResolveFiredRef.current &&
             d.episode_state === "awaiting_fix"
           ) {

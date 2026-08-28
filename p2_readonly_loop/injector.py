@@ -2677,9 +2677,10 @@ def _patch_payment_readiness_path(cfg: dict, path: str):
     )
 
 
-def _restore_init_failure(cfg: dict):
+def _restore_init_failure(cfg: dict, wait: bool = True):
     """Reverts payment's readinessProbe back to the real baseline path
-    and waits for `kubectl rollout status` to confirm real recovery --
+    and (when `wait=True`) waits for `kubectl rollout status` to confirm
+    real recovery --
     never just assumes the patch API call succeeding means the fix
     landed (same 'verify real completion, not just API acceptance'
     discipline as restore_from_disk_full). The reverted template
@@ -2699,8 +2700,23 @@ def _restore_init_failure(cfg: dict):
     revisionHistoryLimit (default 10), confirmed NOT to accumulate the
     same way the NetworkChaos iptables chains did -- no active purge
     needed, checked per the fault-injection cleanup discipline rather
-    than assumed clean."""
+    than assumed clean.
+
+    `wait=False` (Operator live-trigger path only, 2026-08-29) fires the
+    revert patch and returns immediately without blocking on `kubectl
+    rollout status`. payment's fresh pod still has to clear its real
+    ~180s readinessProbe initialDelaySeconds, but the LLM diagnosis that
+    runs right after this is a backward-looking max_over_time(...[2m])
+    query that does NOT need the pod healthy again -- blocking here just
+    added ~90-240s of dead "LLM not firing" time to every live
+    init-failure episode (and, with the 260s subprocess timeout, risked
+    a spurious TimeoutExpired -> episode marked `failed` on slower
+    reverts). _ensure_init_failure_baseline (blocking, pre-injection) is
+    the net that still guarantees a clean start for the NEXT episode.
+    Same pattern as oom bug #3 / cpu-throttling d6c8183."""
     _patch_payment_readiness_path(cfg, PAYMENT_READINESS_PATH_BASELINE)
+    if not wait:
+        return
     result = subprocess.run(
         [
             "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
@@ -2716,7 +2732,17 @@ def _ensure_init_failure_baseline(cfg: dict):
     """Resets payment's readinessProbe path back to baseline before
     injecting, if it's currently anything else -- mirrors
     _ensure_oom_baseline's pattern, guards against a prior failed/
-    interrupted run leaving it patched."""
+    interrupted run leaving it patched.
+
+    Also (2026-08-29) blocks on `kubectl rollout status` unconditionally
+    at the end: a prior LIVE-trigger episode's non-blocking restore (see
+    _restore_init_failure's `wait` param) may still be bringing a fresh
+    payment pod up past its real 180s readinessProbe initialDelaySeconds.
+    Waiting it out HERE, at injection-prep time, keeps that cost out of
+    the resolve hot path -- same pre-injection-net pattern as oom
+    (bug #3) and cpu-throttling (d6c8183). Instant no-op when payment is
+    already healthy (the common case -- a user rarely re-triggers the
+    same class inside 3 minutes)."""
     result = subprocess.run(
         [
             "kubectl", "get", "deployment", cfg["target"], "-n", cfg["namespace"],
@@ -2725,12 +2751,18 @@ def _ensure_init_failure_baseline(cfg: dict):
         capture_output=True, text=True,
     )
     current_path = result.stdout.strip()
-    if current_path == PAYMENT_READINESS_PATH_BASELINE:
-        return
-    print(f"  {cfg['target']}'s readinessProbe path is '{current_path or '(unknown)'}', not the "
-          f"baseline '{PAYMENT_READINESS_PATH_BASELINE}' -- resetting before injecting "
-          f"(a prior run likely left it patched)...")
-    _restore_init_failure(cfg)
+    if current_path != PAYMENT_READINESS_PATH_BASELINE:
+        print(f"  {cfg['target']}'s readinessProbe path is '{current_path or '(unknown)'}', not the "
+              f"baseline '{PAYMENT_READINESS_PATH_BASELINE}' -- resetting before injecting "
+              f"(a prior run likely left it patched)...")
+        _patch_payment_readiness_path(cfg, PAYMENT_READINESS_PATH_BASELINE)
+    subprocess.run(
+        [
+            "kubectl", "rollout", "status", f"deployment/{cfg['target']}", "-n", cfg["namespace"],
+            "--timeout=240s",
+        ],
+        capture_output=True, text=True,
+    )
 
 
 def _payment_stuck_not_ready(namespace: str) -> bool:
@@ -2803,6 +2835,10 @@ def _inject_and_verify_init_failure(cfg: dict, stop_file: str | None = None, evi
     changes that trigger a real RollingUpdate)."""
     _ensure_init_failure_baseline(cfg)
     namespace = cfg["namespace"]
+    # Operator live-trigger episodes pass a stop_file and/or evidence_file;
+    # batch runs pass neither. Only the live path skips the blocking
+    # post-revert rollout-status wait (see _restore_init_failure's `wait`).
+    live_trigger = stop_file is not None or evidence_file is not None
 
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
         window_start = time.time()
@@ -2814,7 +2850,7 @@ def _inject_and_verify_init_failure(cfg: dict, stop_file: str | None = None, evi
             remaining = cfg["duration_s"] - (time.time() - window_start)
             if remaining > 0:
                 _interruptible_sleep(remaining, stop_file)
-            _restore_init_failure(cfg)
+            _restore_init_failure(cfg, wait=not live_trigger)
             return True
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
         print(f"  attempt {attempt}: readiness never flipped to false{suffix}")

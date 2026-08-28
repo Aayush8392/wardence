@@ -52,6 +52,20 @@ function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, crashLo
 
   const elapsedS = useTickingElapsed(isActive ? live?.elapsed_in_state_s : null, isActive && Boolean(state));
 
+  // Real refresh-survival fix (2026-08-29): `fixRequested` (parent state)
+  // is memory-only and resets to false on a page refresh, so refreshing
+  // mid-revert -- while the episode still sits in `holding` because the
+  // injector's own restore hasn't finished (init-failure waits out
+  // payment's real ~180s readiness probe) -- used to re-show a clickable
+  // REVERT/DIAGNOSE button. The backend now persists the real intent
+  // (stop_hold_requested set by trigger_stop_hold, abandon_requested by
+  // logout/tab-close) and exposes it on /trigger/live-status; OR-ing
+  // them in makes the committed/REVERTING state survive a refresh. Not
+  // init-failure-specific -- every holding early-exit class is covered.
+  const fixCommitted =
+    fixRequested ||
+    (isActive && (Boolean(live?.stop_hold_requested) || Boolean(live?.abandon_requested)));
+
   // Real fix, priority order corrected: fixRequested (the user already
   // committed to fixing) must win over the holding-countdown check --
   // otherwise, for the real ~10s gap between clicking "Diagnose & Fix"
@@ -60,13 +74,13 @@ function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, crashLo
   // a button/label that already said FIXING, a real visible contradiction
   // found live 2026-08-15.
   let statusLine = null;
-  if (isActive && fixRequested && state !== "resolved" && state !== "failed" && elapsedS != null) {
+  if (isActive && fixCommitted && state !== "resolved" && state !== "failed" && elapsedS != null) {
     statusLine = `${elapsedS}s ELAPSED`;
-  } else if (isActive && state === "holding" && live?.hold_duration_s != null && elapsedS != null) {
+  } else if (isActive && state === "holding" && !fixCommitted && live?.hold_duration_s != null && elapsedS != null) {
     const remaining = Math.max(0, live.hold_duration_s - elapsedS);
     statusLine = `LIVE — ${remaining}s LEFT`;
   } else if (
-    isActive && state === "awaiting_fix" && !fixRequested &&
+    isActive && state === "awaiting_fix" && !fixCommitted &&
     live?.abandon_ceiling_s != null && elapsedS != null
   ) {
     const remaining = Math.max(0, live.abandon_ceiling_s - elapsedS);
@@ -164,11 +178,13 @@ function FaultCard({ fc, bucket, token, role, trustMap, episodeInFlight, crashLo
   } else if (state === "injecting") {
     stateLabel = "INJECTING";
     actionButton = waitingButton("INJECTING");
-  } else if (fixRequested) {
+  } else if (fixCommitted) {
     // Real for both buckets now: report-only classes can also set
     // fixRequested (clicking REVERT during "holding"), and need their own
     // honest label for the ~10s gap before the backend's hold loop
     // actually notices the stop request and flips episode_state.
+    // fixCommitted also folds in the backend-persisted stop_hold_requested/
+    // abandon_requested so this survives a page refresh (see its decl).
     stateLabel = isAutoFix ? "FIXING" : "REVERTING";
     actionButton = waitingButton(isAutoFix ? "FIXING" : "REVERTING");
   } else if (state === "holding") {

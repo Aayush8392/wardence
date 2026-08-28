@@ -265,7 +265,16 @@ INJECT_SUBPROCESS_TIMEOUT_S = {
     # (2026-08-11). Six of seven cost ~181-190s real (clean, minimal
     # per-probe overhead) -> 260s gives ~70-80s real margin.
     "network-partition": 260,           # real: 181.0s
-    "init-failure": 260,                # real: 181.0s
+    # init-failure: RECALIBRATED 260 -> 500, 2026-08-29. The live-trigger
+    # post-revert rollout wait is now non-blocking (injector.py's
+    # _restore_init_failure wait=False), so the common-case live episode
+    # is FASTER than the 181s batch measurement -- but the moved cost
+    # lands in the NEXT episode's _ensure_init_failure_baseline, which now
+    # blocks up to 240s waiting out payment's real 180s readinessProbe
+    # initialDelaySeconds if that prior recovery is still in flight. Rare
+    # (needs a re-trigger inside ~3min) but real: 240s prep-wait + 180s
+    # hold + verify. 500s covers it; instant no-op in the common case.
+    "init-failure": 500,
     "session-cart-failure": 260,        # real: 190.4s
     "connection-pool-exhaustion": 260,  # real: 184.2s
     # network-latency: real outlier, see the class docstring above --
@@ -1713,14 +1722,15 @@ def trigger_live_status(episode_id: str, payload: dict = Depends(require_role("a
     conn = _conn()
     row = conn.execute(
         "SELECT episode_state, state_entered_at, evidence_confirmed, fault_class, t0, "
-        "triggering_username, republished_at "
+        "triggering_username, republished_at, stop_hold_requested, abandon_requested "
         "FROM episodes WHERE episode_id = ?",
         (episode_id,),
     ).fetchone()
     conn.close()
     if row is None:
         raise HTTPException(404, f"no such episode '{episode_id}'")
-    state, state_entered_at, evidence_confirmed, fault_class, t0, triggering_username, republished_at = row
+    (state, state_entered_at, evidence_confirmed, fault_class, t0, triggering_username,
+     republished_at, stop_hold_requested, abandon_requested) = row
     elapsed_s = None
     if state_entered_at is not None:
         entered = datetime.datetime.fromisoformat(state_entered_at)
@@ -1730,6 +1740,18 @@ def trigger_live_status(episode_id: str, payload: dict = Depends(require_role("a
         "episode_state": state,
         "elapsed_in_state_s": elapsed_s,
         "evidence_confirmed": bool(evidence_confirmed),
+        # Real refresh-survival fix (2026-08-29): once the user has clicked
+        # REVERT / DIAGNOSE & FIX during a holding window, or an abandon
+        # signal has fired, the episode can sit in `holding` for a long
+        # time before the injector's own restore finishes and the state
+        # advances (init-failure's ~240s payment-probe wait is the worst
+        # case). Without these two flags the frontend's own `fixRequested`
+        # is memory-only and a page refresh re-showed a clickable REVERT
+        # button mid-revert -- see FaultGrid.jsx. Harmless to click again
+        # (trigger_stop_hold just re-sets an already-set flag) but
+        # confusing. The frontend now ORs these into its disabled state.
+        "stop_hold_requested": bool(stop_hold_requested),
+        "abandon_requested": bool(abandon_requested),
         "fault_class": fault_class,
         "t0": t0,
         "can_stop_hold_early": state == "holding" and bool(evidence_confirmed),
