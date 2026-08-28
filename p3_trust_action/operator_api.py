@@ -67,16 +67,15 @@ from trust_engine import (  # noqa: E402
 # run_batch_plan.py's own BASELINE_CHECKS already uses, not a subprocess
 # call -- these are plain kubectl-wrapping functions.
 #
-# The 4 evidence-check helpers + 1 constant below (added for Phase 1's
-# async wrapper, Kimi review 33/36) are the SAME real production checks
-# injector.py's own verification already uses for crash-loop/
-# cpu-throttling -- reused directly rather than reimplemented, so the
-# early-exit unlock condition can never quietly drift from what the
-# injector itself considers "confirmed."
+# The evidence-check helpers below (added for Phase 1's async wrapper,
+# Kimi review 33/36) are the SAME real production checks injector.py's
+# own verification uses for crash-loop -- reused directly rather than
+# reimplemented, so the early-exit unlock condition can never quietly
+# drift from what the injector itself considers "confirmed."
+# (cpu-throttling's own throttled-periods check moved fully into
+# injector.py on 2026-08-27 -- see WRAPPER_POLLED_EVIDENCE_CLASSES.)
 from injector import (  # noqa: E402
-    CPU_THROTTLE_MIN_PERIODS_INCREASE,
     FAULT_CONFIG,
-    _cfs_throttled_periods,
     _crash_loop_backoff_now,
     _ensure_catalogue_replica_baseline,
     _ensure_oom_baseline,
@@ -785,16 +784,21 @@ LIVE_TRIGGER_DURATION_OVERRIDE_S = {
 }
 
 # Two different real evidence SOURCES for the 8 holding classes, not
-# one -- crash-loop/cpu-throttling's evidence is a cheap Prometheus
-# read the wrapper can safely re-run on its own every tick (see
-# _evidence_confirmed_now). The 6 report-only classes' own evidence
-# checks are active, real-cost probes (a throwaway pod, an actual mysql
-# connection attempt) -- re-running those from the wrapper in parallel
-# would double real load and risk skewing the very signal being
-# measured, so instead injector.py itself writes an evidence-file the
-# moment ITS OWN real verification first confirms, and the wrapper just
-# polls for that file's existence.
-WRAPPER_POLLED_EVIDENCE_CLASSES = {"crash-loop", "cpu-throttling"}
+# one -- crash-loop's evidence is a cheap Prometheus read (restartCount)
+# the wrapper can safely re-run on its own every tick against a stable
+# pod (see _evidence_confirmed_now). Every other holding class writes an
+# evidence-file from inside injector.py the moment ITS OWN real
+# verification first confirms, and the wrapper just polls for that
+# file's existence -- because the check is either an active real-cost
+# probe (the 6 report-only classes, under-provisioned-replicas) or,
+# for cpu-throttling (moved here 2026-08-27), a cheap read that the
+# WRAPPER still can't do reliably: the probe-loosen rollout swaps user's
+# pod, so a wrapper baseline captured before the subprocess runs is
+# against the OLD pod and current - baseline goes negative once that
+# pod's stale series expires (Oracle live: 5 min stuck on "confirming").
+# injector.py has the fresh pod name and scopes both baseline and check
+# to it.
+WRAPPER_POLLED_EVIDENCE_CLASSES = {"crash-loop"}
 EVIDENCE_FILE_CLASSES = HOLDING_CLASSES - WRAPPER_POLLED_EVIDENCE_CLASSES
 
 # 5-minute abandonment ceiling (Kimi review 33/36, matches the
@@ -1071,20 +1075,16 @@ def _set_episode_state(conn, episode_id: str, state: str, **extra) -> None:
 
 
 def _evidence_confirmed_now(fault_class: str, cfg: dict, baseline_restarts: int, baseline_periods: int) -> bool:
-    """Single-poll evidence check for the 2 holding classes -- reuses
-    injector.py's own real production checks directly (see the import
-    block above), confirmed structurally safe for a single poll (not a
-    consecutive-poll guard) by Kimi review 33: crash-loop's restartCount
-    is a monotonic past-event latch, cpu-throttling's own injector-side
-    verification already uses a raw instant-counter delta, not a
-    windowed PromQL query, so neither can false-positive on a transient
-    blip the way a windowed check could."""
+    """Single-poll evidence check -- crash-loop is now the ONLY
+    wrapper-polled holding class (cpu-throttling moved to injector-
+    written evidence 2026-08-27, see WRAPPER_POLLED_EVIDENCE_CLASSES).
+    crash-loop's restartCount is a monotonic past-event latch against a
+    stable pod, confirmed structurally safe for a single poll (not a
+    consecutive-poll guard) by Kimi review 33. baseline_periods is kept
+    in the signature only for call-site stability."""
     if fault_class == "crash-loop":
         target, namespace = cfg["target"], cfg["namespace"]
         return _restart_count(target, namespace) > baseline_restarts or _crash_loop_backoff_now(target, namespace)
-    if fault_class == "cpu-throttling":
-        current = _cfs_throttled_periods(cfg["target"], cfg["namespace"], cfg["container"])
-        return current - baseline_periods >= CPU_THROTTLE_MIN_PERIODS_INCREASE
     return False
 
 
@@ -1171,7 +1171,14 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     # diagnosis (cleanup deferred to the next injection), so there's no
     # "later is worse" risk the way oom has -- this reuses the exact same
     # evidence-epoch + SETTLE_SECONDS formula, not a separately-tuned one.
-    if fault_class in ("oom", "disk-full"):
+    # cpu-throttling added 2026-08-27: yet another root cause -- the
+    # probe-loosen rollout delays real fault onset to ~t0+40-60s, so the
+    # blind t0+35s formula queried a window BEFORE any throttling had
+    # started -> increase(...[6m]) = 0 -> misdiagnosed "none". Anchoring
+    # to the evidence epoch (written the moment the fresh pod's
+    # throttled-periods delta crossed the threshold) lands the query
+    # squarely inside active throttling.
+    if fault_class in ("oom", "disk-full", "cpu-throttling"):
         evidence_file = _evidence_file_path(episode_id)
         if evidence_file.exists():
             evidence_epoch = float(evidence_file.read_text().strip())
@@ -1179,8 +1186,8 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
                 evidence_epoch + SETTLE_SECONDS, tz=datetime.timezone.utc
             )
         else:
-            # No evidence file (shouldn't happen -- both classes are in
-            # EVIDENCE_FILE_CLASSES/evidence_file_class -- but never
+            # No evidence file (shouldn't happen -- all three classes are
+            # in EVIDENCE_FILE_CLASSES/evidence_file_class -- but never
             # silently fall through to the stale t0-based formula this
             # whole fix exists to avoid).
             target_dt = t0 + datetime.timedelta(seconds=SETTLE_SECONDS)
@@ -1368,11 +1375,13 @@ def _run_live_episode_inner(episode_id: str, fault_class: str, cfg: dict) -> Non
     if evidence_file_class:
         cmd += ["--evidence-file", str(evidence_file)]
 
+    # crash-loop is the only wrapper-polled class now (cpu-throttling
+    # moved to injector-written evidence, 2026-08-27) -- baseline_periods
+    # kept as a no-op kwarg into _evidence_confirmed_now for signature
+    # stability.
     baseline_restarts = baseline_periods = None
     if fault_class == "crash-loop":
         baseline_restarts = _restart_count(cfg["target"], cfg["namespace"])
-    elif fault_class == "cpu-throttling":
-        baseline_periods = _cfs_throttled_periods(cfg["target"], cfg["namespace"], cfg.get("container"))
 
     # A real per-episode LOG FILE, not PIPE and not DEVNULL (refined
     # same session after a real failed episode showed DEVNULL threw

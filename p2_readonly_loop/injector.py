@@ -1409,6 +1409,31 @@ def _cfs_throttled_periods(target: str, namespace: str, container: str) -> int:
     return sum(int(float(entry["value"][1])) for entry in result)
 
 
+def _cfs_throttled_periods_for_pod(pod_name: str, namespace: str, container: str) -> int:
+    """Same counter as _cfs_throttled_periods, but scoped to ONE exact
+    pod name -- never a pod=~ regex that can also match a since-deleted
+    pod whose stale series Prometheus keeps for ~5 min.
+
+    The cpu-throttling live-trigger path loosens user's probes, which
+    rolls the deployment: the OLD pod dies, a fresh one is born, the
+    stressor runs on the fresh one. A regex-summed baseline captured
+    around that rollout is contaminated by the old pod's accumulated
+    count, and once the old pod's series expires mid-hold, current -
+    baseline goes NEGATIVE and the evidence check never confirms (Oracle
+    2026-08-27, live: the operator sat 5 min on 'confirming'). Scoping
+    to the confirmed fresh pod (which _loosen_user_probes_for_fault
+    already returns) eliminates that entirely -- both baseline and
+    current are the same, single, still-alive series."""
+    query = (
+        f'container_cpu_cfs_throttled_periods_total{{namespace="{namespace}", '
+        f'pod="{pod_name}", container="{container}"}}'
+    )
+    resp = requests.get(f"{PROMETHEUS_URL}/api/v1/query", params={"query": query}, timeout=10)
+    resp.raise_for_status()
+    result = resp.json()["data"]["result"]
+    return sum(int(float(entry["value"][1])) for entry in result)
+
+
 def _crash_loop_backoff_now(target: str, namespace: str) -> bool:
     """
     Found the hard way: after enough repeated crash-loop testing across
@@ -3849,7 +3874,26 @@ def _verify_cpu_throttle_effect(
     return False
 
 
-def _inject_and_verify_cpu_throttling(cfg: dict, stop_file: str | None = None) -> str | None:
+def _verify_cpu_throttle_effect_for_pod(
+    pod_name: str, namespace: str, container: str, baseline_periods: int
+) -> bool:
+    """Same as _verify_cpu_throttle_effect but scoped to one exact pod
+    name -- used by the live-trigger path, where a target-regex query
+    can be contaminated by the just-rolled-out old pod's stale series
+    (see _cfs_throttled_periods_for_pod's docstring)."""
+    elapsed = 0
+    while elapsed <= EFFECT_VERIFY_TIMEOUT_S:
+        current = _cfs_throttled_periods_for_pod(pod_name, namespace, container)
+        if current - baseline_periods >= CPU_THROTTLE_MIN_PERIODS_INCREASE:
+            return True
+        time.sleep(EFFECT_VERIFY_POLL_S)
+        elapsed += EFFECT_VERIFY_POLL_S
+    return False
+
+
+def _inject_and_verify_cpu_throttling(
+    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+) -> str | None:
     """StressChaos cpu stressor against `user`, held for the full
     duration_s (same 'don't end early' discipline every other class
     learned the hard way -- an external observer, or a future real
@@ -3872,7 +3916,7 @@ def _inject_and_verify_cpu_throttling(cfg: dict, stop_file: str | None = None) -
     container = cfg["container"]
 
     if stop_file is not None:
-        return _inject_and_verify_cpu_throttling_live_trigger(cfg, stop_file)
+        return _inject_and_verify_cpu_throttling_live_trigger(cfg, stop_file, evidence_file)
 
     for attempt in range(1, MAX_INJECT_ATTEMPTS + 1):
         baseline_periods = _cfs_throttled_periods(target, namespace, container)
@@ -3916,7 +3960,9 @@ def _inject_and_verify_cpu_throttling(cfg: dict, stop_file: str | None = None) -
     return None
 
 
-def _inject_and_verify_cpu_throttling_live_trigger(cfg: dict, stop_file: str) -> str | None:
+def _inject_and_verify_cpu_throttling_live_trigger(
+    cfg: dict, stop_file: str, evidence_file: str | None = None
+) -> str | None:
     """Real live-trigger demo path, locked and live-validated 2026-08-19
     (review 51 + real testing against a throwaway clone at the full
     real worst-case duration, 635s -- see CPU_THROTTLE_LIVE_TRIGGER_*'s
@@ -3960,11 +4006,14 @@ def _inject_and_verify_cpu_throttling_live_trigger(cfg: dict, stop_file: str) ->
     load_pod = None
     load_proc = None
     try:
-        baseline_periods = _cfs_throttled_periods(target, namespace, container)
+        # Scoped to the confirmed fresh pod, NOT the target regex -- see
+        # _cfs_throttled_periods_for_pod's docstring for the Oracle
+        # 2026-08-27 "stuck on confirming for 5 min" incident this fixes.
+        baseline_periods = _cfs_throttled_periods_for_pod(fresh_pod, namespace, container)
         manifest = build_cpu_throttle_manifest(chaos_name, cfg, workers=CPU_THROTTLE_LIVE_TRIGGER_STRESS_WORKERS)
         apply_manifest(manifest)
-        print(f"  live-trigger: baseline_periods={baseline_periods}, workers={CPU_THROTTLE_LIVE_TRIGGER_STRESS_WORKERS}, "
-              f"holding for the full {duration_s}s window...")
+        print(f"  live-trigger: baseline_periods={baseline_periods} (fresh pod {fresh_pod}), "
+              f"workers={CPU_THROTTLE_LIVE_TRIGGER_STRESS_WORKERS}, holding for the full {duration_s}s window...")
 
         load_pod, load_proc = _launch_cpu_throttle_login_load(
             namespace, target, CPU_THROTTLE_LIVE_TRIGGER_LOGIN_CONCURRENCY, duration_s
@@ -3973,15 +4022,34 @@ def _inject_and_verify_cpu_throttling_live_trigger(cfg: dict, stop_file: str) ->
               f"(concurrency={CPU_THROTTLE_LIVE_TRIGGER_LOGIN_CONCURRENCY})")
 
         interrupted = False
+        evidence_written = False
         elapsed = 0
         while elapsed < duration_s:
             if os.path.exists(stop_file):
                 interrupted = True
                 break
+            # Write the evidence file the moment real throttling is
+            # confirmed -- this is what unlocks Operator's "Diagnose &
+            # Fix" button (cpu-throttling moved from wrapper-polled to
+            # evidence-file, 2026-08-27). The hold keeps running the full
+            # window regardless; this only signals readiness.
+            if not evidence_written and evidence_file is not None:
+                delta = _cfs_throttled_periods_for_pod(fresh_pod, namespace, container) - baseline_periods
+                if delta >= CPU_THROTTLE_MIN_PERIODS_INCREASE:
+                    _write_evidence_file_once(evidence_file)
+                    evidence_written = True
+                    print(f"  real CPU throttling confirmed at ~{elapsed}s "
+                          f"(fresh-pod throttled-periods delta {delta} >= {CPU_THROTTLE_MIN_PERIODS_INCREASE})")
             time.sleep(10)
             elapsed += 10
 
-        verified = _verify_cpu_throttle_effect(target, namespace, container, baseline_periods)
+        # If evidence was already confirmed mid-hold, the fault genuinely
+        # landed -- no need to re-verify against a (now possibly stale)
+        # regex query. Otherwise fall back to the original end-of-hold
+        # check, also scoped to the fresh pod.
+        verified = evidence_written or _verify_cpu_throttle_effect_for_pod(
+            fresh_pod, namespace, container, baseline_periods
+        )
     finally:
         delete_chaos_resource("stresschaos", chaos_name)
         if load_pod is not None:
@@ -4348,13 +4416,14 @@ def main():
             "first confirms the fault landed, so Operator's wrapper can "
             "unlock an early-stop button without re-running the same "
             "active probe/mysql-exec a second time in parallel. Used by "
-            "the 6 report-only classes AND, as of 2026-08-15, "
-            "under-provisioned-replicas (its own real active probe -- a "
-            "k6 burst, not a cheap Prometheus read, hence the same "
-            "evidence-file pattern, not crash-loop/cpu-throttling's "
-            "cheap-read wrapper-polled pattern), plus oom as of 2026-08-25 "
-            "(a real k8s-API OOM-kill check, same reasoning). Ignored by "
-            "every other class. Omit for batch runs."
+            "the 6 report-only classes, under-provisioned-replicas "
+            "(2026-08-15), oom (2026-08-25), and cpu-throttling "
+            "(2026-08-27 -- moved off crash-loop's wrapper-polled pattern "
+            "because the probe-loosen rollout makes a regex-summed "
+            "baseline unreliable; the injector now writes this file "
+            "itself, scoped to the confirmed fresh pod). crash-loop is "
+            "the only class still wrapper-polled. Ignored by every other "
+            "class. Omit for batch runs."
         ),
     )
     args = parser.parse_args()
@@ -4439,7 +4508,9 @@ def main():
             )
             chaos_name = "manual-scale" if verified else None
         elif fault_class == "cpu-throttling":
-            chaos_name = _inject_and_verify_cpu_throttling(cfg, stop_file=args.stop_file)
+            chaos_name = _inject_and_verify_cpu_throttling(
+                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+            )
         elif fault_class == "under-provisioned-replicas":
             chaos_name = _inject_and_verify_under_provisioned(
                 cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
