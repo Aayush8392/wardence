@@ -46,6 +46,7 @@ p2_readonly_loop/phase1b_network_partition_degradation.py
 p2_readonly_loop/phase1b_init_failure_degradation.py
 p2_readonly_loop/phase1b_session_cart_failure_degradation.py
 p2_readonly_loop/check_bad_rollout_readyreplicas.py
+p2_readonly_loop/check_network_discriminator.py
 p2_readonly_loop/check_cpu_baseline.sh
 p2_readonly_loop/check_cpu_config.sh
 p2_readonly_loop/check_cpu_throttle_cleanup.sh
