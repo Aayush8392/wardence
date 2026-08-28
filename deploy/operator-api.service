@@ -65,6 +65,15 @@ Environment=KUBECONFIG=/home/ubuntu/.kube/config
 # reasoning and the env var name for every other class.
 Environment=DURABILITY_WINDOW_CRASH_LOOP_S=180
 Environment=FRONT_END_IMAGE_BASELINE=ghcr.io/aayush8392/front-end:0.3.12-wardence1
+# under-provisioned-replicas probe threshold (agent.py diagnosis +
+# verifier.py durability, same var). Oracle tightens catalogue's CPU
+# limit 200m -> 75m (deploy/patch_catalogue_upr_visibility.sh) so the
+# fault is visibly slow on the storefront; at that limit the
+# faulted-1-replica k6 probe reads ~370ms and the fixed-3-replica probe
+# ~145ms, so 240 sits between them. WSL2 keeps catalogue at 200m and
+# does NOT set this var (defaults 130/140). Recalibrate if the limit or
+# hardware changes -- do not carry this number blindly.
+Environment=WARDENCE_UPR_PROBE_THRESHOLD_MS=240
 ExecStart=<VENV_PATH>/bin/uvicorn operator_api:app --host 0.0.0.0 --port 8002
 Restart=on-failure
 RestartSec=5

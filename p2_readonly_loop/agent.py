@@ -144,8 +144,19 @@ UNDER_PROVISIONED_PROBE_DURATION_S = 20
 # replicas episode, just 6ms below the lowest-ever correctly-diagnosed
 # value (205.83ms) across the full real history. 190 gives real margin
 # over the observed miss while staying comfortably under that real
-# correct-cluster floor.
-UNDER_PROVISIONED_PROBE_THRESHOLD_MS = 130
+# correct-cluster floor. Then 190 -> 130 on Oracle recalibration
+# (2026-08-25).
+#
+# Env-overridable as of 2026-08-28: Oracle's catalogue CPU limit is
+# being tightened (200m -> 75m) so under-provisioned-replicas produces
+# a visibly slow storefront -- at that limit the faulted-1-replica
+# probe reads ~370ms and the fixed-3-replica probe ~145ms, so Oracle
+# sets WARDENCE_UPR_PROBE_THRESHOLD_MS=240 (between the two). WSL2's
+# catalogue stays at 200m and this default. verifier.py reads the SAME
+# env var -- keep them in lockstep.
+UNDER_PROVISIONED_PROBE_THRESHOLD_MS = int(
+    os.environ.get("WARDENCE_UPR_PROBE_THRESHOLD_MS", "130")
+)
 # Matches injector.py's own MAX_INJECT_ATTEMPTS pattern for this exact
 # same probe mechanism -- see probe_catalogue_capacity's docstring for
 # the real bug this fixes.

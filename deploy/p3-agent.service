@@ -41,6 +41,13 @@ Environment=WARDENCE_STATE_DIR=/var/lib/wardence/state
 Environment=NETWORK_PARTITION_MAX_THROUGHPUT_BPS=500 # real-recalibrated 2026-08-24 after the checkout-flow /orders 500 bug was fixed -- baseline throughput jumped ~2700-6900 bytes/s (was masked to 32-70 by the broken checkout), fault stays ~20-36
 Environment=PYTHONUNBUFFERED=1
 Environment=KUBECONFIG=/home/ubuntu/.kube/config
+# under-provisioned-replicas probe threshold -- MUST match
+# wardence-operator-api.service's value (agent.py here, verifier.py
+# there, same WARDENCE_UPR_PROBE_THRESHOLD_MS var). Oracle catalogue is
+# CPU-limited to 75m for storefront-visible under-provisioning; 240 sits
+# between the faulted (~370ms) and fixed (~145ms) probe readings. WSL2
+# does not set this (defaults). See operator-api.service for the full note.
+Environment=WARDENCE_UPR_PROBE_THRESHOLD_MS=240
 ExecStart=<VENV_PATH>/bin/uvicorn p3_agent:app --host 0.0.0.0 --port 8001
 Restart=on-failure
 RestartSec=5
