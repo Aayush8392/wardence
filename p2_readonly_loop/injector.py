@@ -3288,46 +3288,46 @@ def _inject_and_verify_network_latency(
     return None
 
 
+# Was 25s (2026-07-28) when verification depended on _probe_orders_reachable
+# (curl --max-time 5): a probe landing in the leaky t+10-20s transitional
+# window read only 1-2/5 failures and failed verification (-> retry ->
+# orphaned iptables chain, the documented recurring cost). Dropped to 15s
+# 2026-08-29 (review 66) when verification moved to _probe_frontend_
+# connectivity, whose 15s per-attempt timeout partly BRIDGES that leaky
+# window -- a fresh request that lands while the block is still firming up
+# tends to hang until it's solid, then times out as a genuine failure
+# rather than being sat out. 15 (not 10) keeps a real margin against the
+# leaky-window retry risk while still cutting net time-to-evidence from
+# ~55-70s to ~35s -- the reason for the change: the operator "confirming"
+# wait was eating 80s+ of a user's idle time, past the 60s bar.
+NETWORK_PARTITION_PROPAGATION_WAIT_S = 15
+
+
 def _inject_and_verify_network_partition(
     cfg: dict, episode_id: str | None = None, t0: str | None = None,
     conn: sqlite3.Connection | None = None,
     stop_file: str | None = None, evidence_file: str | None = None,
 ) -> str | None:
-    """Verified via _probe_orders_reachable (direct probe, NOT k6/
-    Prometheus -- see NETWORK_PARTITION_PROBE_SAMPLES's docstring for
-    why k6_http_req_failed is unusable here: front-end's own call to
-    orders has no timeout and hangs indefinitely rather than ever
-    failing observably while the partition holds).
+    """Verified via _probe_frontend_connectivity (5 parallel GET /health
+    from INSIDE the front-end pod, NOT k6/Prometheus -- see
+    NETWORK_PARTITION_PROBE_SAMPLES's docstring for why k6_http_req_failed
+    is unusable here: front-end's own call to orders has no timeout and
+    hangs indefinitely rather than ever failing observably while the
+    partition holds). This is the review-66 consolidation Qwen anticipated
+    -- the SAME probe both verifies injection AND becomes the frozen
+    diagnosis field, replacing the separate, slower _probe_orders_reachable
+    throwaway-pod probe this function used until 2026-08-29.
 
-    Probes once early (after a propagation wait) to confirm the block
-    landed for real, then holds the fault for its FULL duration_s --
-    same "don't end early" discipline as network-latency, disk-full,
-    memory-leak, and connection-pool-exhaustion all independently
-    learned the hard way: ending a fault the instant our own probe is
-    satisfied starves any other real observer (traffic_gen, a future
-    real diagnosis query) of a fair chance to see it too.
+    Probes once early (after NETWORK_PARTITION_PROPAGATION_WAIT_S) to
+    confirm the block landed, then holds the fault for its FULL duration_s
+    -- same "don't end early" discipline as network-latency, disk-full,
+    memory-leak, and connection-pool-exhaustion all independently learned:
+    ending a fault the instant our own probe is satisfied starves any
+    other real observer (traffic_gen) of a fair chance to see it too.
     Deliberately does NOT probe again near the end of the window --
     confirmed during measurement (2026-07-24) that a probe landing right
-    at the CR's natural expiry boundary can show a false partial
-    recovery purely from probe-pod scheduling overhead, not a real
-    leaky block.
-
-    Propagation wait bumped 5s -> 25s (2026-07-28): the class started
-    failing verification 3/3 attempts despite the block mechanism itself
-    being genuinely healthy (confirmed via direct manual repro -- a real
-    egress connection to an external IP timed out during an active
-    partition, and chaos-daemon's logs showed the iptables rule applying
-    cleanly). Re-running measure_network_partition_direction_check.py
-    (the original 2026-07-24 measurement script) showed the real
-    timeline: baseline ~2100-2600 bytes/s tx/rx, still a leaky
-    30-1250 bytes/s at t+10s/t+20s (NOT a clean block yet), only
-    reliably near-zero from t+30-40s onward. A 5s wait landed the probe
-    squarely in that leaky transitional window, not because the class'
-    real signal is unreliable -- agent.py's own diagnosis-side
-    min_over_time(...[2m]) window comfortably outlasts this settle time
-    regardless, which is why a real episode's diagnosis was never
-    actually broken by this, only the injector's own tighter,
-    single-early-probe self-verification was."""
+    at the CR's natural expiry boundary can show a false partial recovery
+    purely from probe-pod scheduling overhead, not a real leaky block."""
     chaos_kind = "networkchaos"
     namespace = cfg["namespace"]
 
@@ -3335,28 +3335,28 @@ def _inject_and_verify_network_partition(
         chaos_name = f"{cfg['chaos_name_prefix']}-{uuid.uuid4().hex[:8]}"
         manifest = build_network_partition_manifest(chaos_name, cfg)
         apply_manifest(manifest)
-        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: applied, waiting 25s for propagation "
-              f"before probing...")
+        print(f"  attempt {attempt}/{MAX_INJECT_ATTEMPTS}: applied, waiting "
+              f"{NETWORK_PARTITION_PROPAGATION_WAIT_S}s for propagation before probing...")
 
         verified = False
         window_start = time.time()
         try:
-            time.sleep(25)
-            failures = _probe_orders_reachable(namespace)
+            time.sleep(NETWORK_PARTITION_PROPAGATION_WAIT_S)
+            probe = _probe_frontend_connectivity(namespace)
+            failures = probe["connect_failures"] if probe is not None else 0
             verified = failures >= NETWORK_PARTITION_MIN_FAILURES
-            print(f"  early probe: {failures}/{NETWORK_PARTITION_PROBE_SAMPLES} samples failed "
-                  f"(need >= {NETWORK_PARTITION_MIN_FAILURES})")
+            print(f"  connectivity probe: {failures}/{NETWORK_CONNECTIVITY_PROBE_ATTEMPTS} attempts "
+                  f"got no HTTP response (need >= {NETWORK_PARTITION_MIN_FAILURES}); raw={probe}")
             if verified:
-                probe = _probe_frontend_connectivity(namespace) if conn is not None else None
                 _write_evidence_file_once(evidence_file)
                 if conn is not None:
                     _persist_network_probe(conn, episode_id, "network-partition", cfg, t0, probe)
 
             # Sleep out whatever's genuinely left of duration_s, based on
-            # REAL elapsed wall-clock time (the 5s wait + the probe's own
-            # real scheduling/curl overhead), not an assumed constant --
-            # the exact lesson this class's own measurement scripts
-            # taught about probe overhead eating into fault windows.
+            # REAL elapsed wall-clock time (the propagation wait + the
+            # probe's own real overhead), not an assumed constant -- the
+            # exact lesson this class's own measurement scripts taught
+            # about probe overhead eating into fault windows.
             remaining = cfg["duration_s"] - (time.time() - window_start)
             if remaining > 0:
                 _interruptible_sleep(remaining, stop_file)
