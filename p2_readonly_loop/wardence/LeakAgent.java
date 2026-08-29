@@ -155,6 +155,25 @@ public class LeakAgent {
         Long.getLong("wardence.leak.governorCeilingMib", 100L);
     private static final long GOVERNOR_MIN_STABLE_LOW_MS = 8000;       // must stay calm this long before re-ramping
 
+    // Governor mode (2026-08-29, Oracle demo-visibility investigation).
+    // "active" (DEFAULT -- byte-for-byte today's behavior): both the STW%-pressure
+    // trigger and the absolute post-GC-heap ceiling can release retained memory.
+    // "passive": ONLY the absolute ceiling acts, as a pure OOM backstop; the
+    // STW%-pressure release AND its paired recovery/re-ramp logic are both skipped.
+    //
+    // Why this exists: the STW% trigger was built to keep the agent ALIVE at
+    // -Xmx128m by shedding retained memory whenever GC pressure rose. At -Xmx192m
+    // (raised 2026-08-24 after a real OOM killed the control thread) that same
+    // reflex now fights the demo -- rising STW IS the fault working, and trimming
+    // 10MiB at exactly that moment caps the leak below its own requested target.
+    // Confirmed live on Oracle, not theorized: a real episode with target=80 ended
+    // at governor_ceiling_mb=50 after 3 trims, so only ~50MiB was ever retained.
+    //
+    // Deliberately NOT the default: WSL2 still runs -Xmx128m (the installer never
+    // patches -Xmx), where the STW trigger is still genuinely load-bearing.
+    private static final boolean GOVERNOR_PASSIVE =
+        "passive".equalsIgnoreCase(System.getProperty("wardence.leak.governorMode", "active"));
+
     // 0 = unrestricted (worker ramps freely toward targetMb); >0 = worker paused at this
     // reduced ceiling until the watchdog's governor logic lifts it back toward targetMb.
     private static volatile long governorCeilingMb = 0;
@@ -210,6 +229,22 @@ public class LeakAgent {
     // wrong -- a real candidate to relax later if reqsync's own CPU/JMX
     // call overhead ever needs trimming, not yet measured as a problem.
     private static final long SYNC_POLL_MS = 20;
+    // reqsync on/off (2026-08-29, Oracle demo-visibility investigation).
+    // DEFAULT true -- byte-for-byte today's behavior, WSL2 untouched.
+    //
+    // Set false at a raised retained target. The burst is sized
+    // min(freeMiB - SYNC_BURST_MARGIN_MIB, SYNC_BURST_MAX_MIB), which is
+    // SELF-ARMING under exactly the conditions a high target creates: at
+    // 27MiB free it still fires a 17MiB burst INTO that 27MiB, at peak
+    // pressure. That shape is what produced the real -Xmx128m OOM
+    // (retained 80 + burst 40 + app 26 = 146 > 128) that killed the
+    // wardence-leak-control daemon thread, which the JVM never respawns.
+    //
+    // It is also no longer needed at a high target: its whole purpose was
+    // forcing a GC near a request back when retained was low enough that
+    // G1 had headroom and Eden filled too slowly on organic traffic alone.
+    private static final boolean SYNC_ENABLED =
+        !"false".equalsIgnoreCase(System.getProperty("wardence.leak.reqsyncEnabled", "true"));
     // Real, live-tested (2026-08-22 session): 7000ms (the middle of both
     // reviews' agreed 5-10s range) produced only 2 real triggers across a
     // full hold in the 30MiB/40MiB runs, and the real felt-effect
@@ -486,11 +521,16 @@ public class LeakAgent {
             startThread("wardence-leak-watchdog", new Runnable() {
                 public void run() { watchdogLoop(); }
             });
-            startThread("wardence-leak-reqsync", new Runnable() {
-                public void run() { requestSyncLoop(); }
-            });
+            if (SYNC_ENABLED) {
+                startThread("wardence-leak-reqsync", new Runnable() {
+                    public void run() { requestSyncLoop(); }
+                });
+            }
 
-            System.err.println("[wardence-leak-agent] hardened agent loaded, 5 threads started");
+            System.err.println("[wardence-leak-agent] hardened agent loaded, "
+                + (SYNC_ENABLED ? 5 : 4) + " threads started"
+                + " (reqsync=" + (SYNC_ENABLED ? "on" : "off")
+                + ", governor=" + (GOVERNOR_PASSIVE ? "passive" : "active") + ")");
         } catch (Throwable t) {
             // Never let the agent break the real app's boot.
             System.err.println("[wardence-leak-agent] premain failed (non-fatal): " + t);
@@ -869,6 +909,17 @@ public class LeakAgent {
             return;
         }
 
+        // Passive mode: the absolute-ceiling branch above is the ONLY actor. Skip
+        // both the STW%-pressure release and its paired recovery/re-ramp logic --
+        // see GOVERNOR_PASSIVE's own comment for why. Returning here (rather than
+        // just skipping the release branch) is deliberate: the recovery branch only
+        // exists to undo an STW-triggered trim, so running it alone would be dead
+        // logic that could still lift a ceiling the absolute backstop had lowered
+        // for a real reason.
+        if (GOVERNOR_PASSIVE) {
+            return;
+        }
+
         long nowStw = stwPauseMsTotal.get();
         if (govPrevStwSampledAt == 0) {
             govPrevStwMs = nowStw;
@@ -1168,6 +1219,15 @@ public class LeakAgent {
                 lastPostGcHeapBytes < 0 ? -1 : (lastPostGcHeapBytes / (1024 * 1024))).append('\n');
             sb.append("governor_ceiling_mb=").append(governorCeilingMb).append('\n');
             sb.append("governor_release_events=").append(governorReleaseEvents.get()).append('\n');
+            // Real deployed-config readback (2026-08-29). Both flags are set via
+            // -D JVM system properties in JAVA_OPTS, which is exactly the kind of
+            // change that silently fails to land (wrong checkout, un-rolled pod,
+            // typo'd property name) and then gets misread as "the tuning didn't
+            // work." Reporting the values the JVM ACTUALLY resolved makes that a
+            // one-line check instead of a wasted tuning round.
+            sb.append("governor_mode=").append(GOVERNOR_PASSIVE ? "passive" : "active").append('\n');
+            sb.append("governor_abs_ceiling_mib=").append(GOVERNOR_ABS_HEAP_CEILING_MIB).append('\n');
+            sb.append("reqsync_enabled=").append(SYNC_ENABLED).append('\n');
             sb.append("heartbeat_age_ms=").append(now - heartbeatAt.get()).append('\n');
             sb.append("control_age_ms=").append(now - controlLastRunAt.get()).append('\n');
             sb.append("worker_progress_age_ms=").append(now - workerLastProgressAt.get()).append('\n');
