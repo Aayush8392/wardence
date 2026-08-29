@@ -106,6 +106,19 @@ public class LeakAgent {
     // being guarded against) is not reintroduced by this.
     private static final long CHUNK_PACE_MS = 40; // ~95MiB / 256KiB chunks * 40ms =~ 15s ramp, not sub-second
 
+    // Continuous-growth mode (2026-08-29, -Dwardence.leak.growthMbPerSec, DEFAULT 0=off,
+    // byte-identical to every prior run). A real memory leak GROWS -- it does not ramp to
+    // a fixed size and stop. Once retained reaches `targetMb`, the worker keeps allocating
+    // at this rate (MiB/s), growing retained memory toward ~97% of -Xmx, until RELEASE or
+    // the governor's absolute post-GC-heap ceiling. Against a nearly-full old gen (small
+    // -Xmx + a pinned-small young gen) every few MiB of real growth forces a Full GC that
+    // cannot reclaim the leak -- continuous, escalating GC pressure, exactly what a real
+    // leak does. A static "ramp then hold" leak parks in old gen and produces almost no
+    // pressure once request churn stops promoting into it (measured 2026-08-29: 3 Full GCs
+    // in 180s at 96%-full old gen, because nothing new was promoting).
+    private static final long GROWTH_MB_PER_SEC =
+        Long.getLong("wardence.leak.growthMbPerSec", 0L);
+
     // ---- governor (spike-and-recover leak) state, added after real 2026-08-2x data ----
     // Both Kimi and Qwen (reviews 55/56) converged on this as the real path to a
     // SUSTAINED 60s felt effect on a 128MiB heap: ramp toward target, but back off a
@@ -733,9 +746,21 @@ public class LeakAgent {
                     // release-step. This is what makes the spike-and-recover pattern real
                     // rather than a single monotonic ramp.
                     long govCeil = governorCeilingMb;
-                    long effCeilMb = (govCeil > 0) ? Math.min(wantMb, govCeil) : wantMb;
-                    long effCeilBytes = effCeilMb * 1024L * 1024L;
                     long wantBytes = (long) wantMb * 1024L * 1024L;
+                    // In growth mode the worker keeps going PAST wantBytes toward ~97% of
+                    // -Xmx; the governor's absolute ceiling (still active in passive mode)
+                    // is what actually stops it. Non-growth mode: unchanged, capped at
+                    // wantMb (or a governor-reduced ceiling).
+                    long growCapMb = (GROWTH_MB_PER_SEC > 0)
+                        ? (Runtime.getRuntime().maxMemory() / (1024L * 1024L)) * 97 / 100
+                        : wantMb;
+                    long effCeilMb = (govCeil > 0) ? govCeil : Math.max(wantMb, growCapMb);
+                    long effCeilBytes = effCeilMb * 1024L * 1024L;
+                    // Once past the initial target in growth mode, pace to the configured
+                    // MiB/s instead of the fast CHUNK_PACE_MS ramp.
+                    long chunkPace = (GROWTH_MB_PER_SEC > 0 && allocatedBytes >= wantBytes)
+                        ? Math.max(1L, (long) CHUNK_BYTES * 1000L / (GROWTH_MB_PER_SEC * 1024L * 1024L))
+                        : CHUNK_PACE_MS;
 
                     if (allocatedBytes < effCeilBytes && !ABORT_ALLOCATION.get()) {
                         try {
@@ -773,20 +798,24 @@ public class LeakAgent {
                             allocatedBytes += payload.length;
                             lastFailedTargetMb = -1;
                             workerLastProgressAt.set(System.currentTimeMillis());
-                            if (allocatedBytes >= wantBytes) {
+                            if (allocatedBytes >= wantBytes && GROWTH_MB_PER_SEC > 0) {
+                                // Past the initial target, still growing toward growCap.
+                                currentState = "GROWING";
+                            } else if (allocatedBytes >= wantBytes) {
                                 currentState = "ALLOCATED"; // genuinely reached the real target
                             } else if (allocatedBytes >= effCeilBytes) {
                                 // Reached the governor's current (reduced) ceiling, not yet the
                                 // real target -- holding here until the watchdog lifts it.
                                 currentState = "GOVERNED_HOLD";
-                            } else if (!ABORT_ALLOCATION.get()) {
-                                // Real, measured pacing fix -- only while still ramping toward
-                                // the effective ceiling (never on the release path, which stays
-                                // as fast as possible). Checked again right after waking so a
-                                // RELEASE that arrived mid-pace is honored immediately rather
-                                // than finishing this sleep first.
+                            }
+                            if (!ABORT_ALLOCATION.get()) {
+                                // Pace between chunks -- CHUNK_PACE_MS while ramping to the
+                                // target, the growth-rate-derived pace once growing past it.
+                                // Never on the release path (that stays as fast as possible).
+                                // Re-checked right after waking so a RELEASE that arrived
+                                // mid-pace is honored immediately.
                                 try {
-                                    Thread.sleep(CHUNK_PACE_MS);
+                                    Thread.sleep(chunkPace);
                                 } catch (InterruptedException ignored) {
                                     Thread.currentThread().interrupt();
                                 }
@@ -803,8 +832,12 @@ public class LeakAgent {
                         // Idle: either genuinely at the real target, or capped at a reduced
                         // governor ceiling waiting for the watchdog to lift it. Mark the
                         // distinction so the status file honestly reflects which one this is.
-                        if (allocatedBytes < wantBytes && governorCeilingMb > 0) {
+                        if (governorCeilingMb > 0) {
+                            // Held at a governor-reduced ceiling -- whether it was still
+                            // ramping to target or (growth mode) had grown past it.
                             currentState = "GOVERNED_HOLD";
+                        } else if (allocatedBytes >= wantBytes && GROWTH_MB_PER_SEC > 0) {
+                            currentState = "GROWING"; // at growCap, not governor-clamped
                         } else if (allocatedBytes >= wantBytes) {
                             currentState = "ALLOCATED";
                         }
