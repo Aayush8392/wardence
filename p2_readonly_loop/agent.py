@@ -77,30 +77,22 @@ CONNECTION_POOL_THRESHOLD = 100
 # real fault.
 NETWORK_PARTITION_MAX_THROUGHPUT_BPS = int(os.environ.get("NETWORK_PARTITION_MAX_THROUGHPUT_BPS", "200"))
 
-# Real bug found live (2026-07-31, overnight batch): the throughput
-# check above can still miss a genuine partition -- confirmed via two
-# real misdiagnosed episodes where the min_over_time([2m]) throughput
-# query read 2506/9864 bytes/s (at or ABOVE the ~1900-2400 bytes/s
-# normal baseline, not below it -- the query's lookback window missed
-# the actual low-throughput period during the fault, likely reading
-# post-recovery/retry-burst traffic instead; a shuffled multi-hour
-# batch run's real diagnosis timing is less predictable than the
-# original 2026-07-24 fix assumed). Both misdiagnosed episodes shared
-# a second, independent tell the throughput check doesn't use at all:
-# p95_latency_ms landed at an exact ~60000ms ceiling -- k6's own
-# default request timeout, not an organic percentile. A genuine
-# network-latency episode can NEVER produce this: the real injected
-# delay is only 500ms (+/-50ms jitter, see NETWORK_LATENCY_DELAY in
-# injector.py) -- nothing about that mechanism can push a real p95
-# anywhere near 10 real seconds, let alone 60. A request that HANGS
-# until timeout (rather than completing slow) is only possible when
-# the network is genuinely cut, not merely delayed -- so a p95 this
-# high is itself an unambiguous partition signal, independent of
-# whether the throughput check happened to catch the same episode.
-# 10000ms sits with a large real margin above what 500ms+jitter could
-# ever organically produce and a large real margin below the 60000ms
-# timeout artifact itself.
-NETWORK_PARTITION_LATENCY_SATURATION_MS = 10000
+# network-latency vs network-partition PRIMARY discriminator: an
+# injector-frozen active connectivity probe (injector.py's
+# _probe_frontend_connectivity -- 5 parallel GET /health from inside the
+# front-end pod, recorded as {connect_failures, max_http_ms}). Locked
+# Kimi+Qwen review 66 (2026-08-29) after 5 real Oracle measurement runs
+# proved NO passive Prometheus signal (p95_latency_ms,
+# combined_throughput_bps, 2xx completion rate, packet counts) can
+# separate the two on arm64/Oracle's network stack -- partition there
+# produces hung-then-completed requests (real status=200, 13000-38252ms)
+# that fully overlap real latency. p95_latency_ms/combined_throughput_bps
+# are kept below as DEMOTED fallback, used only for episodes recorded
+# before this probe existed (batch backward-compat). This is why the
+# former NETWORK_PARTITION_LATENCY_SATURATION_MS (>= 10000ms -> partition)
+# rule was REMOVED: on Oracle it fires on real latency episodes.
+NETWORK_PROBE_MIN_CONNECT_FAILURES = 4  # a real full partition -> ~5
+NETWORK_PROBE_LATENCY_CEILING_MS = 10000  # max_http_ms >= 300 and < this -> latency
 
 # See oom_sticky_query's own docstring for the full reasoning -- bounds
 # the sticky OOMKilled gauge to the specific container instance that was
@@ -292,6 +284,15 @@ class DiagnoseRequest(BaseModel):
     # same precedent snapshot_at itself set: every existing caller/class
     # is unaffected, zero regression risk.
     baseline_heap_kb: float | None = None
+    # Injector-frozen active connectivity probe result (review 66), for
+    # the network-latency / network-partition pair only -- threaded
+    # through from p3_scorer.py, which reads it from
+    # episodes.network_probe_json (injector.py's own real write, frozen at
+    # evidence-confirm time). {"attempts": int, "connect_failures": int,
+    # "max_http_ms": int}, or None for every other class / every episode
+    # recorded before this probe existed. Same zero-regression precedent
+    # snapshot_at / baseline_heap_kb set.
+    network_probe: dict | None = None
 
 
 def _prom_instant_query(query: str, snapshot_at: str | None = None) -> list:
@@ -325,7 +326,8 @@ def _prom_instant_query(query: str, snapshot_at: str | None = None) -> list:
 
 
 def query_prometheus(
-    target: str, namespace: str, snapshot_at: str | None = None, baseline_heap_kb: float | None = None
+    target: str, namespace: str, snapshot_at: str | None = None, baseline_heap_kb: float | None = None,
+    network_probe: dict | None = None,
 ) -> dict:
     """Tool: check whether a matching container is crash-looping, was OOM-killed,
     was evicted (disk-full), or is seeing elevated request latency
@@ -545,13 +547,13 @@ def query_prometheus(
         # network-latency fault can push a handful of individual
         # requests all the way to that 60s ceiling -- confirmed live,
         # a real network-latency episode produced a status="0" series
-        # pinned at exactly 60001ms. Since this p95_latency_ms feeds
-        # NETWORK_PARTITION_LATENCY_SATURATION_MS's ">= 10000ms ->
-        # network-partition" rule below, an un-filtered max() would
-        # misdiagnose that real network-latency episode as a partition.
-        # A k6 timeout is "we never got an answer," not "how slow was
-        # the answer" -- excluding status="0" (k6's convention for no
-        # real HTTP response received) restores the intended meaning.
+        # pinned at exactly 60001ms. An un-filtered max() would then feed
+        # a 60000ms value into the demoted p95 latency rule in
+        # stub_diagnose (fallback path for pre-probe episodes), which is
+        # still noise, not signal. A k6 timeout is "we never got an
+        # answer," not "how slow was the answer" -- excluding status="0"
+        # (k6's convention for no real HTTP response received) restores
+        # the intended meaning.
         # Real-tested both directions before locking: during a genuine
         # network-partition, real completed (non-timeout) requests
         # still land alongside the timeouts (confirmed live, p95~175ms
@@ -891,10 +893,22 @@ def query_prometheus(
     replicas_result = _prom_instant_query(replicas_query, snapshot_at)
     current_replicas = int(float(replicas_result[0]["value"][1])) if replicas_result else None
 
+    # network-latency vs network-partition PRIMARY signal (review 66) --
+    # the injector's frozen connectivity probe. Both keys ALWAYS present
+    # (never None-vs-a-number, which would leak the class); both None when
+    # network_probe is absent (non-network class, or an episode from
+    # before this probe existed -- those fall through to the demoted
+    # p95_latency_ms / combined_throughput_bps signals in stub_diagnose).
+    _probe = network_probe or {}
+    connect_failures = _probe.get("connect_failures")
+    max_http_ms = _probe.get("max_http_ms")
+
     return {
         "oom_pods": oom_pods,
         "evicted_pods": evicted_pods,
         "crashlooping_pods": crashlooping_pods,
+        "connect_failures": connect_failures,
+        "max_http_ms": max_http_ms,
         "p95_latency_ms": p95_latency_ms,
         "combined_throughput_bps": combined_throughput_bps,
         "payment_stuck_not_ready": payment_stuck_not_ready,
@@ -922,6 +936,10 @@ def stub_diagnose(tool_output: dict) -> dict:
     crashlooping_pods = tool_output["crashlooping_pods"]
     p95_latency_ms = tool_output["p95_latency_ms"]
     combined_throughput_bps = tool_output["combined_throughput_bps"]
+    # review 66 -- .get(), not ["..."], so a tool_output captured/replayed
+    # from before this probe field existed doesn't KeyError.
+    connect_failures = tool_output.get("connect_failures")
+    max_http_ms = tool_output.get("max_http_ms")
     payment_stuck_not_ready = tool_output["payment_stuck_not_ready"]
     session_db_replicas_hit_zero = tool_output["session_db_replicas_hit_zero"]
     # peak_memory_mib deliberately NOT extracted here (2026-08-21) -- its
@@ -991,31 +1009,45 @@ def stub_diagnose(tool_output: dict) -> dict:
                          "the session/cart store itself is down, not a crash-loop or generic "
                          "restart (stubbed rule, not LLM)",
         }
-    # REORDERED 2026-08-03, after Kimi review 20 (reviews/20_network_partition_
-    # latency_discrimination_kimi_review.md) plus real production data from a
-    # 290-episode batch: a present, mid-range p95_latency_ms (300-10000ms) is
-    # checked BEFORE combined_throughput_bps now, not after. Real reason,
-    # empirically confirmed (not assumed): combined_throughput_bps alone
-    # cannot discriminate the two classes -- real network-partition episodes'
-    # own throughput readings (26-89 bytes/s) directly overlap false-positive
-    # network-latency episodes' readings (32-73 bytes/s), confirmed via two
-    # independent real Prometheus signals (bytes AND packet counts both
-    # falsified as clean discriminators, see the same review). But p95_latency_ms,
-    # when present and in the 300-10000ms band, is a CLEAN signal -- across
-    # 10 real ground-truth network-partition episodes, not one ever showed a
-    # mid-range p95 (they land at ~60000ms, the k6 client-timeout ceiling, or
-    # None entirely). The old ordering let a real, diagnostic p95 value get
-    # short-circuited by the throughput check every time (confirmed live: one
-    # real episode with p95=4706ms was still misdiagnosed as network-partition
-    # solely because throughput also happened to be low that episode).
-    if p95_latency_ms is not None and p95_latency_ms >= NETWORK_PARTITION_LATENCY_SATURATION_MS:
+    # network-latency vs network-partition -- PRIMARY signal (Kimi+Qwen
+    # review 66, 2026-08-29): the injector's frozen active connectivity
+    # probe, checked BEFORE the demoted p95_latency_ms / combined_
+    # throughput_bps passive rules below. 5 real Oracle measurement runs
+    # proved no passive Prometheus signal separates these two on arm64.
+    # connect_failures/max_http_ms are None for any episode recorded
+    # before this probe existed -- those fall straight through to the
+    # passive rules (kept for batch backward-compat).
+    if connect_failures is not None and connect_failures >= NETWORK_PROBE_MIN_CONNECT_FAILURES:
         return {
             "diagnosis": "network-partition",
             "confidence": 0.6,
-            "reasoning": f"p95 request latency {p95_latency_ms}ms >= {NETWORK_PARTITION_LATENCY_SATURATION_MS}ms "
-                         f"saturation ceiling -- a request hanging until client timeout, not organic latency "
-                         f"(the real network-latency mechanism only ever injects 500ms+jitter) (stubbed rule, not LLM)",
+            "reasoning": f"connectivity probe: {connect_failures}/5 requests from inside the "
+                         f"front-end pod got no HTTP response at all (>= {NETWORK_PROBE_MIN_CONNECT_FAILURES}) "
+                         f"-- the path to orders is cut, not merely slow (stubbed rule, not LLM)",
         }
+    if (
+        max_http_ms is not None
+        and HIGH_LATENCY_THRESHOLD_MS <= max_http_ms < NETWORK_PROBE_LATENCY_CEILING_MS
+        and (connect_failures is None or connect_failures <= 1)
+    ):
+        return {
+            "diagnosis": "network-latency",
+            "confidence": 0.6,
+            "reasoning": f"connectivity probe: requests from inside the front-end pod completed "
+                         f"but slow (max {max_http_ms}ms, in [{HIGH_LATENCY_THRESHOLD_MS}, "
+                         f"{NETWORK_PROBE_LATENCY_CEILING_MS})ms) with connect_failures="
+                         f"{connect_failures} -- delayed, not cut (stubbed rule, not LLM)",
+        }
+    # REORDERED 2026-08-03, after Kimi review 20 (reviews/20_network_partition_
+    # latency_discrimination_kimi_review.md) plus real production data from a
+    # 290-episode batch: a present, mid-range p95_latency_ms (300-10000ms) is
+    # checked BEFORE combined_throughput_bps. DEMOTED to fallback-only by
+    # review 66 (2026-08-29) -- reached only when the connectivity probe
+    # above produced no answer (network_probe absent: a pre-probe episode).
+    # The former ">= 10000ms -> network-partition saturation" rule was
+    # REMOVED here: 5 real Oracle runs showed partition producing
+    # hung-then-completed requests at 13000-38252ms real latency, so that
+    # rule fired on genuine partition AND genuine Oracle latency alike.
     if p95_latency_ms is not None and p95_latency_ms >= HIGH_LATENCY_THRESHOLD_MS:
         return {
             "diagnosis": "network-latency",
@@ -1070,7 +1102,8 @@ def stub_diagnose(tool_output: dict) -> dict:
 @app.post("/diagnose")
 def diagnose(req: DiagnoseRequest):
     tool_output = query_prometheus(
-        req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb
+        req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb,
+        network_probe=req.network_probe,
     )
     result = stub_diagnose(tool_output)
     # under-provisioned-replicas fallback: only fires the real active

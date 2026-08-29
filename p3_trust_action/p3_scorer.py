@@ -506,10 +506,16 @@ def main():
     # populated" shape as every other per-episode field this function
     # already reads from `episodes`/`episode_snapshots`.
     baseline_row = conn.execute(
-        "SELECT memory_leak_baseline_heap_kb FROM episodes WHERE episode_id = ?",
+        "SELECT memory_leak_baseline_heap_kb, network_probe_json FROM episodes WHERE episode_id = ?",
         (episode_id,),
     ).fetchone()
     baseline_heap_kb = baseline_row[0] if baseline_row is not None else None
+    # Injector-frozen active connectivity probe (review 66), network-latency /
+    # network-partition only -- same "read from episodes, harmless to always
+    # read, meaningful only where populated" shape as baseline_heap_kb.
+    network_probe = (
+        json.loads(baseline_row[1]) if baseline_row is not None and baseline_row[1] else None
+    )
 
     # Phase 1: diagnosis only (stub + background LLM), independently timed.
     diag_resp = requests.post(
@@ -518,6 +524,7 @@ def main():
             "target": target, "namespace": namespace, "episode_id": episode_id,
             "snapshot_at": args.snapshot_at, "stream": args.stream,
             "baseline_heap_kb": baseline_heap_kb,
+            "network_probe": network_probe,
         },
         timeout=DIAGNOSE_TIMEOUT_S,
     )

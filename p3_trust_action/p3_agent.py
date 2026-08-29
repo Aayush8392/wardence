@@ -416,6 +416,15 @@ class HandleRequest(BaseModel):
     # zero-regression precedent snapshot_at itself set. See agent.py's
     # query_prometheus for the real formula this feeds.
     baseline_heap_kb: float | None = None
+    # Injector-frozen active connectivity probe (review 66), network-
+    # latency / network-partition only -- threaded through from
+    # p3_scorer.py, which reads it from episodes.network_probe_json. None
+    # for every other class / caller not passing it. Same zero-regression
+    # precedent snapshot_at / baseline_heap_kb set. Threaded into BOTH the
+    # stub's query_prometheus AND _build_llm_tools below so the real LLM's
+    # own ReAct tool call sees the SAME frozen probe evidence the stub
+    # does (Dimension B comparison premise).
+    network_probe: dict | None = None
 
 
 class ActRequest(BaseModel):
@@ -451,7 +460,8 @@ class ActRequest(BaseModel):
 
 
 def _build_llm_tools(
-    target: str, namespace: str, snapshot_at: str | None = None, baseline_heap_kb: float | None = None
+    target: str, namespace: str, snapshot_at: str | None = None, baseline_heap_kb: float | None = None,
+    network_probe: dict | None = None,
 ) -> dict:
     """Same real tool set + binding convention as test_react_agent.py's
     build_tools -- kept in sync by hand (same 'duplicated by hand'
@@ -468,7 +478,8 @@ def _build_llm_tools(
     the stub's comparison uses, not silently see None and lose the signal
     entirely."""
     tools = {"query_prometheus": lambda: query_prometheus(
-        target, namespace, snapshot_at=snapshot_at, baseline_heap_kb=baseline_heap_kb
+        target, namespace, snapshot_at=snapshot_at, baseline_heap_kb=baseline_heap_kb,
+        network_probe=network_probe,
     )}
     if target in DL_DETECTOR_SERVICES:
         tools["call_dl_detector"] = lambda: call_dl_detector(target)
@@ -544,7 +555,8 @@ def diagnose(req: HandleRequest):
     same as the old /handle's early-return-on-report-only behavior.
     """
     tool_output = query_prometheus(
-        req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb
+        req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb,
+        network_probe=req.network_probe,
     )
     stub_result = stub_diagnose(tool_output)
     # under-provisioned-replicas fallback -- mirrors agent.py's own
@@ -601,7 +613,8 @@ def diagnose(req: HandleRequest):
                        "failed_attempts": [], "detail": "WARDENCE_STUB_ONLY set -- LLM call skipped"}
     else:
         llm_tools = _build_llm_tools(
-            req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb
+            req.target, req.namespace, snapshot_at=req.snapshot_at, baseline_heap_kb=req.baseline_heap_kb,
+            network_probe=req.network_probe,
         )
         on_event, reasoning_stream_path = (
             _make_reasoning_event_writer(req.episode_id) if (req.stream and req.episode_id) else (None, None)

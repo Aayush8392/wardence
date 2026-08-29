@@ -95,7 +95,8 @@ FAULT_CLASSES = [
 # back would be a circular import. Keep these in sync with agent.py's
 # own HIGH_LATENCY_THRESHOLD_MS/MEMORY_LEAK_THRESHOLD_MIB/
 # CONNECTION_POOL_THRESHOLD/NETWORK_PARTITION_MAX_THROUGHPUT_BPS/
-# NETWORK_PARTITION_LATENCY_SATURATION_MS/CPU_THROTTLE_INCREASE_THRESHOLD/
+# NETWORK_PROBE_MIN_CONNECT_FAILURES/NETWORK_PROBE_LATENCY_CEILING_MS/
+# CPU_THROTTLE_INCREASE_THRESHOLD/
 # UNDER_PROVISIONED_PROBE_THRESHOLD_MS by hand if any of those ever change.
 NETWORK_PARTITION_MAX_THROUGHPUT_BPS = int(os.environ.get("NETWORK_PARTITION_MAX_THROUGHPUT_BPS", "200"))
 
@@ -103,8 +104,9 @@ _FIELD_GUIDANCE_BASE = f"""Field meanings and thresholds (a null/false/empty fie
 - oom_pods: non-empty -> oom.
 - evicted_pods: non-empty -> disk-full.
 - crashlooping_pods: non-empty (and oom_pods/evicted_pods/front_end_image_pull_failing all empty/false) -> crash-loop. Check front_end_image_pull_failing (below) BEFORE concluding crash-loop -- a bad-rollout episode's own image-reset step can leave residual restart activity on front-end that satisfies this signal even when nothing is actually crash-looping; front_end_image_pull_failing is the more specific, direct signal and wins.
-- p95_latency_ms (orders only), if NOT null: >= 10000ms -> network-partition (a request hanging until client timeout, not organic latency -- the real network-latency mechanism only ever injects 500ms+jitter, so nothing that high can be real latency). >= 300ms and < 10000ms -> network-latency. Check p95_latency_ms BEFORE combined_throughput_bps below when p95_latency_ms is present -- confirmed via real production data (Kimi review 20) that combined_throughput_bps alone cannot reliably distinguish these two classes (real network-partition and real network-latency episodes' throughput readings genuinely overlap), but a present, non-null p95_latency_ms in either band above is a clean, reliable signal -- across all real ground-truth network-partition episodes checked, none ever showed a mid-range p95 value.
-- combined_throughput_bps (orders only): < {NETWORK_PARTITION_MAX_THROUGHPUT_BPS} bytes/s -> network-partition, but ONLY if p95_latency_ms above is null or did not already give you an answer. This is a weaker, fallback signal, not a primary one, for this specific pair of classes.
+- connect_failures / max_http_ms (orders only), from the injector's frozen connectivity probe (5 parallel GET /health from inside the front-end pod) -- this is the PRIMARY network-latency vs network-partition signal (Kimi+Qwen review 66): connect_failures >= 4 -> network-partition (requests got no HTTP response at all -- the path is cut, not just slow). max_http_ms >= 300 and < 10000 with connect_failures 0-1 -> network-latency (requests complete, just slow). Both are null only for episodes recorded before this probe existed -- ONLY then fall back to p95_latency_ms / combined_throughput_bps below.
+- p95_latency_ms (orders only): DEMOTED fallback, use ONLY when connect_failures and max_http_ms are both null. >= 300ms -> network-latency. (5 real Oracle runs showed a real partition can produce hung-then-completed requests at 13000-38000ms, so a high p95 is NOT a partition signal.)
+- combined_throughput_bps (orders only): DEMOTED fallback, use ONLY when the probe fields AND p95_latency_ms are all null. < {NETWORK_PARTITION_MAX_THROUGHPUT_BPS} bytes/s -> network-partition.
 - payment_stuck_not_ready: true -> init-failure.
 - session_db_replicas_hit_zero: true -> session-cart-failure.
 - heap_rise_kb (shipping only): >= 20000 KB (20 MiB) above the episode's own captured pre-injection heap floor -> memory-leak.
@@ -178,15 +180,19 @@ _STRONG_SIGNAL_FIELDS = {
 # deliberately narrow -- only single-threshold, single-diagnosis fields
 # with no other class contending for the same signal. p95_latency_ms/
 # combined_throughput_bps (network-latency vs. network-partition) are
-# NOT included here: that pair already has its own recently-tuned,
-# accepted-limitation logic (2026-08-03 session, Kimi review 20) and
-# touching it again isn't warranted by this specific finding.
+# NOT included here: they're demoted fallback-only as of review 66 and
+# their overlap is exactly why. connect_failures IS included (review 66):
+# it's the injector's frozen probe, a genuinely clean single-threshold
+# signal for network-partition with nothing else contending for it.
+# max_http_ms (the latency direction) is a bounded band (300-10000ms),
+# not a single >= cutoff, so it stays FIELD_GUIDANCE-only for the model.
 _NUMERIC_THRESHOLD_FIELDS = {
     # field: (threshold, diagnosis)
     "cpu_throttle_periods_increase": (100, "cpu-throttling"),
     "catalogue_probe_p95_ms": (130, "under-provisioned-replicas"),
     "heap_rise_kb": (20000, "memory-leak"),
     "peak_threads_connected": (100, "connection-pool-exhaustion"),
+    "connect_failures": (4, "network-partition"),
 }
 
 

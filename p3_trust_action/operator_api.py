@@ -415,16 +415,19 @@ SETTLE_SECONDS = 35
 # long the real hold (duration override) runs. Most classes are immune
 # (max_over_time-for-a-spike signals register correctly whenever queried
 # mid-fault; min_over_time-for-a-drop signals like session-cart-failure's
-# scale-to-0 manifest instantly). network-partition is the one exception:
-# its min_over_time-for-a-drop signal depends on the underlying iptables
-# block itself, which injector.py's own docstring confirms takes ~30-40s
-# of real propagation before traffic is reliably near-zero -- the fixed
-# 35s settle lands right at that boundary, sometimes before it's clean.
-# This override gives network-partition a wider margin so snapshot_at
-# reliably lands past the documented worst case; every other class keeps
-# the original 35s via .get()'s default.
+# scale-to-0 manifest instantly). network-partition WAS the one exception
+# (its passive min_over_time-for-a-drop signal needed ~30-40s of iptables
+# propagation history), handled here with a "60" override until 2026-08-29
+# -- review 66 replaced that passive signal with the injector's frozen
+# connectivity probe, so the pair is now handled in _attempt_resolve's
+# evidence-epoch branch with settle_add=0 and this dict no longer has an
+# entry for it. Every remaining class keeps the original 35s via .get().
 SETTLE_SECONDS_OVERRIDE = {
-    "network-partition": 60,
+    # network-partition's old "60" moved out 2026-08-29 (review 66): this
+    # pair is now handled in _attempt_resolve's evidence-epoch branch with
+    # settle_add=0, because its diagnosis is driven by the injector's
+    # frozen connectivity probe, not the passive metrics the 60s settle
+    # existed to give propagation history to.
     # DEAD for oom as of 2026-08-26 -- kept only so .get()'s default
     # doesn't silently change for anyone still reading this dict; the real
     # oom snapshot_at is now computed in _attempt_resolve from the real
@@ -1187,19 +1190,31 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     # to the evidence epoch (written the moment the fresh pod's
     # throttled-periods delta crossed the threshold) lands the query
     # squarely inside active throttling.
-    if fault_class in ("oom", "disk-full", "cpu-throttling"):
+    # network-latency/network-partition added 2026-08-29 (Kimi+Qwen review
+    # 66): diagnosis for this pair is now driven by the injector's FROZEN
+    # connectivity probe (5 parallel GET /health from inside the front-end
+    # pod, recorded on episodes.network_probe_json the moment the fault
+    # verified). The passive p95_latency_ms / combined_throughput_bps
+    # signals -- which needed the old "network-partition": 60 settle for
+    # their ~30-40s iptables-propagation-history window -- are demoted to
+    # fallback-only, so there is nothing left for a settle to wait for:
+    # snapshot_at = the evidence epoch exactly (settle_add = 0). Anything
+    # a stale passive metric would show at that instant is irrelevant now
+    # that the probe wins.
+    if fault_class in ("oom", "disk-full", "cpu-throttling", "network-latency", "network-partition"):
         evidence_file = _evidence_file_path(episode_id)
+        settle_add = 0 if fault_class in ("network-latency", "network-partition") else SETTLE_SECONDS
         if evidence_file.exists():
             evidence_epoch = float(evidence_file.read_text().strip())
             target_dt = datetime.datetime.fromtimestamp(
-                evidence_epoch + SETTLE_SECONDS, tz=datetime.timezone.utc
+                evidence_epoch + settle_add, tz=datetime.timezone.utc
             )
         else:
-            # No evidence file (shouldn't happen -- all three classes are
+            # No evidence file (shouldn't happen -- all these classes are
             # in EVIDENCE_FILE_CLASSES/evidence_file_class -- but never
             # silently fall through to the stale t0-based formula this
             # whole fix exists to avoid).
-            target_dt = t0 + datetime.timedelta(seconds=SETTLE_SECONDS)
+            target_dt = t0 + datetime.timedelta(seconds=settle_add)
         snapshot_at = target_dt.isoformat()
         # Almost always already in the past by the time resolve actually
         # runs (evidence_confirmed has to flip before "Diagnose & Fix" is

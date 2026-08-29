@@ -148,6 +148,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -925,6 +926,17 @@ def ensure_db():
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(episodes)")}
     if "memory_leak_baseline_heap_kb" not in existing_cols:
         conn.execute("ALTER TABLE episodes ADD COLUMN memory_leak_baseline_heap_kb REAL")
+    # network_probe_json: injector-frozen active connectivity probe result
+    # for the network-latency / network-partition pair (Kimi+Qwen review 66,
+    # 2026-08-29). Same "lives on `episodes`, written by injector before
+    # episode_snapshots exists, read by p3_scorer when building the
+    # /diagnose payload" shape as memory_leak_baseline_heap_kb above. JSON
+    # text: {"attempts": int, "connect_failures": int, "max_http_ms": int}.
+    # NULL for every non-network class and every episode recorded before
+    # this probe existed (those fall back to the demoted p95/throughput
+    # passive signals in agent.py).
+    if "network_probe_json" not in existing_cols:
+        conn.execute("ALTER TABLE episodes ADD COLUMN network_probe_json TEXT")
     conn.commit()
     return conn
 
@@ -1254,6 +1266,130 @@ def _probe_orders_latency_ms(namespace: str) -> float | None:
     if not samples_ms:
         return None
     return max(samples_ms)
+
+
+# One class-agnostic connectivity probe, locked via Kimi+Qwen review 66
+# (2026-08-29) after 5 real Oracle measurement runs proved NO passive
+# Prometheus signal (p95_latency_ms, combined_throughput_bps, 2xx
+# completion rate, packet counts) can separate network-latency from
+# network-partition on arm64/Oracle's network stack -- partition there
+# produces hung-then-completed requests (real status=200, 13000-38252ms)
+# that fully overlap real latency, and its leaky/retry-prone injection
+# makes byte-rate windows unstable run-to-run.
+NETWORK_CONNECTIVITY_PROBE_ATTEMPTS = 5
+# 15s per attempt: NETWORK_LATENCY_DELAY is 3000ms nominal / ~6.5s real
+# observed p95, so a real latency request must be allowed to COMPLETE
+# (~6s) without being counted as a connect failure; 15s clears that with
+# margin while still capping a genuinely-cut request. Qwen review 66.
+NETWORK_CONNECTIVITY_PROBE_TIMEOUT_S = 15
+
+
+def _probe_frontend_connectivity(namespace: str) -> dict | None:
+    """Active connectivity probe for the network-latency / network-partition
+    pair. Runs NETWORK_CONNECTIVITY_PROBE_ATTEMPTS fresh GET /health
+    requests against orders' own Service, each a SEPARATE `kubectl exec`
+    into the live front-end pod -- NOT a throwaway pod: network-latency's
+    NetworkChaos is scoped `target: {selector: front-end}`
+    (build_network_latency_manifest), so anything outside that pod sits
+    outside the chaos scope and reads a false baseline (Qwen review 66
+    caught this; partition has no `target` block so it's visible from
+    anywhere, but a class-agnostic probe must catch both). Same BusyBox
+    `wget -T` / wall-clock-timed pattern as _probe_orders_latency_ms.
+
+    All attempts run in PARALLEL -- 5 serial x 15s would blow the hold
+    loop's poll cadence and the frontend's confirm-button budget.
+
+    Returns a RAW measurement dict, never a verdict (agent.py maps
+    symptom -> class itself):
+      attempts:         how many exec attempts actually ran
+      connect_failures: how many got no HTTP response (timeout / refused)
+                        -- a real full partition -> ~5, real latency -> 0
+      max_http_ms:      max wall-clock of ANY attempt, successful OR
+                        timed-out -- real latency -> ~6000, partition -> ~15000
+    Both numeric fields are ALWAYS present when the dict is returned
+    (never None-vs-a-number, which would itself leak the class). Returns
+    None only if the front-end pod couldn't be found or every exec failed
+    to launch -- callers treat that as "probe unavailable", never as
+    "healthy" / "no fault".
+    """
+    pod_name = _current_pod_name("front-end", namespace)
+    if pod_name is None:
+        return None
+    url = f"http://orders.{namespace}.svc.cluster.local/health"
+
+    def _one_attempt() -> tuple[bool, float]:
+        start = time.monotonic()
+        try:
+            result = subprocess.run(
+                [
+                    "kubectl", "exec",
+                    f"--request-timeout={NETWORK_CONNECTIVITY_PROBE_TIMEOUT_S}s",
+                    "-n", namespace, pod_name, "--",
+                    "wget", "-q", "-O", "/dev/null",
+                    "-T", str(NETWORK_CONNECTIVITY_PROBE_TIMEOUT_S), url,
+                ],
+                capture_output=True, text=True,
+                timeout=NETWORK_CONNECTIVITY_PROBE_TIMEOUT_S + 5,
+            )
+        except subprocess.TimeoutExpired:
+            return False, (time.monotonic() - start) * 1000
+        except Exception:
+            return False, (time.monotonic() - start) * 1000
+        return result.returncode == 0, (time.monotonic() - start) * 1000
+
+    durations_ms: list[float] = []
+    failures = 0
+    ran = 0
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=NETWORK_CONNECTIVITY_PROBE_ATTEMPTS
+    ) as pool:
+        for fut in concurrent.futures.as_completed(
+            [pool.submit(_one_attempt) for _ in range(NETWORK_CONNECTIVITY_PROBE_ATTEMPTS)]
+        ):
+            try:
+                ok, ms = fut.result()
+            except Exception:
+                continue
+            ran += 1
+            durations_ms.append(ms)
+            if not ok:
+                failures += 1
+
+    if ran == 0:
+        return None
+    return {
+        "attempts": ran,
+        "connect_failures": failures,
+        "max_http_ms": round(max(durations_ms)),
+    }
+
+
+def _persist_network_probe(
+    conn: sqlite3.Connection, episode_id: str, fault_class: str, cfg: dict, t0: str,
+    probe: dict | None,
+) -> None:
+    """Freeze _probe_frontend_connectivity's result onto the `episodes`
+    row, at _write_evidence_file_once time. Mirrors _capture_memory_leak_
+    baseline's UPSERT exactly (INSERT covers the batch-run case where no
+    row exists yet -- record_episode's own INSERT only fires after
+    injection completes; ON CONFLICT covers Operator's async-pre-created
+    row). ONLY ever touches network_probe_json, never a field
+    record_episode owns. A None probe (front-end pod gone, every exec
+    failed) writes nothing -- the column stays NULL and agent.py falls
+    back to the demoted passive p95/throughput signals."""
+    if probe is None:
+        print(f"  connectivity probe unavailable -- leaving network_probe_json NULL for {episode_id}")
+        return
+    print(f"  connectivity probe for {episode_id}: {probe}")
+    conn.execute(
+        "INSERT INTO episodes "
+        "(episode_id, fault_class, target, namespace, t0, chaos_resource_name, network_probe_json) "
+        "VALUES (?, ?, ?, ?, ?, 'pending', ?) "
+        "ON CONFLICT(episode_id) DO UPDATE SET "
+        "network_probe_json=excluded.network_probe_json",
+        (episode_id, fault_class, cfg["target"], cfg["namespace"], t0, json.dumps(probe)),
+    )
+    conn.commit()
 
 
 def _current_pod_name(target: str, namespace: str) -> str | None:
@@ -3074,13 +3210,20 @@ def _inject_and_verify_crash_loop(cfg: dict, stop_file: str | None = None) -> bo
 
 
 def _inject_and_verify_network_latency(
-    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+    cfg: dict, episode_id: str | None = None, t0: str | None = None,
+    conn: sqlite3.Connection | None = None,
+    stop_file: str | None = None, evidence_file: str | None = None,
 ) -> str | None:
     """Unlike the other Chaos Mesh class (oom), verification here does
     NOT reuse _verify_restart_effect -- a network delay never restarts
     anything. Verified via _probe_orders_latency_ms's direct, timed
     requests (see the ABANDONED note above LATENCY_PROBE_SAMPLES for
-    why this isn't k6/Prometheus-metric-based)."""
+    why this isn't k6/Prometheus-metric-based).
+
+    On first verification also runs _probe_frontend_connectivity and
+    freezes its raw result onto the episode row (review 66) -- this is
+    the PRIMARY network-latency-vs-partition discriminator for
+    diagnosis; the passive p95/throughput signals are demoted fallback."""
     chaos_kind = "networkchaos"
     namespace = cfg["namespace"]
 
@@ -3124,7 +3267,10 @@ def _inject_and_verify_network_latency(
                 during_ms = _probe_orders_latency_ms(namespace)
                 if during_ms is not None and during_ms >= baseline_ms + NETWORK_LATENCY_MIN_INCREASE_MS:
                     if not verified:
+                        probe = _probe_frontend_connectivity(namespace) if conn is not None else None
                         _write_evidence_file_once(evidence_file)
+                        if conn is not None:
+                            _persist_network_probe(conn, episode_id, "network-latency", cfg, t0, probe)
                     verified = True
         finally:
             delete_chaos_resource(chaos_kind, chaos_name)
@@ -3143,7 +3289,9 @@ def _inject_and_verify_network_latency(
 
 
 def _inject_and_verify_network_partition(
-    cfg: dict, stop_file: str | None = None, evidence_file: str | None = None
+    cfg: dict, episode_id: str | None = None, t0: str | None = None,
+    conn: sqlite3.Connection | None = None,
+    stop_file: str | None = None, evidence_file: str | None = None,
 ) -> str | None:
     """Verified via _probe_orders_reachable (direct probe, NOT k6/
     Prometheus -- see NETWORK_PARTITION_PROBE_SAMPLES's docstring for
@@ -3199,7 +3347,10 @@ def _inject_and_verify_network_partition(
             print(f"  early probe: {failures}/{NETWORK_PARTITION_PROBE_SAMPLES} samples failed "
                   f"(need >= {NETWORK_PARTITION_MIN_FAILURES})")
             if verified:
+                probe = _probe_frontend_connectivity(namespace) if conn is not None else None
                 _write_evidence_file_once(evidence_file)
+                if conn is not None:
+                    _persist_network_probe(conn, episode_id, "network-partition", cfg, t0, probe)
 
             # Sleep out whatever's genuinely left of duration_s, based on
             # REAL elapsed wall-clock time (the 5s wait + the probe's own
@@ -4503,7 +4654,16 @@ def main():
         # itself) so it's the SAME connection record_episode reuses below --
         # avoids two separate SQLite connections racing on the same file
         # mid-episode.
-        conn = ensure_db() if fault_class == "memory-leak" else None
+        # memory-leak needs a live DB connection mid-injection for its
+        # settle-time baseline capture; network-latency/network-partition
+        # need one for _persist_network_probe (frozen connectivity probe,
+        # review 66) -- same "opened here so it's the SAME connection
+        # record_episode reuses below" reasoning for all three.
+        conn = (
+            ensure_db()
+            if fault_class in ("memory-leak", "network-latency", "network-partition")
+            else None
+        )
 
         if fault_class == "disk-full":
             _ensure_queue_master_pod_cleanup(cfg)
@@ -4517,7 +4677,8 @@ def main():
             chaos_name = "manual-exec" if verified else None
         elif fault_class == "network-latency":
             chaos_name = _inject_and_verify_network_latency(
-                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+                cfg, episode_id, t0, conn,
+                stop_file=args.stop_file, evidence_file=args.evidence_file,
             )
         elif fault_class == "memory-leak":
             _ensure_memory_leak_baseline(cfg)
@@ -4531,7 +4692,8 @@ def main():
             )
         elif fault_class == "network-partition":
             chaos_name = _inject_and_verify_network_partition(
-                cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
+                cfg, episode_id, t0, conn,
+                stop_file=args.stop_file, evidence_file=args.evidence_file,
             )
         elif fault_class == "init-failure":
             verified = _inject_and_verify_init_failure(
