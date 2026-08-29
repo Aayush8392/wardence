@@ -758,6 +758,17 @@ MEMORY_LEAK_TARGET_MB = 80
 # cannot reproduce -- the synthetic burst below is what makes the felt
 # effect real, not decoration.
 MEMORY_LEAK_LOAD_CONCURRENCY = 15
+# CPU limit on the DEDICATED load-burst pod (2026-08-29, Oracle demo-visibility
+# investigation). The burst used to run via `kubectl exec` INSIDE the live
+# front-end pod, which pinned front-end at its own 300m CPU limit for the whole
+# hold -- degrading add-to-cart / browse / every front-end-proxied request
+# regardless of shipping (a symptom a real shipping heap leak would never
+# cause) and pushing the 2-vCPU Oracle node to ~98%. The burst now runs in its
+# own pod (front-end's image, for a `node` runtime) with this cap, so the load
+# stays on shipping's own request path and its node footprint is bounded.
+# Tunable: raise if concurrency can't be sustained under it, lower if the node
+# is still too hot during a hold.
+SHIPPING_LOAD_BURST_CPU_LIMIT = "250m"
 
 # catalogue-db's max_connections is 151 (confirmed still unchanged,
 # 2026-07-25). baseline Threads_connected was ~2-3 on 2026-07-21;
@@ -2448,34 +2459,35 @@ export default function () {{
     return pod_name, proc
 
 
-def _launch_shipping_load_burst(namespace: str, concurrency: int, duration_s: int) -> subprocess.Popen | None:
-    """Non-blocking (Popen) launch of the real synthetic load burst
-    memory-leak's production design was actually measured against
-    (check_shipping_synthetic_load_no_leak.sh, 2026-08-21 session) --
-    identical payload/mechanism, not a fresh reimplementation: closed-loop
-    POST /shipping, CONCURRENCY workers each awaiting their own response
-    before issuing the next. Real measurement confirmed organic traffic
-    alone (0.667 req/s) cannot reproduce the validated felt effect; this
-    burst is the real reason the effect is felt at all, not decoration.
+def _launch_shipping_load_burst(namespace: str, concurrency: int, duration_s: int):
+    """Non-blocking launch of the real synthetic load burst memory-leak's
+    production design was measured against (check_shipping_synthetic_load_no_leak.sh,
+    2026-08-21 session) -- identical payload/mechanism: closed-loop POST
+    /shipping, CONCURRENCY workers each awaiting their own response before the
+    next. Real measurement confirmed organic traffic alone (0.667 req/s) cannot
+    reproduce the validated felt effect; this burst is the real reason the
+    effect is felt at all, not decoration.
 
-    Deliberately reuses the SAME technique the validated check script used
-    -- `kubectl exec` directly into a live front-end pod running an inline
-    Node.js closed-loop client, targeting shipping's own real pod IP (not
-    the Service DNS name) -- rather than a separate k6 pod like
-    _launch_sustained_catalogue_burst, because this exact mechanism (not
-    k6) is what the real production measurements (measurement 3, prior
-    session) were taken against.
+    Runs in a DEDICATED, CPU-capped pod (front-end's own image, which carries a
+    `node` runtime) -- NOT `kubectl exec` into the live front-end pod. The
+    original in-front-end approach (2026-08-21) was found on Oracle (2026-08-29)
+    to pin front-end at its own 300m CPU limit for the whole hold, degrading
+    every request front-end proxies (add-to-cart, browse) regardless of
+    shipping -- a symptom a real shipping heap leak would never produce -- and
+    pushing the 2-vCPU node to ~98%. A dedicated pod keeps the load on
+    shipping's own request path only; SHIPPING_LOAD_BURST_CPU_LIMIT bounds its
+    node footprint.
 
-    Returns None (logs why, never raises) if either pod can't be resolved.
-    Caller owns reaping the returned Popen (communicate/terminate), same
-    contract as _launch_sustained_catalogue_burst -- wired into
-    _inject_and_verify_memory_leak, which reaps it in its own `finally`
-    block (see that function's hold loop)."""
+    Returns (pod_name, Popen). Caller reaps the Popen AND deletes the pod --
+    --rm/--attach is best-effort; the explicit delete in the caller's `finally`
+    is the real cleanup, per this project's fault-injection cleanup discipline.
+    Returns (None, None) (logs why, never raises) if shipping's pod/IP or
+    front-end's image can't be resolved."""
     shipping_pod = _current_pod_name("shipping", namespace)
     if shipping_pod is None:
         print(f"  ABORT: no Running shipping pod found in {namespace} -- cannot resolve a pod IP "
               f"to target the synthetic load burst at.")
-        return None
+        return None, None
     ip_result = subprocess.run(
         ["kubectl", "get", "pod", shipping_pod, "-n", namespace, "-o", "jsonpath={.status.podIP}"],
         capture_output=True, text=True,
@@ -2483,14 +2495,18 @@ def _launch_shipping_load_burst(namespace: str, concurrency: int, duration_s: in
     shipping_ip = ip_result.stdout.strip()
     if not shipping_ip:
         print(f"  ABORT: shipping pod {shipping_pod} has no podIP yet -- cannot start the load burst.")
-        return None
+        return None, None
 
-    front_end_pod = _current_pod_name("front-end", namespace)
-    if front_end_pod is None:
-        print(f"  ABORT: no Running front-end pod found in {namespace} -- the load burst is "
-              f"executed FROM front-end (same technique the validated check script used), "
-              f"not from a separate pod.")
-        return None
+    image_result = subprocess.run(
+        ["kubectl", "get", "deployment", "front-end", "-n", namespace,
+         "-o", "jsonpath={.spec.template.spec.containers[0].image}"],
+        capture_output=True, text=True,
+    )
+    load_image = image_result.stdout.strip()
+    if not load_image:
+        print("  ABORT: could not resolve front-end's image for the load-burst pod "
+              "(needed only for its `node` runtime).")
+        return None, None
 
     js = (
         "'use strict';\n"
@@ -2523,11 +2539,34 @@ def _launch_shipping_load_burst(namespace: str, concurrency: int, duration_s: in
         "  console.log('[loadresult] sent=' + sent + ' failed=' + failed);\n"
         "});\n"
     )
+    pod_name = f"wardence-shipping-load-{uuid.uuid4().hex[:8]}"
+    overrides = json.dumps({
+        "apiVersion": "v1",
+        "spec": {
+            "restartPolicy": "Never",
+            "containers": [{
+                "name": pod_name,
+                "image": load_image,
+                "imagePullPolicy": "IfNotPresent",
+                "command": ["node", "-e", js],
+                "resources": {
+                    "limits": {"cpu": SHIPPING_LOAD_BURST_CPU_LIMIT, "memory": "128Mi"},
+                    "requests": {"cpu": "50m", "memory": "64Mi"},
+                },
+            }],
+        },
+    })
     proc = subprocess.Popen(
-        ["kubectl", "exec", "-n", namespace, front_end_pod, "--", "node", "-e", js],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        [
+            "kubectl", "run", pod_name, "--rm", "--attach", "--restart=Never",
+            "-n", namespace, "--image", load_image, "--image-pull-policy=IfNotPresent",
+            "--overrides", overrides,
+        ],
+        # stdout/stderr -> DEVNULL: output is never read; lets the caller reap
+        # with terminate()+communicate() with no pipe-buffer risk.
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
     )
-    return proc
+    return pod_name, proc
 
 
 def _launch_catalogue_live_sampler(namespace: str, duration_s: int) -> str:
@@ -3439,7 +3478,7 @@ def _inject_and_verify_memory_leak(
 
     print(f"  launching the synthetic load burst (concurrency={MEMORY_LEAK_LOAD_CONCURRENCY}, "
           f"duration={cfg['duration_s']}s) against shipping...")
-    load_proc = _launch_shipping_load_burst(
+    load_pod, load_proc = _launch_shipping_load_burst(
         cfg["namespace"], MEMORY_LEAK_LOAD_CONCURRENCY, cfg["duration_s"]
     )
     if load_proc is None:
@@ -3497,6 +3536,13 @@ def _inject_and_verify_memory_leak(
                 load_proc.kill()
             except Exception:
                 pass
+        if load_pod is not None:
+            print(f"  deleting the load-burst pod {load_pod}...")
+            subprocess.run(
+                ["kubectl", "delete", "pod", load_pod, "-n", cfg["namespace"],
+                 "--ignore-not-found=true", "--wait=false"],
+                capture_output=True, text=True,
+            )
         print(f"  releasing the leak agent on {pod}...")
         _leak_agent_send_cmd(pod, cfg["namespace"], container, "RELEASE")
 
