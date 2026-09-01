@@ -466,6 +466,29 @@ public class LeakAgent {
         Class<?> define(String binName, byte[] b) { return defineClass(binName, b, 0, b.length); }
     }
 
+    // ---- CHURN mode: medium-lived promoted-then-garbage stream (2026-09-01) ----
+    // DELIBERATELY SEPARATE from every other mechanism in this file. A `CHURN <mb>
+    // <hold_ms> [static=<mb>] [ttl=<s>]` command maintains a ring buffer of ~<mb> MiB
+    // where each 256KiB chunk is held for <hold_ms> then dropped and replaced. Every
+    // prior attempt attacked condition #1 (fill/hold old gen with PERMANENT retained
+    // junk). This attacks condition #2: a continuous stream of objects that live long
+    // enough to be PROMOTED into old gen (hold_ms >= ~2s comfortably survives a young GC
+    // under load), then become garbage IN old gen when they fall off the ring -- forcing
+    // repeated old-gen collections for as long as the stream runs. Bounded ring => can
+    // never OOM => no cliff by construction (the "no bounded middle" problem from the
+    // paced-climb test was about a GROWING retained set; this is not that). `static=<mb>`
+    // (optional) additionally drives the existing retained-leak worker to pre-fill old
+    // gen so the churn garbage triggers a collection with far less headroom. `CHURN 0` /
+    // RELEASE drains it. Byte-identical no-op until a CHURN command arrives.
+    private static final int CHURN_CHUNK_BYTES = 256 * 1024; // 256 KiB, sub-humongous
+    private static volatile long churnTargetBytes = 0L;
+    private static volatile long churnLiveBytes = 0L;
+    private static volatile long churnHoldMs = 2500L;
+    // Each entry: Object[]{ Long createdAtMs, byte[] payload }. Head = oldest.
+    private static final java.util.ArrayDeque<Object[]> CHURN_RING = new java.util.ArrayDeque<Object[]>();
+    private static final Object CHURN_LOCK = new Object();
+    private static final AtomicLong churnEvictions = new AtomicLong(0L);
+
     // ---- real GC observation state (review 57) ----
     // Kimi and Qwen DISAGREED on whether summed GarbageCollectorMXBean.getCollectionTime()
     // is a valid "application stopped time" signal: Kimi said the beans are correct and
@@ -860,6 +883,95 @@ public class LeakAgent {
         codeLeakTarget = Math.max(0L, count);
     }
 
+    // ================= Thread: churn (medium-lived promoted-then-garbage stream) =======
+    // Every ~150ms, under CHURN_LOCK: (1) evict from the head every chunk older than
+    // churnHoldMs (dropping the reference -> the chunk becomes garbage; if it has been
+    // alive >= churnHoldMs under load it has already survived a young GC and been
+    // promoted, so it is garbage IN OLD GEN); (2) top the ring back up toward
+    // churnTargetBytes with fresh 256KiB chunks. When churnTargetBytes is 0, drain
+    // everything immediately regardless of age. An allocation failure just stops adding
+    // for this tick -- never throws up (the ring is bounded, so this should not happen,
+    // but the try/catch is a safety net).
+    private static void churnLoop() {
+        while (true) {
+            try {
+                long target = churnTargetBytes;
+                long holdMs = churnHoldMs;
+                long now = System.currentTimeMillis();
+                synchronized (CHURN_LOCK) {
+                    // evict aged-out (or everything, if target==0)
+                    while (!CHURN_RING.isEmpty()) {
+                        Object[] head = CHURN_RING.peekFirst();
+                        long age = now - (Long) head[0];
+                        if (target == 0L || age >= holdMs) {
+                            CHURN_RING.removeFirst();
+                            churnLiveBytes -= ((byte[]) head[1]).length;
+                            if (churnLiveBytes < 0) churnLiveBytes = 0;
+                            churnEvictions.incrementAndGet();
+                        } else {
+                            break; // head is the oldest; nothing behind it is older
+                        }
+                    }
+                    // top up toward target
+                    int added = 0;
+                    while (churnLiveBytes + CHURN_CHUNK_BYTES <= target && added < 4096) {
+                        try {
+                            byte[] payload = new byte[CHURN_CHUNK_BYTES];
+                            payload[0] = (byte) 0xC7;
+                            payload[payload.length - 1] = (byte) 0xC7;
+                            CHURN_RING.addLast(new Object[] { Long.valueOf(System.currentTimeMillis()), payload });
+                            churnLiveBytes += CHURN_CHUNK_BYTES;
+                            added++;
+                        } catch (OutOfMemoryError oom) {
+                            lastError = "churn alloc failed at liveBytes=" + churnLiveBytes + ": " + oom;
+                            break;
+                        }
+                    }
+                }
+                Thread.sleep(150);
+            } catch (Throwable t) {
+                lastError = "churn: " + t;
+            }
+        }
+    }
+
+    private static void handleChurn(String line, long cmdMtime) {
+        String[] parts = line.split("\\s+");
+        if (parts.length < 3) return;
+        long mb;
+        long holdMs;
+        long ttlS = 60;
+        long staticMb = -1;
+        try {
+            mb = Long.parseLong(parts[1]);
+            holdMs = Long.parseLong(parts[2]);
+            for (int i = 3; i < parts.length; i++) {
+                if (parts[i].startsWith("ttl=")) ttlS = Long.parseLong(parts[i].substring(4));
+                else if (parts[i].startsWith("static=")) staticMb = Long.parseLong(parts[i].substring(7));
+            }
+        } catch (NumberFormatException e) {
+            return;
+        }
+        cmdMtimeAtRead = cmdMtime;
+        cmdTtlS = ttlS;
+        churnTargetBytes = Math.max(0L, mb) * 1024L * 1024L;
+        churnHoldMs = Math.max(250L, holdMs);
+        // Optional companion static retained leak -- reuses the existing worker/governor
+        // path exactly like an ALLOCATE would, so old gen is pre-filled.
+        if (staticMb >= 0) {
+            int reqMb = (int) staticMb;
+            ABORT_ALLOCATION.set(false);
+            if (reqMb != targetMb) {
+                governorCeilingMb = 0;
+                governorLastReleaseAt = 0;
+                governorStableLowSinceMs = 0;
+                govPrevStwSampledAt = 0;
+                currentState = "ALLOCATING";
+            }
+            targetMb = reqMb;
+        }
+    }
+
     public static void premain(String agentArgs, Instrumentation inst) {
         try {
             if (CMD_FILE.exists()) {
@@ -893,6 +1005,9 @@ public class LeakAgent {
             startThread("wardence-leak-codeleak", new Runnable() {
                 public void run() { codeLeakLoop(); }
             });
+            startThread("wardence-leak-churn", new Runnable() {
+                public void run() { churnLoop(); }
+            });
             if (SYNC_ENABLED) {
                 startThread("wardence-leak-reqsync", new Runnable() {
                     public void run() { requestSyncLoop(); }
@@ -900,7 +1015,7 @@ public class LeakAgent {
             }
 
             System.err.println("[wardence-leak-agent] hardened agent loaded, "
-                + (SYNC_ENABLED ? 8 : 7) + " threads started"
+                + (SYNC_ENABLED ? 9 : 8) + " threads started"
                 + " (reqsync=" + (SYNC_ENABLED ? "on" : "off")
                 + ", governor=" + (GOVERNOR_PASSIVE ? "passive" : "active")
                 + ", native=" + (UNSAFE != null ? "available" : "UNAVAILABLE") + ")");
@@ -958,7 +1073,7 @@ public class LeakAgent {
                     ioStuck.set(true);
                 } else if (!cmdExists) {
                     ioStuck.set(false);
-                    if ((allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0) && !"RELEASING".equals(currentState)) {
+                    if ((allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0) && !"RELEASING".equals(currentState)) {
                         requestRelease("no command file present");
                     }
                 } else {
@@ -977,7 +1092,7 @@ public class LeakAgent {
                         } else {
                             String line = lines.isEmpty() ? "" : lines.get(0).trim();
                             if (line.isEmpty()) {
-                                if (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0) requestRelease("empty command file");
+                                if (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0) requestRelease("empty command file");
                             } else if (line.equalsIgnoreCase("RELEASE")) {
                                 requestRelease("RELEASE command");
                             } else if (line.toUpperCase().startsWith("ALLOCATE")) {
@@ -988,6 +1103,8 @@ public class LeakAgent {
                                 handleRefLeak(line, mtime);
                             } else if (line.toUpperCase().startsWith("CODELEAK")) {
                                 handleCodeLeak(line, mtime);
+                            } else if (line.toUpperCase().startsWith("CHURN")) {
+                                handleChurn(line, mtime);
                             }
                         }
                     }
@@ -1079,6 +1196,7 @@ public class LeakAgent {
         nativeTargetBytes = 0L; // native-memory mode is freed by nativeLoop() converging to 0
         refLeakTarget = 0L;     // refleak mode is freed by refLeakLoop() converging to 0
         codeLeakTarget = 0L;    // codeleak mode is freed by codeLeakLoop() dropping its loaders
+        churnTargetBytes = 0L;  // churn ring is drained by churnLoop() when target is 0
         currentState = "RELEASING";
         lastError = reason;
     }
@@ -1259,7 +1377,7 @@ public class LeakAgent {
 
                 if (cmdMtimeAtRead > 0) {
                     long cmdAgeS = (now - cmdMtimeAtRead) / 1000;
-                    if (cmdAgeS > cmdTtlS && (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0)) {
+                    if (cmdAgeS > cmdTtlS && (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0)) {
                         forceRelease("watchdog: command TTL expired independently (age=" + cmdAgeS + "s)");
                     }
                 }
@@ -1389,6 +1507,7 @@ public class LeakAgent {
         nativeTargetBytes = 0L; // nativeLoop() frees its chunks as it converges to 0
         refLeakTarget = 0L;     // refLeakLoop() drops its soft refs as it converges to 0
         codeLeakTarget = 0L;    // codeLeakLoop() drops its loaders as it converges to 0
+        churnTargetBytes = 0L;  // churnLoop() drains its ring when target is 0
         ABORT_ALLOCATION.set(true);
         currentState = "WATCHDOG_RELEASE";
         lastError = reason;
@@ -1641,6 +1760,10 @@ public class LeakAgent {
             sb.append("codeleak_count=").append(codeLeakCount).append('\n');
             sb.append("codeleak_target=").append(codeLeakTarget).append('\n');
             sb.append("codeleak_failed=").append(codeLeakFailed).append('\n');
+            sb.append("churn_target_mb=").append(churnTargetBytes / (1024 * 1024)).append('\n');
+            sb.append("churn_live_mb=").append(churnLiveBytes / (1024 * 1024)).append('\n');
+            sb.append("churn_hold_ms=").append(churnHoldMs).append('\n');
+            sb.append("churn_evictions=").append(churnEvictions.get()).append('\n');
             if (CODE_CACHE_POOL != null) {
                 try {
                     java.lang.management.MemoryUsage cu = CODE_CACHE_POOL.getUsage();
