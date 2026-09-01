@@ -468,7 +468,7 @@ public class LeakAgent {
 
     // ---- CHURN mode: medium-lived promoted-then-garbage stream (2026-09-01) ----
     // DELIBERATELY SEPARATE from every other mechanism in this file. A `CHURN <mb>
-    // <hold_ms> [static=<mb>] [ttl=<s>]` command maintains a ring buffer of ~<mb> MiB
+    // <hold_ms> [linked] [static=<mb>] [ttl=<s>]` command maintains a ring buffer of ~<mb> MiB
     // where each 256KiB chunk is held for <hold_ms> then dropped and replaced. Every
     // prior attempt attacked condition #1 (fill/hold old gen with PERMANENT retained
     // junk). This attacks condition #2: a continuous stream of objects that live long
@@ -481,11 +481,33 @@ public class LeakAgent {
     // gen so the churn garbage triggers a collection with far less headroom. `CHURN 0` /
     // RELEASE drains it. Byte-identical no-op until a CHURN command arrives.
     private static final int CHURN_CHUNK_BYTES = 256 * 1024; // 256 KiB, sub-humongous
+    // `linked` variant (2026-09-01, user's own idea #1): each churned entry, instead of
+    // an inert byte[], is a small node holding a byte[] payload PLUS refs to a few OTHER
+    // recent ring entries -- so a young GC must chase pointers and maintain cross-region
+    // remembered-set/card-table bookkeeping every collection, not just copy bytes. Refs
+    // point only at entries within a bounded recent window (the "hub" fix from the
+    // 2026-08 object-graph work: without a window, the oldest few nodes get referenced by
+    // nearly every later node). With FIFO head-eviction, an evicted node stays reachable
+    // via forward refs from newer nodes until the window slides past it ~CHURN_REF_WINDOW
+    // steps later -- so garbage is generated as LINKED CLUSTERS that fall unreachable
+    // together, more tracing/reclaim work for the GC than scattered arrays. Flat (default)
+    // mode is a ChurnNode with an empty refs array -- functionally the original design.
+    private static final int CHURN_REFS_PER_NODE = 6;
+    private static final int CHURN_REF_WINDOW = 40;
+    private static final java.util.Random CHURN_RANDOM = new java.util.Random();
+    private static final Object[] CHURN_EMPTY_REFS = new Object[0];
+    private static final class ChurnNode {
+        final long createdAtMs;
+        final byte[] payload;
+        final Object[] refs; // ChurnNode[] in practice; Object[] to sidestep a self-generic
+        ChurnNode(long t, byte[] p, Object[] r) { this.createdAtMs = t; this.payload = p; this.refs = r; }
+    }
+    private static volatile boolean churnLinked = false;
     private static volatile long churnTargetBytes = 0L;
     private static volatile long churnLiveBytes = 0L;
     private static volatile long churnHoldMs = 2500L;
-    // Each entry: Object[]{ Long createdAtMs, byte[] payload }. Head = oldest.
-    private static final java.util.ArrayDeque<Object[]> CHURN_RING = new java.util.ArrayDeque<Object[]>();
+    // Head = oldest.
+    private static final java.util.ArrayDeque<ChurnNode> CHURN_RING = new java.util.ArrayDeque<ChurnNode>();
     private static final Object CHURN_LOCK = new Object();
     private static final AtomicLong churnEvictions = new AtomicLong(0L);
 
@@ -897,15 +919,16 @@ public class LeakAgent {
             try {
                 long target = churnTargetBytes;
                 long holdMs = churnHoldMs;
+                boolean linked = churnLinked;
                 long now = System.currentTimeMillis();
                 synchronized (CHURN_LOCK) {
                     // evict aged-out (or everything, if target==0)
                     while (!CHURN_RING.isEmpty()) {
-                        Object[] head = CHURN_RING.peekFirst();
-                        long age = now - (Long) head[0];
+                        ChurnNode head = CHURN_RING.peekFirst();
+                        long age = now - head.createdAtMs;
                         if (target == 0L || age >= holdMs) {
                             CHURN_RING.removeFirst();
-                            churnLiveBytes -= ((byte[]) head[1]).length;
+                            churnLiveBytes -= head.payload.length;
                             if (churnLiveBytes < 0) churnLiveBytes = 0;
                             churnEvictions.incrementAndGet();
                         } else {
@@ -919,7 +942,20 @@ public class LeakAgent {
                             byte[] payload = new byte[CHURN_CHUNK_BYTES];
                             payload[0] = (byte) 0xC7;
                             payload[payload.length - 1] = (byte) 0xC7;
-                            CHURN_RING.addLast(new Object[] { Long.valueOf(System.currentTimeMillis()), payload });
+                            Object[] refs = CHURN_EMPTY_REFS;
+                            if (linked && !CHURN_RING.isEmpty()) {
+                                // snapshot up to CHURN_REF_WINDOW newest entries (tail-first),
+                                // then pick CHURN_REFS_PER_NODE at random from that window
+                                int winCap = Math.min(CHURN_REF_WINDOW, CHURN_RING.size());
+                                Object[] window = new Object[winCap];
+                                int wi = 0;
+                                java.util.Iterator<ChurnNode> it = CHURN_RING.descendingIterator();
+                                while (it.hasNext() && wi < winCap) window[wi++] = it.next();
+                                int want = Math.min(CHURN_REFS_PER_NODE, wi);
+                                refs = new Object[want];
+                                for (int r = 0; r < want; r++) refs[r] = window[CHURN_RANDOM.nextInt(wi)];
+                            }
+                            CHURN_RING.addLast(new ChurnNode(System.currentTimeMillis(), payload, refs));
                             churnLiveBytes += CHURN_CHUNK_BYTES;
                             added++;
                         } catch (OutOfMemoryError oom) {
@@ -942,18 +978,21 @@ public class LeakAgent {
         long holdMs;
         long ttlS = 60;
         long staticMb = -1;
+        boolean linked = false;
         try {
             mb = Long.parseLong(parts[1]);
             holdMs = Long.parseLong(parts[2]);
             for (int i = 3; i < parts.length; i++) {
                 if (parts[i].startsWith("ttl=")) ttlS = Long.parseLong(parts[i].substring(4));
                 else if (parts[i].startsWith("static=")) staticMb = Long.parseLong(parts[i].substring(7));
+                else if (parts[i].equalsIgnoreCase("linked")) linked = true;
             }
         } catch (NumberFormatException e) {
             return;
         }
         cmdMtimeAtRead = cmdMtime;
         cmdTtlS = ttlS;
+        churnLinked = linked;
         churnTargetBytes = Math.max(0L, mb) * 1024L * 1024L;
         churnHoldMs = Math.max(250L, holdMs);
         // Optional companion static retained leak -- reuses the existing worker/governor
@@ -1763,6 +1802,7 @@ public class LeakAgent {
             sb.append("churn_target_mb=").append(churnTargetBytes / (1024 * 1024)).append('\n');
             sb.append("churn_live_mb=").append(churnLiveBytes / (1024 * 1024)).append('\n');
             sb.append("churn_hold_ms=").append(churnHoldMs).append('\n');
+            sb.append("churn_linked=").append(churnLinked).append('\n');
             sb.append("churn_evictions=").append(churnEvictions.get()).append('\n');
             if (CODE_CACHE_POOL != null) {
                 try {
