@@ -540,6 +540,31 @@ public class LeakAgent {
     private static final Object CHURN_LOCK = new Object();
     private static final AtomicLong churnEvictions = new AtomicLong(0L);
 
+    // ---- GRAPH mode: dense, constantly-rewritten reference graph in old gen (2026-09-01,
+    //      user's #A+#B fused) ----
+    // GC mark cost is O(references/EDGES traversed), and young-GC cost is O(dirty cards
+    // rescanned). This holds ONE big retained Object[] "backbone" (-> old gen) whose slots
+    // each point to a GraphNode carrying `graphEdges` references to random OTHER backbone
+    // slots -- a dense graph of ~graphSlots nodes and graphSlots*graphEdges edges. A
+    // background thread overwrites random backbone slots at graphWritesPerSec: each store
+    // (a) dirties that slot's card -> every young GC must rescan it and re-examine every
+    // node on it (all its edges), and (b) makes the previous slot occupant old-gen
+    // garbage. So EVERY young GC (frequent, on the request path) pays O(all edges), and
+    // every Full GC's mark phase traverses the whole edge set. `GRAPH 0` / RELEASE nulls
+    // the backbone. Byte-identical no-op until a GRAPH command arrives.
+    private static final int GRAPH_NODE_PAD_INTS = 4; // int[4] ~= 32B pad per node
+    private static final class GraphNode {
+        final int[] pad;
+        final Object[] edges;
+        GraphNode(int[] p, Object[] e) { this.pad = p; this.edges = e; }
+    }
+    private static volatile Object[] graphBackbone = null;
+    private static volatile int graphSlots = 0;
+    private static volatile int graphWritesPerSec = 0;
+    private static volatile int graphEdges = 0;
+    private static final java.util.Random GRAPH_WRITE_RANDOM = new java.util.Random();
+    private static final AtomicLong graphWritesTotal = new AtomicLong(0L);
+
     // ---- real GC observation state (review 57) ----
     // Kimi and Qwen DISAGREED on whether summed GarbageCollectorMXBean.getCollectionTime()
     // is a valid "application stopped time" signal: Kimi said the beans are correct and
@@ -1047,20 +1072,115 @@ public class LeakAgent {
         churnDense = dense;
         churnTargetBytes = Math.max(0L, mb) * 1024L * 1024L;
         churnHoldMs = Math.max(250L, holdMs);
-        // Optional companion static retained leak -- reuses the existing worker/governor
-        // path exactly like an ALLOCATE would, so old gen is pre-filled.
-        if (staticMb >= 0) {
-            int reqMb = (int) staticMb;
-            ABORT_ALLOCATION.set(false);
-            if (reqMb != targetMb) {
-                governorCeilingMb = 0;
-                governorLastReleaseAt = 0;
-                governorStableLowSinceMs = 0;
-                govPrevStwSampledAt = 0;
-                currentState = "ALLOCATING";
-            }
-            targetMb = reqMb;
+        applyStaticCompanion(staticMb);
+    }
+
+    // Shared: drive the existing retained-leak worker/governor path (like an ALLOCATE)
+    // so old gen is pre-filled. staticMb < 0 => leave it alone.
+    private static void applyStaticCompanion(long staticMb) {
+        if (staticMb < 0) return;
+        int reqMb = (int) staticMb;
+        ABORT_ALLOCATION.set(false);
+        if (reqMb != targetMb) {
+            governorCeilingMb = 0;
+            governorLastReleaseAt = 0;
+            governorStableLowSinceMs = 0;
+            govPrevStwSampledAt = 0;
+            currentState = "ALLOCATING";
         }
+        targetMb = reqMb;
+    }
+
+    // ================= Thread: graph (dense, constantly-rewritten reference graph) ======
+    private static void graphLoop() {
+        long lastTick = System.currentTimeMillis();
+        while (true) {
+            try {
+                int slots = graphSlots;
+                if (slots <= 0) {
+                    if (graphBackbone != null) graphBackbone = null; // release -> GC reclaims
+                    Thread.sleep(100);
+                    lastTick = System.currentTimeMillis();
+                    continue;
+                }
+                int edg = Math.max(0, graphEdges);
+                Object[] bb = graphBackbone;
+                if (bb == null || bb.length != slots) {
+                    Object[] nb = new Object[slots];
+                    for (int i = 0; i < slots; i++) {
+                        try {
+                            nb[i] = new GraphNode(new int[GRAPH_NODE_PAD_INTS],
+                                edg > 0 ? new Object[edg] : CHURN_EMPTY_REFS);
+                        } catch (OutOfMemoryError oom) {
+                            lastError = "graph build OOM at slot " + i + "/" + slots;
+                            break;
+                        }
+                    }
+                    // wire initial edges once the array is populated
+                    if (edg > 0) {
+                        for (int i = 0; i < slots; i++) {
+                            GraphNode n = (GraphNode) nb[i];
+                            if (n == null) continue;
+                            for (int k = 0; k < edg; k++) n.edges[k] = nb[GRAPH_WRITE_RANDOM.nextInt(slots)];
+                        }
+                    }
+                    graphBackbone = nb;
+                    bb = nb;
+                }
+                long now = System.currentTimeMillis();
+                long dtMs = Math.max(1L, Math.min(200L, now - lastTick));
+                lastTick = now;
+                int writes = (int) Math.min(200000L, (long) graphWritesPerSec * dtMs / 1000L);
+                int len = bb.length;
+                for (int w = 0; w < writes; w++) {
+                    try {
+                        Object[] e;
+                        if (edg > 0) {
+                            e = new Object[edg];
+                            for (int k = 0; k < edg; k++) e[k] = bb[GRAPH_WRITE_RANDOM.nextInt(len)];
+                        } else {
+                            e = CHURN_EMPTY_REFS;
+                        }
+                        // the store below dirties this slot's card -> every young GC rescans it
+                        bb[GRAPH_WRITE_RANDOM.nextInt(len)] = new GraphNode(new int[GRAPH_NODE_PAD_INTS], e);
+                        graphWritesTotal.incrementAndGet();
+                    } catch (OutOfMemoryError oom) {
+                        lastError = "graph write OOM";
+                        break;
+                    }
+                }
+                Thread.sleep(10);
+            } catch (Throwable t) {
+                lastError = "graph: " + t;
+            }
+        }
+    }
+
+    private static void handleGraph(String line, long cmdMtime) {
+        String[] parts = line.split("\\s+");
+        if (parts.length < 4) return;
+        long slotsK;
+        long writesKPerSec;
+        long edges;
+        long ttlS = 60;
+        long staticMb = -1;
+        try {
+            slotsK = Long.parseLong(parts[1]);
+            writesKPerSec = Long.parseLong(parts[2]);
+            edges = Long.parseLong(parts[3]);
+            for (int i = 4; i < parts.length; i++) {
+                if (parts[i].startsWith("ttl=")) ttlS = Long.parseLong(parts[i].substring(4));
+                else if (parts[i].startsWith("static=")) staticMb = Long.parseLong(parts[i].substring(7));
+            }
+        } catch (NumberFormatException e) {
+            return;
+        }
+        cmdMtimeAtRead = cmdMtime;
+        cmdTtlS = ttlS;
+        graphEdges = (int) Math.max(0L, Math.min(1000L, edges));
+        graphWritesPerSec = (int) Math.max(0L, writesKPerSec) * 1000;
+        graphSlots = (int) Math.max(0L, Math.min(20_000_000L, slotsK * 1000L));
+        applyStaticCompanion(staticMb);
     }
 
     public static void premain(String agentArgs, Instrumentation inst) {
@@ -1099,6 +1219,9 @@ public class LeakAgent {
             startThread("wardence-leak-churn", new Runnable() {
                 public void run() { churnLoop(); }
             });
+            startThread("wardence-leak-graph", new Runnable() {
+                public void run() { graphLoop(); }
+            });
             if (SYNC_ENABLED) {
                 startThread("wardence-leak-reqsync", new Runnable() {
                     public void run() { requestSyncLoop(); }
@@ -1106,7 +1229,7 @@ public class LeakAgent {
             }
 
             System.err.println("[wardence-leak-agent] hardened agent loaded, "
-                + (SYNC_ENABLED ? 9 : 8) + " threads started"
+                + (SYNC_ENABLED ? 10 : 9) + " threads started"
                 + " (reqsync=" + (SYNC_ENABLED ? "on" : "off")
                 + ", governor=" + (GOVERNOR_PASSIVE ? "passive" : "active")
                 + ", native=" + (UNSAFE != null ? "available" : "UNAVAILABLE") + ")");
@@ -1164,7 +1287,7 @@ public class LeakAgent {
                     ioStuck.set(true);
                 } else if (!cmdExists) {
                     ioStuck.set(false);
-                    if ((allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0) && !"RELEASING".equals(currentState)) {
+                    if ((allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0 || graphSlots > 0) && !"RELEASING".equals(currentState)) {
                         requestRelease("no command file present");
                     }
                 } else {
@@ -1183,7 +1306,7 @@ public class LeakAgent {
                         } else {
                             String line = lines.isEmpty() ? "" : lines.get(0).trim();
                             if (line.isEmpty()) {
-                                if (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0) requestRelease("empty command file");
+                                if (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0 || graphSlots > 0) requestRelease("empty command file");
                             } else if (line.equalsIgnoreCase("RELEASE")) {
                                 requestRelease("RELEASE command");
                             } else if (line.toUpperCase().startsWith("ALLOCATE")) {
@@ -1196,6 +1319,8 @@ public class LeakAgent {
                                 handleCodeLeak(line, mtime);
                             } else if (line.toUpperCase().startsWith("CHURN")) {
                                 handleChurn(line, mtime);
+                            } else if (line.toUpperCase().startsWith("GRAPH")) {
+                                handleGraph(line, mtime);
                             }
                         }
                     }
@@ -1288,6 +1413,7 @@ public class LeakAgent {
         refLeakTarget = 0L;     // refleak mode is freed by refLeakLoop() converging to 0
         codeLeakTarget = 0L;    // codeleak mode is freed by codeLeakLoop() dropping its loaders
         churnTargetBytes = 0L;  // churn ring is drained by churnLoop() when target is 0
+        graphSlots = 0;         // graphLoop() nulls the backbone when slots is 0
         currentState = "RELEASING";
         lastError = reason;
     }
@@ -1468,7 +1594,7 @@ public class LeakAgent {
 
                 if (cmdMtimeAtRead > 0) {
                     long cmdAgeS = (now - cmdMtimeAtRead) / 1000;
-                    if (cmdAgeS > cmdTtlS && (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0)) {
+                    if (cmdAgeS > cmdTtlS && (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0 || graphSlots > 0)) {
                         forceRelease("watchdog: command TTL expired independently (age=" + cmdAgeS + "s)");
                     }
                 }
@@ -1599,6 +1725,7 @@ public class LeakAgent {
         refLeakTarget = 0L;     // refLeakLoop() drops its soft refs as it converges to 0
         codeLeakTarget = 0L;    // codeLeakLoop() drops its loaders as it converges to 0
         churnTargetBytes = 0L;  // churnLoop() drains its ring when target is 0
+        graphSlots = 0;         // graphLoop() nulls the backbone when slots is 0
         ABORT_ALLOCATION.set(true);
         currentState = "WATCHDOG_RELEASE";
         lastError = reason;
@@ -1856,6 +1983,9 @@ public class LeakAgent {
             sb.append("churn_hold_ms=").append(churnHoldMs).append('\n');
             sb.append("churn_linked=").append(churnLinked).append('\n');
             sb.append("churn_dense=").append(churnDense).append('\n');
+            sb.append("graph_slots=").append(graphSlots).append('\n');
+            sb.append("graph_edges=").append(graphEdges).append('\n');
+            sb.append("graph_writes=").append(graphWritesTotal.get()).append('\n');
             sb.append("churn_evictions=").append(churnEvictions.get()).append('\n');
             if (CODE_CACHE_POOL != null) {
                 try {
