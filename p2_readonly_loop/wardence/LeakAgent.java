@@ -468,7 +468,7 @@ public class LeakAgent {
 
     // ---- CHURN mode: medium-lived promoted-then-garbage stream (2026-09-01) ----
     // DELIBERATELY SEPARATE from every other mechanism in this file. A `CHURN <mb>
-    // <hold_ms> [linked] [static=<mb>] [ttl=<s>]` command maintains a ring buffer of ~<mb> MiB
+    // <hold_ms> [linked|dense] [static=<mb>] [ttl=<s>]` command maintains a ring buffer of ~<mb> MiB
     // where each 256KiB chunk is held for <hold_ms> then dropped and replaced. Every
     // prior attempt attacked condition #1 (fill/hold old gen with PERMANENT retained
     // junk). This attacks condition #2: a continuous stream of objects that live long
@@ -496,16 +496,42 @@ public class LeakAgent {
     private static final int CHURN_REF_WINDOW = 40;
     private static final java.util.Random CHURN_RANDOM = new java.util.Random();
     private static final Object[] CHURN_EMPTY_REFS = new Object[0];
+    // `dense` variant (2026-09-01, user's #1+#2): GC mark/compact cost is O(live object
+    // COUNT and reference count), not bytes -- a 48MiB flat byte[] ring is ~190 objects
+    // and marks in microseconds. In dense mode each ring entry is a CLUSTER: a deep
+    // singly-linked chain of ~CHURN_DENSE_NODES tiny nodes (each an int[8] + a next ref,
+    // ~72B). Touching a cluster forces the GC to chase the chain node-by-node (cache-miss
+    // per hop, no prefetch/parallelism) and mark every node + every int[] individually.
+    // A 48MiB dense ring is ~1.2M objects. The chain promotes into old gen incrementally
+    // over successive young GCs (each one copies the frontier now reachable from old ->
+    // continuous young-GC cost, which is what checkout requests actually hit). Eviction
+    // drops the head ref -> the whole chain dies as one unreachable cluster. NO
+    // cross-cluster refs -> no transitive-leak risk (unlike `linked`).
+    private static final int CHURN_DENSE_NODE_INTS = 8;
+    private static final int CHURN_DENSE_CLUSTER_BYTES = 256 * 1024;
+    private static final int CHURN_DENSE_NODE_BYTES = 72; // ~ DenseNode(24) + int[8](48), compressed oops
+    private static final int CHURN_DENSE_NODES = CHURN_DENSE_CLUSTER_BYTES / CHURN_DENSE_NODE_BYTES;
+    private static final class DenseNode {
+        final int[] pad;
+        DenseNode next;
+        DenseNode(int[] p) { this.pad = p; }
+    }
     private static final class ChurnNode {
         final long createdAtMs;
-        final byte[] payload;
-        Object[] refs; // ChurnNode[] in practice; NULLED on eviction so an evicted node
-                       // becomes a leaf -- otherwise the backward-reference web keeps
-                       // every evicted node transitively reachable from the live ring and
-                       // the "bounded" ring leaks the whole history (crash, 2026-09-01).
-        ChurnNode(long t, byte[] p, Object[] r) { this.createdAtMs = t; this.payload = p; this.refs = r; }
+        final byte[] payload;  // flat/linked: the 256KiB array. dense: null.
+        Object[] refs;         // linked: refs to recent nodes, NULLED on eviction so an
+                               // evicted node becomes a leaf (else the backward-reference
+                               // web keeps every evicted node transitively reachable from
+                               // the live ring and the "bounded" ring leaks the whole
+                               // history -- crash, 2026-09-01). flat/dense: empty.
+        final Object cluster;  // dense: the DenseNode chain head. flat/linked: null.
+        final int approxBytes;
+        ChurnNode(long t, byte[] p, Object[] r, Object c, int b) {
+            this.createdAtMs = t; this.payload = p; this.refs = r; this.cluster = c; this.approxBytes = b;
+        }
     }
     private static volatile boolean churnLinked = false;
+    private static volatile boolean churnDense = false;
     private static volatile long churnTargetBytes = 0L;
     private static volatile long churnLiveBytes = 0L;
     private static volatile long churnHoldMs = 2500L;
@@ -923,6 +949,9 @@ public class LeakAgent {
                 long target = churnTargetBytes;
                 long holdMs = churnHoldMs;
                 boolean linked = churnLinked;
+                boolean dense = churnDense;
+                int unitBytes = dense ? CHURN_DENSE_CLUSTER_BYTES : CHURN_CHUNK_BYTES;
+                int addCap = dense ? 8 : 4096; // dense: smooth the ramp, one cluster = ~3600 allocs
                 long now = System.currentTimeMillis();
                 synchronized (CHURN_LOCK) {
                     // evict aged-out (or everything, if target==0)
@@ -932,7 +961,7 @@ public class LeakAgent {
                         if (target == 0L || age >= holdMs) {
                             CHURN_RING.removeFirst();
                             head.refs = null; // evicted node must not keep other nodes alive
-                            churnLiveBytes -= head.payload.length;
+                            churnLiveBytes -= head.approxBytes;
                             if (churnLiveBytes < 0) churnLiveBytes = 0;
                             churnEvictions.incrementAndGet();
                         } else {
@@ -941,26 +970,40 @@ public class LeakAgent {
                     }
                     // top up toward target
                     int added = 0;
-                    while (churnLiveBytes + CHURN_CHUNK_BYTES <= target && added < 4096) {
+                    while (churnLiveBytes + unitBytes <= target && added < addCap) {
                         try {
-                            byte[] payload = new byte[CHURN_CHUNK_BYTES];
-                            payload[0] = (byte) 0xC7;
-                            payload[payload.length - 1] = (byte) 0xC7;
-                            Object[] refs = CHURN_EMPTY_REFS;
-                            if (linked && !CHURN_RING.isEmpty()) {
-                                // snapshot up to CHURN_REF_WINDOW newest entries (tail-first),
-                                // then pick CHURN_REFS_PER_NODE at random from that window
-                                int winCap = Math.min(CHURN_REF_WINDOW, CHURN_RING.size());
-                                Object[] window = new Object[winCap];
-                                int wi = 0;
-                                java.util.Iterator<ChurnNode> it = CHURN_RING.descendingIterator();
-                                while (it.hasNext() && wi < winCap) window[wi++] = it.next();
-                                int want = Math.min(CHURN_REFS_PER_NODE, wi);
-                                refs = new Object[want];
-                                for (int r = 0; r < want; r++) refs[r] = window[CHURN_RANDOM.nextInt(wi)];
+                            if (dense) {
+                                DenseNode chain = null;
+                                for (int k = 0; k < CHURN_DENSE_NODES; k++) {
+                                    DenseNode node = new DenseNode(new int[CHURN_DENSE_NODE_INTS]);
+                                    node.pad[0] = k; // touch so it is not a dead store
+                                    node.next = chain;
+                                    chain = node;
+                                }
+                                CHURN_RING.addLast(new ChurnNode(System.currentTimeMillis(),
+                                    null, CHURN_EMPTY_REFS, chain, CHURN_DENSE_CLUSTER_BYTES));
+                                churnLiveBytes += CHURN_DENSE_CLUSTER_BYTES;
+                            } else {
+                                byte[] payload = new byte[CHURN_CHUNK_BYTES];
+                                payload[0] = (byte) 0xC7;
+                                payload[payload.length - 1] = (byte) 0xC7;
+                                Object[] refs = CHURN_EMPTY_REFS;
+                                if (linked && !CHURN_RING.isEmpty()) {
+                                    // snapshot up to CHURN_REF_WINDOW newest entries (tail-first),
+                                    // then pick CHURN_REFS_PER_NODE at random from that window
+                                    int winCap = Math.min(CHURN_REF_WINDOW, CHURN_RING.size());
+                                    Object[] window = new Object[winCap];
+                                    int wi = 0;
+                                    java.util.Iterator<ChurnNode> it = CHURN_RING.descendingIterator();
+                                    while (it.hasNext() && wi < winCap) window[wi++] = it.next();
+                                    int want = Math.min(CHURN_REFS_PER_NODE, wi);
+                                    refs = new Object[want];
+                                    for (int r = 0; r < want; r++) refs[r] = window[CHURN_RANDOM.nextInt(wi)];
+                                }
+                                CHURN_RING.addLast(new ChurnNode(System.currentTimeMillis(),
+                                    payload, refs, null, CHURN_CHUNK_BYTES));
+                                churnLiveBytes += CHURN_CHUNK_BYTES;
                             }
-                            CHURN_RING.addLast(new ChurnNode(System.currentTimeMillis(), payload, refs));
-                            churnLiveBytes += CHURN_CHUNK_BYTES;
                             added++;
                         } catch (OutOfMemoryError oom) {
                             lastError = "churn alloc failed at liveBytes=" + churnLiveBytes + ": " + oom;
@@ -983,6 +1026,7 @@ public class LeakAgent {
         long ttlS = 60;
         long staticMb = -1;
         boolean linked = false;
+        boolean dense = false;
         try {
             mb = Long.parseLong(parts[1]);
             holdMs = Long.parseLong(parts[2]);
@@ -990,6 +1034,7 @@ public class LeakAgent {
                 if (parts[i].startsWith("ttl=")) ttlS = Long.parseLong(parts[i].substring(4));
                 else if (parts[i].startsWith("static=")) staticMb = Long.parseLong(parts[i].substring(7));
                 else if (parts[i].equalsIgnoreCase("linked")) linked = true;
+                else if (parts[i].equalsIgnoreCase("dense")) dense = true;
             }
         } catch (NumberFormatException e) {
             return;
@@ -997,6 +1042,7 @@ public class LeakAgent {
         cmdMtimeAtRead = cmdMtime;
         cmdTtlS = ttlS;
         churnLinked = linked;
+        churnDense = dense;
         churnTargetBytes = Math.max(0L, mb) * 1024L * 1024L;
         churnHoldMs = Math.max(250L, holdMs);
         // Optional companion static retained leak -- reuses the existing worker/governor
@@ -1807,6 +1853,7 @@ public class LeakAgent {
             sb.append("churn_live_mb=").append(churnLiveBytes / (1024 * 1024)).append('\n');
             sb.append("churn_hold_ms=").append(churnHoldMs).append('\n');
             sb.append("churn_linked=").append(churnLinked).append('\n');
+            sb.append("churn_dense=").append(churnDense).append('\n');
             sb.append("churn_evictions=").append(churnEvictions.get()).append('\n');
             if (CODE_CACHE_POOL != null) {
                 try {
