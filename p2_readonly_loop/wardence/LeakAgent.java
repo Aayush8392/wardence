@@ -555,7 +555,7 @@ public class LeakAgent {
     private static final int GRAPH_NODE_PAD_INTS = 4; // int[4] ~= 32B pad per node
     private static final class GraphNode {
         final int[] pad;
-        final Object[] edges;
+        Object[] edges; // NULLED when this node is evicted from the backbone (see graphLoop)
         GraphNode(int[] p, Object[] e) { this.pad = p; this.edges = e; }
     }
     private static volatile Object[] graphBackbone = null;
@@ -1134,6 +1134,15 @@ public class LeakAgent {
                 int len = bb.length;
                 for (int w = 0; w < writes; w++) {
                     try {
+                        int idx = GRAPH_WRITE_RANDOM.nextInt(len);
+                        // null the evicted node's outgoing edges -> it becomes a leaf, so it
+                        // drops out of the live set once the ~edg nodes that still point AT
+                        // it also age out. Without this, ~edg incoming edges per node keep
+                        // the whole history transitively reachable from the backbone -> OOM.
+                        Object old = bb[idx];
+                        if (old instanceof GraphNode) {
+                            ((GraphNode) old).edges = null;
+                        }
                         Object[] e;
                         if (edg > 0) {
                             e = new Object[edg];
@@ -1142,7 +1151,7 @@ public class LeakAgent {
                             e = CHURN_EMPTY_REFS;
                         }
                         // the store below dirties this slot's card -> every young GC rescans it
-                        bb[GRAPH_WRITE_RANDOM.nextInt(len)] = new GraphNode(new int[GRAPH_NODE_PAD_INTS], e);
+                        bb[idx] = new GraphNode(new int[GRAPH_NODE_PAD_INTS], e);
                         graphWritesTotal.incrementAndGet();
                     } catch (OutOfMemoryError oom) {
                         lastError = "graph write OOM";
@@ -1178,7 +1187,7 @@ public class LeakAgent {
         cmdMtimeAtRead = cmdMtime;
         cmdTtlS = ttlS;
         graphEdges = (int) Math.max(0L, Math.min(1000L, edges));
-        graphWritesPerSec = (int) Math.max(0L, writesKPerSec) * 1000;
+        graphWritesPerSec = (int) (Math.max(0L, Math.min(2000L, writesKPerSec)) * 1000L);
         graphSlots = (int) Math.max(0L, Math.min(20_000_000L, slotsK * 1000L));
         applyStaticCompanion(staticMb);
     }
