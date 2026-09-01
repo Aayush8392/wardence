@@ -393,6 +393,79 @@ public class LeakAgent {
     private static volatile int lastFailedTargetMb = -1;
     private static final AtomicBoolean ABORT_ALLOCATION = new AtomicBoolean(false);
 
+    // ---- native (off-heap) memory-pressure mode (2026-08-30) ----
+    // DELIBERATELY SEPARATE from the heap leak above and from every GC/governor
+    // mechanism in this file. A `NATIVE <mb> [ttl=<s>]` control command drives real,
+    // resident, off-heap memory via sun.misc.Unsafe.allocateMemory -- this grows the
+    // CONTAINER's RSS toward its cgroup memory limit WITHOUT touching the Java heap, so
+    // the garbage collector is not involved at all. Purpose: test whether cgroup memory
+    // pressure (kernel reclaiming the JVM's own file-backed code pages -> major page
+    // faults -> request stutter) produces a felt storefront slowdown where a retained
+    // heap leak provably cannot (reviews 67-69 + the paced-climb test, 2026-08-30).
+    // `NATIVE 0` or `RELEASE` frees all of it. Every chunk is written page-by-page on
+    // allocation so it is genuinely resident, not just reserved address space.
+    // Byte-identical no-op for every existing ALLOCATE/heap-leak episode: nativeTargetBytes
+    // starts 0 and nativeLoop() does nothing until a NATIVE command arrives.
+    private static final long NATIVE_CHUNK_BYTES = 4L * 1024 * 1024; // 4 MiB
+    private static volatile long nativeTargetBytes = 0L;
+    private static final java.util.List<Long> NATIVE_CHUNKS = new java.util.ArrayList<Long>();
+    private static final Object NATIVE_LOCK = new Object();
+    private static volatile long nativeAllocatedBytes = 0L;
+    private static volatile boolean nativeAllocFailed = false;
+    // Resolved reflectively (no direct sun.misc.Unsafe type reference -> compiles clean
+    // on every JDK8 build, including ones whose javac symbol file hides sun.* classes).
+    private static Object UNSAFE = null;
+    private static java.lang.reflect.Method U_ALLOC = null; // allocateMemory(long) -> long
+    private static java.lang.reflect.Method U_FREE = null;  // freeMemory(long)
+    private static java.lang.reflect.Method U_SET = null;   // setMemory(long,long,byte)
+
+    // ---- Reference-processing-inflation mode (2026-08-30, Gemini idea #1) ----
+    // DELIBERATELY SEPARATE from every other mechanism in this file. A `REFLEAK <count>
+    // [ttl=<s>]` command retains <count> java.lang.ref.SoftReference wrappers, each
+    // holding a tiny referent that is otherwise unreachable. Purpose: test whether a
+    // real SoftReference-cache leak inflates the GC's mandatory Reference-Processing
+    // phase (O(N) in discovered refs) enough to add felt STW latency to checkout, where
+    // an inert retained byte[] leak provably cannot (every prior test 2026-08-2x..30).
+    // Both the wrappers (~40B) and the live-because-not-yet-cleared referents (~24B)
+    // grow the heap, so the heap_rise_kb diagnosis signal survives; fault identity stays
+    // "memory leak". `REFLEAK 0` / `RELEASE` drops them. Byte-identical no-op until a
+    // REFLEAK command arrives (refLeakTarget starts 0).
+    private static final int REFLEAK_REFERENT_BYTES = 16;
+    private static final int REFLEAK_BATCH = 4000; // per ~100ms convergence tick
+    private static volatile long refLeakTarget = 0L;
+    private static volatile long refLeakCount = 0L;
+    private static final java.util.ArrayList<java.lang.ref.SoftReference<byte[]>> REFLEAK_LIST =
+        new java.util.ArrayList<java.lang.ref.SoftReference<byte[]>>();
+    private static final Object REFLEAK_LOCK = new Object();
+
+    // ---- JIT CodeCache-exhaustion mode (2026-08-30, Gemini idea #3) ----
+    // DELIBERATELY SEPARATE from every other mechanism. A `CODELEAK <count> [ttl=<s>]`
+    // command generates <count> distinct trivial classes (hand-built bytecode, no
+    // library) each held alive via its own ClassLoader, and warms each one's method so
+    // the JIT compiles it into the non-heap CodeCache. Purpose: test whether filling
+    // CodeCache (compiler shuts down -> hot app paths fall back to INTERPRETED execution,
+    // ~10x slower, no GC involvement, no crash) produces a felt, stable checkout
+    // slowdown where every heap/GC mechanism provably cannot. This is the canonical
+    // real-world Java "memory leak" (ClassLoader / dynamic-proxy / bytecode leak).
+    // Diagnosis signal shifts to jvm nonheap "Code Cache" usage (a real mechanism
+    // change -> continuity note). `CODELEAK 0` / `RELEASE` drops the loaders; the
+    // CodeCache sweeper then reclaims the flushed methods and the compiler re-enables.
+    // Needs a shrunk -XX:ReservedCodeCacheSize on the JVM to fill in a demo window.
+    // Byte-identical no-op until a CODELEAK command arrives (codeLeakTarget starts 0).
+    private static final int CODELEAK_HOT_INVOCATIONS = 2500; // enough to force C1 compilation
+    private static final int CODELEAK_BATCH = 20;             // classes generated+warmed per ~100ms tick
+    private static volatile long codeLeakTarget = 0L;
+    private static volatile long codeLeakCount = 0L;
+    private static volatile boolean codeLeakFailed = false;
+    private static final java.util.ArrayList<Object[]> CODELEAK_HOLD = new java.util.ArrayList<Object[]>();
+    private static final Object CODELEAK_LOCK = new Object();
+    private static java.lang.management.MemoryPoolMXBean CODE_CACHE_POOL = null;
+
+    private static final class GenCL extends ClassLoader {
+        GenCL() { super(GenCL.class.getClassLoader()); }
+        Class<?> define(String binName, byte[] b) { return defineClass(binName, b, 0, b.length); }
+    }
+
     // ---- real GC observation state (review 57) ----
     // Kimi and Qwen DISAGREED on whether summed GarbageCollectorMXBean.getCollectionTime()
     // is a valid "application stopped time" signal: Kimi said the beans are correct and
@@ -512,6 +585,281 @@ public class LeakAgent {
         }
     }
 
+    // Resolve sun.misc.Unsafe once, reflectively (no static import to keep the compile
+    // clean on any JDK8 build). Fully non-fatal: if it can't be resolved, UNSAFE stays
+    // null, nativeLoop() becomes a no-op, and native_alloc_failed reports it -- the heap
+    // leak and everything else is untouched.
+    private static void initUnsafe() {
+        try {
+            Class<?> uc = Class.forName("sun.misc.Unsafe");
+            java.lang.reflect.Field f = uc.getDeclaredField("theUnsafe");
+            f.setAccessible(true);
+            UNSAFE = f.get(null);
+            U_ALLOC = uc.getMethod("allocateMemory", long.class);
+            U_FREE = uc.getMethod("freeMemory", long.class);
+            U_SET = uc.getMethod("setMemory", long.class, long.class, byte.class);
+            System.err.println("[wardence-leak-agent] sun.misc.Unsafe resolved via reflection -- native-memory mode available");
+        } catch (Throwable t) {
+            UNSAFE = null; U_ALLOC = null; U_FREE = null; U_SET = null;
+            System.err.println("[wardence-leak-agent] sun.misc.Unsafe unavailable (non-fatal, NATIVE command "
+                + "will be a no-op): " + t);
+        }
+    }
+
+    // ================= Thread: native (off-heap) memory pressure =================
+    // Converges real resident off-heap memory toward nativeTargetBytes, in
+    // NATIVE_CHUNK_BYTES steps, every ~200ms. Grows via Unsafe.allocateMemory +
+    // setMemory (page-touch so the kernel backs it with real pages, i.e. it shows up in
+    // container RSS immediately). Shrinks via freeMemory. All list mutation under
+    // NATIVE_LOCK. A native allocation failure (native OOM) sets a flag and stops
+    // growing rather than throwing -- freeing any chunk clears the flag so it can retry.
+    private static void nativeLoop() {
+        while (true) {
+            try {
+                long target = nativeTargetBytes;
+                boolean ready = (UNSAFE != null && U_ALLOC != null && U_FREE != null && U_SET != null);
+                synchronized (NATIVE_LOCK) {
+                    while (ready && !nativeAllocFailed
+                            && nativeAllocatedBytes + NATIVE_CHUNK_BYTES <= target) {
+                        try {
+                            long addr = (Long) U_ALLOC.invoke(UNSAFE, NATIVE_CHUNK_BYTES);
+                            U_SET.invoke(UNSAFE, addr, NATIVE_CHUNK_BYTES, (byte) 0);
+                            NATIVE_CHUNKS.add(addr);
+                            nativeAllocatedBytes += NATIVE_CHUNK_BYTES;
+                        } catch (Throwable oom) {
+                            nativeAllocFailed = true;
+                            lastError = "native alloc failed at "
+                                + (nativeAllocatedBytes / (1024 * 1024)) + "MiB: " + oom;
+                            break;
+                        }
+                    }
+                    while (ready && !NATIVE_CHUNKS.isEmpty()
+                            && nativeAllocatedBytes - NATIVE_CHUNK_BYTES >= target) {
+                        long addr = NATIVE_CHUNKS.remove(NATIVE_CHUNKS.size() - 1);
+                        try { U_FREE.invoke(UNSAFE, addr); } catch (Throwable ignored) {}
+                        nativeAllocatedBytes -= NATIVE_CHUNK_BYTES;
+                        nativeAllocFailed = false;
+                    }
+                }
+                Thread.sleep(200);
+            } catch (Throwable t) {
+                lastError = "native: " + t;
+            }
+        }
+    }
+
+    private static void handleNative(String line, long cmdMtime) {
+        String[] parts = line.split("\\s+");
+        if (parts.length < 2) return;
+        long mb;
+        long ttlS = 60;
+        try {
+            mb = Long.parseLong(parts[1]);
+            for (int i = 2; i < parts.length; i++) {
+                if (parts[i].startsWith("ttl=")) ttlS = Long.parseLong(parts[i].substring(4));
+            }
+        } catch (NumberFormatException e) {
+            return;
+        }
+        cmdMtimeAtRead = cmdMtime;
+        cmdTtlS = ttlS;
+        nativeTargetBytes = Math.max(0L, mb) * 1024L * 1024L;
+    }
+
+    // ================= Thread: reference-processing-inflation leak =================
+    // Converges REFLEAK_LIST size toward refLeakTarget in REFLEAK_BATCH steps every
+    // ~100ms. Each entry is a SoftReference wrapping a fresh 16-byte referent held ONLY
+    // by that soft ref -> the GC must "discover" and policy-evaluate it every marking
+    // cycle (the O(N) Reference-Processing cost being tested). Under real memory
+    // pressure G1 will clear them all at once (ref.get() -> null); the wrappers stay,
+    // the referents are reclaimed -- that oscillation is itself a real datapoint, not a
+    // bug. Never throws OOM up: an allocation failure just stops growth for this tick.
+    private static void refLeakLoop() {
+        while (true) {
+            try {
+                long target = refLeakTarget;
+                synchronized (REFLEAK_LOCK) {
+                    int added = 0;
+                    while (refLeakCount < target && added < REFLEAK_BATCH) {
+                        try {
+                            REFLEAK_LIST.add(new java.lang.ref.SoftReference<byte[]>(new byte[REFLEAK_REFERENT_BYTES]));
+                            refLeakCount++;
+                            added++;
+                        } catch (OutOfMemoryError oom) {
+                            lastError = "refleak alloc failed at count=" + refLeakCount + ": " + oom;
+                            break;
+                        }
+                    }
+                    int removed = 0;
+                    while (refLeakCount > target && !REFLEAK_LIST.isEmpty() && removed < REFLEAK_BATCH) {
+                        REFLEAK_LIST.remove(REFLEAK_LIST.size() - 1);
+                        refLeakCount--;
+                        removed++;
+                    }
+                    if (target == 0 && REFLEAK_LIST.isEmpty()) {
+                        REFLEAK_LIST.trimToSize(); // hand the backing array back after a full release
+                    }
+                }
+                Thread.sleep(100);
+            } catch (Throwable t) {
+                lastError = "refleak: " + t;
+            }
+        }
+    }
+
+    private static void handleRefLeak(String line, long cmdMtime) {
+        String[] parts = line.split("\\s+");
+        if (parts.length < 2) return;
+        long count;
+        long ttlS = 60;
+        try {
+            count = Long.parseLong(parts[1]);
+            for (int i = 2; i < parts.length; i++) {
+                if (parts[i].startsWith("ttl=")) ttlS = Long.parseLong(parts[i].substring(4));
+            }
+        } catch (NumberFormatException e) {
+            return;
+        }
+        cmdMtimeAtRead = cmdMtime;
+        cmdTtlS = ttlS;
+        refLeakTarget = Math.max(0L, count);
+    }
+
+    // ================= Thread: CodeCache-exhaustion leak =================
+    private static void initCodeCachePool() {
+        try {
+            for (java.lang.management.MemoryPoolMXBean p : ManagementFactory.getMemoryPoolMXBeans()) {
+                String n = p.getName();
+                if (n != null && n.toLowerCase().contains("code")) { CODE_CACHE_POOL = p; break; }
+            }
+        } catch (Throwable ignored) { CODE_CACHE_POOL = null; }
+    }
+
+    // Minimal Java-8 (major 52) class file for:  public final class <name> { public
+    // static int f(int x){ return x*31 + x*7 - (x>>1) ^ x; } }  -- straight-line, no
+    // branches, so no StackMapTable needed. 7-entry constant pool.
+    private static byte[] genClassBytes(String internalName) {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        try {
+            java.io.DataOutputStream d = new java.io.DataOutputStream(bos);
+            d.writeInt(0xCAFEBABE);
+            d.writeShort(0);   // minor
+            d.writeShort(50);  // major = Java 6 -- deliberately <=50 so the OLD (inference,
+                               // no-StackMapTable) verifier is used; a hand-built straight-
+                               // line method verifies with zero stackmap hassle. Java 8
+                               // loads v50 classes fine.
+            d.writeShort(8);   // constant_pool_count = 7 entries + 1
+            d.writeByte(7); d.writeShort(2);                 // #1 Class -> #2
+            d.writeByte(1); d.writeUTF(internalName);        // #2 Utf8 this-class name
+            d.writeByte(7); d.writeShort(4);                 // #3 Class -> #4
+            d.writeByte(1); d.writeUTF("java/lang/Object");  // #4 Utf8 super
+            d.writeByte(1); d.writeUTF("f");                 // #5 Utf8 method name
+            d.writeByte(1); d.writeUTF("(I)I");              // #6 Utf8 descriptor
+            d.writeByte(1); d.writeUTF("Code");              // #7 Utf8 "Code"
+            d.writeShort(0x0031); // ACC_PUBLIC | ACC_FINAL | ACC_SUPER
+            d.writeShort(1);      // this_class -> #1
+            d.writeShort(3);      // super_class -> #3
+            d.writeShort(0);      // interfaces
+            d.writeShort(0);      // fields
+            d.writeShort(1);      // methods
+            d.writeShort(0x0009); // ACC_PUBLIC | ACC_STATIC
+            d.writeShort(5);      // name -> #5
+            d.writeShort(6);      // descriptor -> #6
+            d.writeShort(1);      // method attributes
+            d.writeShort(7);      // attribute name -> #7 "Code"
+            byte[] code = new byte[] {
+                0x1a,             // iload_0
+                0x10, 0x1f,       // bipush 31
+                0x68,             // imul           -> x*31
+                0x1a,             // iload_0
+                0x10, 0x07,       // bipush 7
+                0x68,             // imul           -> x*7
+                0x60,             // iadd           -> x*31 + x*7
+                0x1a,             // iload_0
+                0x04,             // iconst_1
+                0x7a,             // ishr           -> x>>1
+                0x64,             // isub           -> (...) - (x>>1)
+                0x1a,             // iload_0
+                (byte) 0x82,      // ixor           -> (...) ^ x
+                (byte) 0xac       // ireturn
+            };
+            d.writeInt(2 + 2 + 4 + code.length + 2 + 2); // Code attribute length
+            d.writeShort(3);      // max_stack
+            d.writeShort(1);      // max_locals
+            d.writeInt(code.length);
+            d.write(code);
+            d.writeShort(0);      // exception_table_length
+            d.writeShort(0);      // code attributes_count
+            d.writeShort(0);      // CLASS-level attributes_count (was missing -> "Truncated class file")
+            d.flush();
+        } catch (java.io.IOException e) {
+            return null;
+        }
+        return bos.toByteArray();
+    }
+
+    private static void codeLeakLoop() {
+        while (true) {
+            try {
+                long target = codeLeakTarget;
+                if (codeLeakCount < target && !codeLeakFailed) {
+                    int made = 0;
+                    while (codeLeakCount < target && made < CODELEAK_BATCH) {
+                        try {
+                            String simple = "W" + codeLeakCount;
+                            byte[] b = genClassBytes("wardence/gen/" + simple);
+                            if (b == null) { codeLeakFailed = true; lastError = "codeleak: genClassBytes null"; break; }
+                            GenCL cl = new GenCL();
+                            Class<?> c = cl.define("wardence.gen." + simple, b);
+                            java.lang.reflect.Method m = c.getMethod("f", int.class);
+                            int acc = 0;
+                            for (int i = 0; i < CODELEAK_HOT_INVOCATIONS; i++) {
+                                acc += ((Integer) m.invoke(null, Integer.valueOf(i))).intValue();
+                            }
+                            synchronized (CODELEAK_LOCK) {
+                                CODELEAK_HOLD.add(new Object[] { cl, c, m, Integer.valueOf(acc) });
+                            }
+                            codeLeakCount++;
+                            made++;
+                        } catch (Throwable t) {
+                            codeLeakFailed = true;
+                            lastError = "codeleak failed at count=" + codeLeakCount + ": " + t;
+                            System.err.println("[wardence-leak-agent] " + lastError);
+                            t.printStackTrace();
+                            break;
+                        }
+                    }
+                } else if (target == 0 && codeLeakCount > 0) {
+                    synchronized (CODELEAK_LOCK) { CODELEAK_HOLD.clear(); }
+                    codeLeakCount = 0;
+                    codeLeakFailed = false;
+                    System.gc(); // nudge classloader unloading -> CodeCache sweep -> compiler re-enables
+                }
+                Thread.sleep(100);
+            } catch (Throwable t) {
+                lastError = "codeleak: " + t;
+            }
+        }
+    }
+
+    private static void handleCodeLeak(String line, long cmdMtime) {
+        String[] parts = line.split("\\s+");
+        if (parts.length < 2) return;
+        long count;
+        long ttlS = 60;
+        try {
+            count = Long.parseLong(parts[1]);
+            for (int i = 2; i < parts.length; i++) {
+                if (parts[i].startsWith("ttl=")) ttlS = Long.parseLong(parts[i].substring(4));
+            }
+        } catch (NumberFormatException e) {
+            return;
+        }
+        cmdMtimeAtRead = cmdMtime;
+        cmdTtlS = ttlS;
+        codeLeakTarget = Math.max(0L, count);
+    }
+
     public static void premain(String agentArgs, Instrumentation inst) {
         try {
             if (CMD_FILE.exists()) {
@@ -519,6 +867,8 @@ public class LeakAgent {
             }
             if (!CTL_DIR.exists()) CTL_DIR.mkdirs();
             registerGcListener();
+            initUnsafe();
+            initCodeCachePool();
             writeStatusBounded("agent started");
             writeBeat();
 
@@ -534,6 +884,15 @@ public class LeakAgent {
             startThread("wardence-leak-watchdog", new Runnable() {
                 public void run() { watchdogLoop(); }
             });
+            startThread("wardence-leak-native", new Runnable() {
+                public void run() { nativeLoop(); }
+            });
+            startThread("wardence-leak-refleak", new Runnable() {
+                public void run() { refLeakLoop(); }
+            });
+            startThread("wardence-leak-codeleak", new Runnable() {
+                public void run() { codeLeakLoop(); }
+            });
             if (SYNC_ENABLED) {
                 startThread("wardence-leak-reqsync", new Runnable() {
                     public void run() { requestSyncLoop(); }
@@ -541,9 +900,10 @@ public class LeakAgent {
             }
 
             System.err.println("[wardence-leak-agent] hardened agent loaded, "
-                + (SYNC_ENABLED ? 5 : 4) + " threads started"
+                + (SYNC_ENABLED ? 8 : 7) + " threads started"
                 + " (reqsync=" + (SYNC_ENABLED ? "on" : "off")
-                + ", governor=" + (GOVERNOR_PASSIVE ? "passive" : "active") + ")");
+                + ", governor=" + (GOVERNOR_PASSIVE ? "passive" : "active")
+                + ", native=" + (UNSAFE != null ? "available" : "UNAVAILABLE") + ")");
         } catch (Throwable t) {
             // Never let the agent break the real app's boot.
             System.err.println("[wardence-leak-agent] premain failed (non-fatal): " + t);
@@ -598,7 +958,7 @@ public class LeakAgent {
                     ioStuck.set(true);
                 } else if (!cmdExists) {
                     ioStuck.set(false);
-                    if (allocatedBytes > 0 && !"RELEASING".equals(currentState)) {
+                    if ((allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0) && !"RELEASING".equals(currentState)) {
                         requestRelease("no command file present");
                     }
                 } else {
@@ -617,11 +977,17 @@ public class LeakAgent {
                         } else {
                             String line = lines.isEmpty() ? "" : lines.get(0).trim();
                             if (line.isEmpty()) {
-                                if (allocatedBytes > 0) requestRelease("empty command file");
+                                if (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0) requestRelease("empty command file");
                             } else if (line.equalsIgnoreCase("RELEASE")) {
                                 requestRelease("RELEASE command");
                             } else if (line.toUpperCase().startsWith("ALLOCATE")) {
                                 handleAllocate(line, mtime);
+                            } else if (line.toUpperCase().startsWith("NATIVE")) {
+                                handleNative(line, mtime);
+                            } else if (line.toUpperCase().startsWith("REFLEAK")) {
+                                handleRefLeak(line, mtime);
+                            } else if (line.toUpperCase().startsWith("CODELEAK")) {
+                                handleCodeLeak(line, mtime);
                             }
                         }
                     }
@@ -710,6 +1076,9 @@ public class LeakAgent {
     private static void requestRelease(String reason) {
         ABORT_ALLOCATION.set(true);
         targetMb = 0;
+        nativeTargetBytes = 0L; // native-memory mode is freed by nativeLoop() converging to 0
+        refLeakTarget = 0L;     // refleak mode is freed by refLeakLoop() converging to 0
+        codeLeakTarget = 0L;    // codeleak mode is freed by codeLeakLoop() dropping its loaders
         currentState = "RELEASING";
         lastError = reason;
     }
@@ -890,7 +1259,7 @@ public class LeakAgent {
 
                 if (cmdMtimeAtRead > 0) {
                     long cmdAgeS = (now - cmdMtimeAtRead) / 1000;
-                    if (cmdAgeS > cmdTtlS && allocatedBytes > 0) {
+                    if (cmdAgeS > cmdTtlS && (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0)) {
                         forceRelease("watchdog: command TTL expired independently (age=" + cmdAgeS + "s)");
                     }
                 }
@@ -1017,6 +1386,9 @@ public class LeakAgent {
         }
         allocatedBytes = 0;
         targetMb = 0;
+        nativeTargetBytes = 0L; // nativeLoop() frees its chunks as it converges to 0
+        refLeakTarget = 0L;     // refLeakLoop() drops its soft refs as it converges to 0
+        codeLeakTarget = 0L;    // codeLeakLoop() drops its loaders as it converges to 0
         ABORT_ALLOCATION.set(true);
         currentState = "WATCHDOG_RELEASE";
         lastError = reason;
@@ -1261,6 +1633,27 @@ public class LeakAgent {
             sb.append("governor_mode=").append(GOVERNOR_PASSIVE ? "passive" : "active").append('\n');
             sb.append("governor_abs_ceiling_mib=").append(GOVERNOR_ABS_HEAP_CEILING_MIB).append('\n');
             sb.append("reqsync_enabled=").append(SYNC_ENABLED).append('\n');
+            sb.append("native_mb=").append(nativeAllocatedBytes / (1024 * 1024)).append('\n');
+            sb.append("native_target_mb=").append(nativeTargetBytes / (1024 * 1024)).append('\n');
+            sb.append("native_alloc_failed=").append(nativeAllocFailed).append('\n');
+            sb.append("refleak_count=").append(refLeakCount).append('\n');
+            sb.append("refleak_target=").append(refLeakTarget).append('\n');
+            sb.append("codeleak_count=").append(codeLeakCount).append('\n');
+            sb.append("codeleak_target=").append(codeLeakTarget).append('\n');
+            sb.append("codeleak_failed=").append(codeLeakFailed).append('\n');
+            if (CODE_CACHE_POOL != null) {
+                try {
+                    java.lang.management.MemoryUsage cu = CODE_CACHE_POOL.getUsage();
+                    long used = cu.getUsed(), max = cu.getMax();
+                    sb.append("codecache_used_mib=").append(used / (1024 * 1024)).append('\n');
+                    sb.append("codecache_max_mib=").append(max > 0 ? (max / (1024 * 1024)) : -1).append('\n');
+                    sb.append("codecache_pct=").append(max > 0 ? (used * 100 / max) : -1).append('\n');
+                } catch (Throwable ignored) {
+                    sb.append("codecache_used_mib=-1\ncodecache_max_mib=-1\ncodecache_pct=-1\n");
+                }
+            } else {
+                sb.append("codecache_used_mib=-1\ncodecache_max_mib=-1\ncodecache_pct=-1\n");
+            }
             sb.append("heartbeat_age_ms=").append(now - heartbeatAt.get()).append('\n');
             sb.append("control_age_ms=").append(now - controlLastRunAt.get()).append('\n');
             sb.append("worker_progress_age_ms=").append(now - workerLastProgressAt.get()).append('\n');
