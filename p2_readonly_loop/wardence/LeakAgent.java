@@ -499,7 +499,10 @@ public class LeakAgent {
     private static final class ChurnNode {
         final long createdAtMs;
         final byte[] payload;
-        final Object[] refs; // ChurnNode[] in practice; Object[] to sidestep a self-generic
+        Object[] refs; // ChurnNode[] in practice; NULLED on eviction so an evicted node
+                       // becomes a leaf -- otherwise the backward-reference web keeps
+                       // every evicted node transitively reachable from the live ring and
+                       // the "bounded" ring leaks the whole history (crash, 2026-09-01).
         ChurnNode(long t, byte[] p, Object[] r) { this.createdAtMs = t; this.payload = p; this.refs = r; }
     }
     private static volatile boolean churnLinked = false;
@@ -928,6 +931,7 @@ public class LeakAgent {
                         long age = now - head.createdAtMs;
                         if (target == 0L || age >= holdMs) {
                             CHURN_RING.removeFirst();
+                            head.refs = null; // evicted node must not keep other nodes alive
                             churnLiveBytes -= head.payload.length;
                             if (churnLiveBytes < 0) churnLiveBytes = 0;
                             churnEvictions.incrementAndGet();
