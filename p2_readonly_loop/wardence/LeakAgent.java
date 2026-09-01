@@ -951,7 +951,9 @@ public class LeakAgent {
                 boolean linked = churnLinked;
                 boolean dense = churnDense;
                 int unitBytes = dense ? CHURN_DENSE_CLUSTER_BYTES : CHURN_CHUNK_BYTES;
-                int addCap = dense ? 8 : 4096; // dense: smooth the ramp, one cluster = ~3600 allocs
+                int addCap = dense ? 48 : 4096; // dense: cap the per-tick allocation burst, but
+                                               // high enough to sustain the ring vs eviction
+                                               // (~77 clusters/s needed; 48/tick @ 150ms = 320/s)
                 long now = System.currentTimeMillis();
                 synchronized (CHURN_LOCK) {
                     // evict aged-out (or everything, if target==0)
