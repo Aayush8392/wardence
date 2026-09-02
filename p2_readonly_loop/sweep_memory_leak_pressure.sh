@@ -95,8 +95,23 @@ echo "=== sweep_memory_leak_pressure.sh (mode: $MODE) ==="
 S0=$(status)
 [[ -z "$S0" ]] && { echo "FAILED: cannot read /agent-ctl/status." >&2; exit 1; }
 ST=$(field "$S0" state)
+# RELEASING is NOT an active episode -- it is a prior run still draining its
+# retained memory (a 360MiB companion + a 200k-node graph takes real time to
+# reclaim). Wait it out rather than failing; only a genuinely armed state
+# (ALLOCATING/ALLOCATED/GOVERNED_HOLD) means something else owns the agent.
+if [[ "$ST" == "RELEASING" ]]; then
+  echo "  agent is RELEASING (prior run draining) -- waiting up to 180s..."
+  for ((i=0; i<180; i+=5)); do
+    sleep 5; S0=$(status); ST=$(field "$S0" state)
+    [[ "$ST" == "READY" || "$ST" == "IDLE" ]] && break
+  done
+  echo "  ...state now '$ST'"
+fi
 if [[ "$ST" != "READY" && "$ST" != "IDLE" ]]; then
-  echo "FAILED: agent state '$ST' -- an episode or prior run is still active." >&2; exit 1
+  echo "FAILED: agent state '$ST' -- an episode or prior run still owns the agent." >&2
+  echo "        If nothing should be running, force it clear with:" >&2
+  echo "        kubectl exec -n $NS deploy/$DEP -c $CTR -- sh -c \"printf 'RELEASE\\n' > /agent-ctl/cmd\"" >&2
+  exit 1
 fi
 R0=$(kubectl get pod -n "$NS" -l name="$DEP" -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
 echo "  heap_max=$(field "$S0" heap_max_mib)Mi  governor=$(field "$S0" governor_abs_ceiling_mib)Mi  reqsync=$(field "$S0" reqsync_enabled)  restarts=$R0"
