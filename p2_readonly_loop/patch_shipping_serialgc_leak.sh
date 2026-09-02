@@ -31,6 +31,19 @@
 #   Revert (one line):
 #     kubectl set env deployment/shipping -n sock-shop JAVA_OPTS='-Xms64m -Xmx192m -XX:+UseG1GC -Djava.security.egd=file:/dev/urandom -Dspring.zipkin.enabled=false -javaagent:/agent/leak-agent.jar' && kubectl -n sock-shop rollout status deployment/shipping
 #
+# Heap sizing (2026-09-02, raised from -Xmx256 / NewSize 48m / governorCeilingMib 246):
+# the 256/48/246 config gave ~1.0s SerialGC pauses at ~37% duty -- real but a
+# lone checkout barely felt it (warm orders->shipping keep-alive connection eats
+# only the *remaining* pause on a mid-freeze request, ~0.5s avg). -Xmx640 (k8s
+# limit is 1Gi; ~150MiB non-heap + ~100MiB margin leaves room) + a ~370MiB live
+# set (MEMORY_LEAK_TARGET_MB 200 + graphEdges 85, both in injector.py) -> ~3s
+# mark+compact pauses. NewSize 32m + MaxTenuringThreshold=1 -> Full GC ~1.5x more
+# often (~55-60% duty). governorCeilingMib 540 sits above the ~370MiB working set
+# and below -Xmx so it still backstops a runaway before -XX:+ExitOnOutOfMemoryError.
+# (/tmp is a memory-backed emptyDir counting against the 1Gi limit, but gc.log
+# measured ~0.2MB over 30min -- a non-issue; rotation left off to keep the
+# tail path /tmp/gc.log stable for debugging.)
+#
 # reqsync: left OFF here (-Dwardence.leak.reqsyncEnabled=false), matching the
 # buildlog's production-wiring spec -- GRAPH is the mechanism now, not reqsync.
 # To re-enable, drop that one token from NEW_OPTS below and re-run.
@@ -55,7 +68,7 @@ echo "  current JAVA_OPTS: $CUR"
 KEPT=""
 for tok in $CUR; do
   case "$tok" in
-    -Xm*|-XX:+Use*GC|-XX:+UseParallelOldGC|-XX:NewSize=*|-XX:MaxNewSize=*|-XX:NewRatio=*|-Xmn*) ;;
+    -Xm*|-XX:+Use*GC|-XX:+UseParallelOldGC|-XX:NewSize=*|-XX:MaxNewSize=*|-XX:NewRatio=*|-Xmn*|-XX:MaxTenuringThreshold=*) ;;
     -Xloggc:*|-verbose:gc|-XX:+PrintGC*|-XX:+ExitOnOutOfMemoryError) ;;
     -Dwardence.leak.*) ;;
     *) KEPT="${KEPT:+$KEPT }$tok" ;;
@@ -63,7 +76,7 @@ for tok in $CUR; do
 done
 echo "  preserved tokens: $KEPT"
 
-NEW_OPTS="-Xms256m -Xmx256m -XX:+UseSerialGC -XX:NewSize=48m -XX:MaxNewSize=48m ${KEPT} -Xloggc:/tmp/gc.log -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCApplicationStoppedTime -XX:+ExitOnOutOfMemoryError -Dwardence.leak.governorMode=passive -Dwardence.leak.governorCeilingMib=246 -Dwardence.leak.reqsyncEnabled=false"
+NEW_OPTS="-Xms640m -Xmx640m -XX:+UseSerialGC -XX:NewSize=32m -XX:MaxNewSize=32m -XX:MaxTenuringThreshold=1 ${KEPT} -Xloggc:/tmp/gc.log -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCApplicationStoppedTime -XX:+ExitOnOutOfMemoryError -Dwardence.leak.governorMode=passive -Dwardence.leak.governorCeilingMib=540 -Dwardence.leak.reqsyncEnabled=false"
 
 if [[ "$CUR" == "$NEW_OPTS" ]]; then
   echo "  already patched -- no change."
