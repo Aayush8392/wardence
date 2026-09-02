@@ -31,7 +31,7 @@
 #                   while moving mass out of the companion and into the graph,
 #                   raising edge count 17M -> ~48M. Pick on maxMs / ">2s" with
 #                   DUTY% still >=65.
-#   hold <static> <edges> <seconds>
+#   hold <static> <edges> <seconds>   
 #                   arm the SAME leak a real episode arms and hold it, printing
 #                   a rolling duty cycle, so the felt effect can be tested by
 #                   hand (probe loop / real storefront clicks) with NO episode.
@@ -39,6 +39,7 @@
 #   bash p2_readonly_loop/sweep_memory_leak_pressure.sh static "120 200 280 360 440"
 #   bash p2_readonly_loop/sweep_memory_leak_pressure.sh edges  "40 85 130 175"
 #   bash p2_readonly_loop/sweep_memory_leak_pressure.sh hold 360 85 600
+#   bash p2_readonly_loop/sweep_memory_leak_pressure.sh hold 300:350:110 600
 #
 # Duty cycle is measured as (delta stw_pause_ms / delta gc_sampled_at_ms) -- a
 # monotonic STW counter stamped with the JVM own clock (LeakAgent.java review-57
@@ -142,10 +143,20 @@ restart_check() {
 
 case "$MODE" in
   hold)
-    HS="${2:-360}"; HE="${3:-85}"; HD="${4:-600}"
-    echo "  arming static=${HS}MiB edges=${HE} for ${HD}s -- the SAME leak a real"
-    echo "  episode arms. No episode/scorer/DB. Ctrl-C releases early."
-    send_cmd "GRAPH $SLOTS_K $WRITES_K $HE static=$HS ttl=$(( HD + 300 ))" >/dev/null
+    # Two accepted forms:
+    #   hold <static> <edges> <seconds>          (slots default to SLOTS_K)
+    #   hold <static:slots:edges> <seconds>      (a combo-sweep triple)
+    if [[ "${2:-}" == *:*:* ]]; then
+      HS="${2%%:*}"; _R="${2#*:}"; HSL="${_R%%:*}"; HE="${_R##*:}"; HD="${3:-600}"
+    else
+      HS="${2:-360}"; HE="${3:-85}"; HD="${4:-600}"; HSL="$SLOTS_K"
+    fi
+    echo "  arming static=${HS}MiB slots=${HSL}k edges=${HE} for ${HD}s -- the SAME leak a"
+    echo "  real episode arms. No episode/scorer/DB. Ctrl-C releases early."
+    echo "  NOTE: hold does NOT run the k6 checkout burst a real episode fires, so this"
+    echo "  measures the LONE-VISITOR condition. Orders-thread starvation under 14 VUs is"
+    echo "  not exercised here."
+    send_cmd "GRAPH $HSL $WRITES_K $HE static=$HS ttl=$(( HD + 300 ))" >/dev/null
     ramp "$HS" || { cleanup; exit 1; }
     echo ""
     echo "  ARMED. In a SECOND terminal now:"
