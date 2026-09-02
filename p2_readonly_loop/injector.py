@@ -763,7 +763,7 @@ MEMORY_LEAK_TARGET_MB = 80
 # keys on post-GC heap elevated vs the per-episode baseline, which GRAPH
 # produces (static companion + graph structure) exactly as ALLOCATE did.
 MEMORY_LEAK_GRAPH_SLOTS_K = 200     # backbone slots, thousands (200k nodes)
-MEMORY_LEAK_GRAPH_WRITES_K = 200    # graph rewrites/sec, thousands (200k/s -- graphLoop() hard cap; raised from 100 2026-09-02 to shrink the inter-GC gap / raise STW duty cycle)
+MEMORY_LEAK_GRAPH_WRITES_K = 100    # graph rewrites/sec, thousands (100k/s). Tried 200k 2026-09-02: shortened the inter-GC gap but also each pause (less garbage/cycle) -- duty cycle flat, cost smeared below the ~800ms felt threshold. Reverted; pause DURATION (heap/edges), not frequency, is the lever.
 MEMORY_LEAK_GRAPH_EDGES = 30        # refs per node
 # Synthetic load concurrency for the checkout-journey burst. LOCKED at 14
 # (2026-09-02, live-tuned on wardence-prod): with `orders` on a 24-thread pool
