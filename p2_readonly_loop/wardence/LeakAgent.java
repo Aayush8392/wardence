@@ -104,7 +104,24 @@ public class LeakAgent {
     // watchdog keep running independently even while the worker paces itself. A slower
     // ramp is a benign failure mode; a fully unresponsive agent (the thing actually
     // being guarded against) is not reintroduced by this.
-    private static final long CHUNK_PACE_MS = 40; // ~95MiB / 256KiB chunks * 40ms =~ 15s ramp, not sub-second
+    // DEFAULT 40 -- byte-identical to every prior run and to WSL2, which is still on the
+    // small-heap/G1 config the measurement above was taken on. Made overridable
+    // 2026-09-02 (-Dwardence.leak.chunkPaceMs) because the 40ms pacing does NOT transfer
+    // to prod's current config: the hazard it guards against is the ramp exhausting
+    // headroom before reaching target, measured at 97% GC-time by heap_used=86MiB on a
+    // 128MiB G1 heap. Prod is now a 640MiB SerialGC heap with a 360MiB target, so there
+    // is ~280MiB of slack the whole way up and that failure mode is not reachable.
+    // What 40ms DOES cost there is real: 256KiB/40ms = ~6.25MiB/s, so a 360MiB companion
+    // needs ~58s to reach target -- and the felt effect tracks the live set the entire
+    // way, so most of a 180s hold ran below the swept operating point (measured live:
+    // allocated_mb=77/360, post_gc_heap 290 vs ~535 at target). Prod sets 10 (=25MiB/s,
+    // ~14s ramp) via patch_shipping_serialgc_leak.sh. Lower with care: this paces
+    // RETAINED allocation, so a faster ramp fills old gen faster and makes the Full GCs
+    // during the ramp progressively more expensive -- intended here, but it is also what
+    // could trip the governor before target if pushed too far. injector.py's saturation
+    // wait treats that as a warning, not an abort.
+    private static final long CHUNK_PACE_MS =
+        Long.getLong("wardence.leak.chunkPaceMs", 40L);
 
     // Continuous-growth mode (2026-08-29, -Dwardence.leak.growthMbPerSec, DEFAULT 0=off,
     // byte-identical to every prior run). A real memory leak GROWS -- it does not ramp to

@@ -114,7 +114,7 @@ for tok in $CUR; do
 done
 echo "  preserved tokens: $KEPT"
 
-NEW_OPTS="-Xms640m -Xmx640m -XX:+UseSerialGC -XX:NewSize=64m -XX:MaxNewSize=64m ${KEPT} -Xloggc:/tmp/gc.log -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCApplicationStoppedTime -XX:+ExitOnOutOfMemoryError -Dwardence.leak.governorMode=passive -Dwardence.leak.governorCeilingMib=600"
+NEW_OPTS="-Xms640m -Xmx640m -XX:+UseSerialGC -XX:NewSize=64m -XX:MaxNewSize=64m ${KEPT} -Xloggc:/tmp/gc.log -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCApplicationStoppedTime -XX:+ExitOnOutOfMemoryError -Dwardence.leak.governorMode=passive -Dwardence.leak.governorCeilingMib=600 -Dwardence.leak.chunkPaceMs=10"
 
 if [[ "$CUR" == "$NEW_OPTS" ]]; then
   echo "  already patched -- no change."
