@@ -2492,22 +2492,36 @@ export const options = {
 
 let ready = false;
 let itemId = null;
+let failLogged = 0;
 
+function ok(r) { return r.status === 200 || r.status === 201; }
+
+// Per-VU one-time setup. Sleeps mirror traffic_gen/baseline.js (the proven-
+// working flow) -- Sock Shop's user/user-db writes need the settle or /orders
+// can't find the address/card and 500s. Returns true only if EVERY step
+// genuinely succeeded, so a raced setup doesn't leave a VU checking-out-broken
+// forever.
 function prep() {
   const s = Math.random().toString(36).slice(2, 10);
-  const r = http.post(BASE + '/register', JSON.stringify({
+  const reg = http.post(BASE + '/register', JSON.stringify({
     username: 'wl_' + s, password: 'wardencePass123', email: 'wl_' + s + '@example.com',
     firstName: 'W', lastName: 'L' }), H);
-  if (r.status !== 200) return false;
-  http.post(BASE + '/addresses', JSON.stringify({
+  if (!ok(reg)) return false;
+  sleep(0.3);
+  const addr = http.post(BASE + '/addresses', JSON.stringify({
     street: '1 Wardence Way', number: '1', country: 'UK', city: 'London', postcode: 'W1 1AA' }), H);
-  http.post(BASE + '/cards', JSON.stringify({
+  if (!ok(addr)) return false;
+  sleep(0.3);
+  const card = http.post(BASE + '/cards', JSON.stringify({
     longNum: '1234567890123456', expires: '12/2030', ccv: '123' }), H);
-  const c = http.get(BASE + '/catalogue?size=10');
+  if (!ok(card)) return false;
+  sleep(0.3);
+  const cat = http.get(BASE + '/catalogue?size=10');
   try {
-    const items = JSON.parse(c.body);
+    const items = JSON.parse(cat.body);
     if (Array.isArray(items) && items.length > 0) itemId = items[0].id;
-  } catch (e) { /* unexpected shape -- prep fails, retried next iter */ }
+  } catch (e) { /* unexpected shape */ }
+  sleep(0.4);
   return itemId !== null;
 }
 
@@ -2516,10 +2530,21 @@ export default function () {
     ready = prep();
     if (!ready) { sleep(1); return; }
   }
-  http.post(BASE + '/cart', JSON.stringify({ id: itemId }), H);
+  const add = http.post(BASE + '/cart', JSON.stringify({ id: itemId }), H);
+  sleep(0.2);  // let the carts-db write commit before /orders reads it
   const co = http.post(BASE + '/orders', '{}', { headers: H.headers, tags: { name: 'checkout' } });
   checkoutDur.add(co.timings.duration);
-  checkoutFail.add(co.status !== 200);
+  const good = ok(co);
+  checkoutFail.add(!good);
+  if (!good) {
+    if (failLogged < 5) {
+      failLogged++;
+      console.log('order fail: status=' + co.status + ' addStatus=' + add.status
+        + ' body=' + String(co.body).slice(0, 160));
+    }
+    ready = false;  // session/setup may be stale -- re-prep next iteration
+    sleep(0.5);
+  }
 }
 """
 
@@ -3580,7 +3605,7 @@ def _inject_and_verify_memory_leak(
                     ln.strip() for ln in summary.splitlines()
                     if any(k in ln for k in (
                         "checkout_duration", "checkout_failed", "http_req_duration",
-                        "http_req_failed", "http_reqs", "iterations",
+                        "http_req_failed", "http_reqs", "iterations", "order fail:",
                     ))
                 ]
                 if shown:
