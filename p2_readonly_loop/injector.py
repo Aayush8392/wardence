@@ -781,7 +781,7 @@ MEMORY_LEAK_RISE_THRESHOLD_KB = 20000
 # Governor ceiling is NOT set from here -- LeakAgent.java reads it from the
 # `wardence.leak.governorCeilingMib` JVM system property, a deploy-time
 # JAVA_OPTS concern (patch_shipping_serialgc_leak.sh).
-MEMORY_LEAK_TARGET_MB = 360
+MEMORY_LEAK_TARGET_MB = 300
 # Max seconds to wait for the static companion to actually REACH target before
 # starting the hold + load burst. LeakAgent allocates it at CHUNK_PACE_MS
 # (256KiB per 40ms = ~6.25MiB/s), a constant sized when the target was 95MiB
@@ -799,9 +799,37 @@ MEMORY_LEAK_SATURATION_MAX_S = 120
 # check_memory_leak_churn.sh (graph mode). Diagnosis is unchanged -- it still
 # keys on post-GC heap elevated vs the per-episode baseline, which GRAPH
 # produces (static companion + graph structure) exactly as ALLOCATE did.
-MEMORY_LEAK_GRAPH_SLOTS_K = 200     # backbone slots, thousands (200k nodes)
+# SHAPE LOCKED 2026-09-02 as the triple static=300 / slots=350k / edges=110,
+# chosen from the measured combo sweep (sweep_memory_leak_pressure.sh combo), NOT
+# predicted. A SerialGC full GC costs mark (proportional to EDGE COUNT --
+# pointer-chasing, cache-hostile, expensive per MiB) plus mark-compact
+# (proportional to BYTES -- cheap per MiB). The old 360/200k/85 shape spent most
+# of its heap budget on flat companion bytes, i.e. the cheap kind of work, and
+# traced only 17M edges. These triples were swept iso-live-set, moving mass out
+# of the companion and into the graph:
+#   static:slots:edges  Medges  postGC  headrm  DUTY%  >1s  >2s  maxMs
+#     360:200:85         17.0   554Mi    79Mi   65.6    18    0   1735  <- old
+#     320:300:100        30.0   576Mi    57Mi   90.5    13   13   3296
+#     300:350:110        38.5   560Mi    73Mi   97.2    13   13   3702  <- chosen
+#     280:400:120        48.0   570Mi    63Mi  104.7    11   11   4375  <- too close
+#                                                                         to the cliff
+# Real hold-test at the chosen triple: probe p50 2294ms vs a ~100ms baseline,
+# 30/30 calls over 800ms, 29/30 over 1500ms. The old shape read ~0.87s typical
+# felt delay (a warm keep-alive orders->shipping connection means a checkout eats
+# only the REMAINDER of a pause, ~half on average); this reads ~1.9s.
+# 280:400:120 was rejected: maxMs 4375 leaves only ~625ms before orders' 5s
+# Future.get, where checkouts ERROR instead of lagging.
+# DUTY% above ~90 is saturated and not meaningful to compare -- stw_pause_ms is
+# cumulative and a pause straddling the sample boundary is counted in full, plus
+# SerialGC's two collector beans (Copy + MarkSweepCompact) both notify on an
+# escalated safepoint. Trust the gc.log-derived columns at the top end.
+# WATCH over a long hold: both maxMs (3880->4249 across four 45s windows) and
+# post-GC heap (569->592Mi against the 600MiB governor ceiling) CREEP upward as
+# graph churn promotes. Fine for the 180s episode hold that was tested; would
+# cross on a materially longer one.
+MEMORY_LEAK_GRAPH_SLOTS_K = 350     # backbone slots, thousands (350k nodes)
 MEMORY_LEAK_GRAPH_WRITES_K = 100    # graph rewrites/sec, thousands (100k/s). Tried 200k 2026-09-02: shortened the inter-GC gap but also each pause (less garbage/cycle) -- duty cycle flat, cost smeared below the ~800ms felt threshold. Reverted. (Superseded 2026-09-02 by the swept curve at MEMORY_LEAK_TARGET_MB: the real duty-cycle lever is HEADROOM, live_set/(heap-live_set) -- write rate changes neither.)
-MEMORY_LEAK_GRAPH_EDGES = 85        # refs per node. 30->85 on 2026-09-02: ~2.8x the (cache-unfriendly, pointer-chasing) mark-phase traversal -> longer SerialGC full-GC pause. Heap cost ~150MiB for the graph; fits the -Xmx640 old gen. Dial to ~65 for slow-never-broken, up to ~110 for harder freezes (watch the 5s orders Future.get cliff).
+MEMORY_LEAK_GRAPH_EDGES = 110        # refs per node. See the swept-shape block above MEMORY_LEAK_GRAPH_SLOTS_K for why 110 (with 350k slots and static=300) rather than 85. Dial DOWN, never up: 120 measured maxMs 4375, only ~625ms clear of orders 5s Future.get.
 # Synthetic load concurrency for the checkout-journey burst. LOCKED at 14
 # (2026-09-02, live-tuned on wardence-prod): with `orders` on a 24-thread pool
 # (patch_orders_pool.sh) a shipping GC pause holds enough orders threads to
