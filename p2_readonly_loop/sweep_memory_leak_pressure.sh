@@ -79,7 +79,12 @@ measure() {
   stw0=$(field "$A" stw_pause_ms); ts0=$(field "$A" gc_sampled_at_ms)
   stw1=$(field "$B" stw_pause_ms); ts1=$(field "$B" gc_sampled_at_ms)
   postgc=$(field "$B" post_gc_heap_mib); hmax=$(field "$B" heap_max_mib)
-  govrel=$(field "$B" governor_release_events)
+  # governor_release_events is CUMULATIVE since agent start -- reporting it raw
+  # makes every point after the first governor event look like the governor is
+  # firing when it is not (that misread the 2026-09-02 edges sweep: govRel=2 on
+  # all four rows, including one with 232MiB of headroom, was two leftover
+  # events from the prior static=440 point). Report the per-window DELTA.
+  govrel=$(( $(field "$B" governor_release_events) - $(field "$A" governor_release_events) ))
   dstw=$(( stw1 - stw0 )); dts=$(( ts1 - ts0 ))
   duty="n/a"; (( dts > 0 )) && duty=$(awk "BEGIN{printf \"%.1f\", $dstw*100/$dts}")
   n=$(( GL1 - GL0 )); (( n < 1 )) && n=1
