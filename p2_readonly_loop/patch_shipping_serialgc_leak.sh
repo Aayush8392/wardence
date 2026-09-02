@@ -35,18 +35,56 @@
 # the 256/48/246 config gave ~1.0s SerialGC pauses at ~37% duty -- real but a
 # lone checkout barely felt it (warm orders->shipping keep-alive connection eats
 # only the *remaining* pause on a mid-freeze request, ~0.5s avg). -Xmx640 (k8s
-# limit is 1Gi; ~150MiB non-heap + ~100MiB margin leaves room) + a ~370MiB live
-# set (MEMORY_LEAK_TARGET_MB 200 + graphEdges 85, both in injector.py) -> ~3s
-# mark+compact pauses. NewSize 32m + MaxTenuringThreshold=1 -> Full GC ~1.5x more
-# often (~55-60% duty). governorCeilingMib 540 sits above the ~370MiB working set
-# and below -Xmx so it still backstops a runaway before -XX:+ExitOnOutOfMemoryError.
+# limit is 1Gi; ~150MiB non-heap + ~100MiB margin leaves room) carries the
+# ~320MiB live set (MEMORY_LEAK_TARGET_MB 200 + graphEdges 85, both injector.py)
+# that makes each forced collection expensive. reqsync (see below) supplies the
+# request correlation; GRAPH supplies the mass.
+#
+# Two knobs from the first -Xmx640 attempt were REVERTED the same day, both
+# measured wrong on prod, both recorded so they aren't retried:
+#   -XX:MaxTenuringThreshold=1 -- meant to pin old gen full so young GCs escalate
+#     to Full GCs. Instead it promoted the graph writer's churn garbage (~41MB/s
+#     of new GraphNodes) straight into old gen after one scavenge, so old gen
+#     filled with DEAD nodes (gc.log showed a monotonic 483->619MiB climb, ~22MiB
+#     promoted per young GC) and post-GC heap hit 561MiB -- over the 540 ceiling,
+#     which made the governor fire 3x, clamp its working ceiling to 170MiB and
+#     start dismantling the companion mid-episode (allocated_mb stuck at 137/200,
+#     state stuck ALLOCATING). It ALSO made every young collection a 0.21s
+#     card-table-scan event (29MiB eden, 3MiB surviving, should be 10-20ms) --
+#     replacing one ~1s Full GC every 2.8s with a 0.21s pause every ~0.6s, i.e.
+#     smearing the cost back below the ~800ms perception threshold. Same failure
+#     shape as the reverted GRAPH write-rate change (d4697d1), different route.
+#   -XX:NewSize=32m -- amplified the above; the 0.21s cost is card-scan-driven
+#     (proportional to old-gen graph size and dirty cards, NOT eden size), so a
+#     SMALLER eden just means more of those pauses. 64m amortizes it over fewer
+#     events and keeps the baseline fast, so a reqsync stall stands out.
+# governorCeilingMib is now 600: a pure OOM backstop just under -Xmx, deliberately
+# well above the ~320MiB working set so it never fights the leak again.
 # (/tmp is a memory-backed emptyDir counting against the 1Gi limit, but gc.log
 # measured ~0.2MB over 30min -- a non-issue; rotation left off to keep the
 # tail path /tmp/gc.log stable for debugging.)
 #
-# reqsync: left OFF here (-Dwardence.leak.reqsyncEnabled=false), matching the
-# buildlog's production-wiring spec -- GRAPH is the mechanism now, not reqsync.
-# To re-enable, drop that one token from NEW_OPTS below and re-run.
+# reqsync: back ON (2026-09-02) -- the `-Dwardence.leak.reqsyncEnabled=false`
+# token was REMOVED from NEW_OPTS (the property defaults to true). GRAPH alone
+# is a PROBABILISTIC mechanism: shipping freezes at moments uncorrelated with
+# when anyone clicks, so even at a 60% STW duty cycle ~40% of checkouts miss
+# entirely, and the warm keep-alive orders->shipping connection halves the felt
+# duration of the ones that hit. That is a correlation problem, and no
+# magnitude knob (write rate, heap size, edge count -- all tried, all failed
+# the same way) can fix it. reqsync is the REQUEST-CORRELATED mechanism: it
+# polls Tomcat's GlobalRequestProcessor counter every 20ms and fires a 40MiB
+# throwaway burst the moment a real request arrives, forcing an
+# Allocation-Failure GC on top of that specific request. GRAPH stays on
+# underneath it -- it supplies the heavy old-gen live set that makes each
+# forced collection expensive. To disable again, re-add the token.
+#
+# CAVEAT carried from the buildlog: reqsync's own locked "EVERY manual checkout
+# click felt >1s" result (2026-08-23) is attributed there to a carts-db COLLSCAN
+# confound. reqsync is request-triggered and the COLLSCAN inflates baseline
+# checkout latency generally, so they are not obviously the same effect -- but
+# they cannot be separated retroactively. Fix the missing
+# db.cart.createIndex({customerId:1}) before treating any new reqsync
+# measurement as clean.
 
 set -uo pipefail
 NS="sock-shop"
@@ -76,7 +114,7 @@ for tok in $CUR; do
 done
 echo "  preserved tokens: $KEPT"
 
-NEW_OPTS="-Xms640m -Xmx640m -XX:+UseSerialGC -XX:NewSize=32m -XX:MaxNewSize=32m -XX:MaxTenuringThreshold=1 ${KEPT} -Xloggc:/tmp/gc.log -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCApplicationStoppedTime -XX:+ExitOnOutOfMemoryError -Dwardence.leak.governorMode=passive -Dwardence.leak.governorCeilingMib=540 -Dwardence.leak.reqsyncEnabled=false"
+NEW_OPTS="-Xms640m -Xmx640m -XX:+UseSerialGC -XX:NewSize=64m -XX:MaxNewSize=64m ${KEPT} -Xloggc:/tmp/gc.log -verbose:gc -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCApplicationStoppedTime -XX:+ExitOnOutOfMemoryError -Dwardence.leak.governorMode=passive -Dwardence.leak.governorCeilingMib=600"
 
 if [[ "$CUR" == "$NEW_OPTS" ]]; then
   echo "  already patched -- no change."
