@@ -3479,45 +3479,58 @@ def _inject_and_verify_memory_leak(
 
     container = cfg["container"]
     ttl_s = cfg["duration_s"] + 30  # real margin over the hold, same shape as the clone's "HOLD_S + 30"
-    cmd = (
-        f"GRAPH {MEMORY_LEAK_GRAPH_SLOTS_K} {MEMORY_LEAK_GRAPH_WRITES_K} "
-        f"{MEMORY_LEAK_GRAPH_EDGES} static={MEMORY_LEAK_TARGET_MB} ttl={ttl_s}"
-    )
-    print(f"  sending '{cmd}' to {pod} ({container})...")
-    if not _leak_agent_send_cmd(pod, cfg["namespace"], container, cmd):
-        print(f"  ABORT: kubectl exec failed writing the command file to {pod} -- "
-              f"the leak agent may not be installed/loaded on this pod, or the pod is unreachable.")
-        return None
 
-    # Real confirmation, not fire-and-forget: the control thread only polls
-    # /agent-ctl/cmd once per second (LeakAgent.java's controlLoop), so give
-    # it a real window to pick up the command and report back via the
-    # status file before treating the ramp as started.
-    ramp_confirmed = False
-    for _ in range(10):
-        time.sleep(1)
-        status = _leak_agent_read_status(pod, cfg["namespace"], container)
-        if status is None:
-            continue
-        try:
-            graph_slots = int(status.get("graph_slots") or 0)
-        except (TypeError, ValueError):
-            graph_slots = 0
-        # GRAPH drives the static companion through applyStaticCompanion() so the
-        # state still passes through ALLOCATING/ALLOCATED; graph_slots>0 is the
-        # GRAPH-specific confirmation that the backbone is actually building.
-        if status.get("state") in ("ALLOCATING", "GOVERNED_HOLD", "ALLOCATED") or graph_slots > 0:
-            ramp_confirmed = True
-            print(f"  ramp confirmed: state={status.get('state')}, "
-                  f"graph_slots={status.get('graph_slots')}, "
-                  f"requested_mb={status.get('requested_mb')}, allocated_mb={status.get('allocated_mb')}")
-            break
-    if not ramp_confirmed:
-        print(f"  ABORT: sent '{cmd}' but the agent's own status file never reported an "
-              f"ALLOCATING/GOVERNED_HOLD/ALLOCATED state within 10s -- treating this as an "
-              f"unconfirmed ramp, not a successful one. Check `kubectl exec ... cat /agent-ctl/status` "
-              f"and the pod's logs directly before retrying.")
-        return None
+    # WARDENCE_MEMLEAK_NO_LEAK: NO-LEAK CONTROL run. Skips the GRAPH command
+    # entirely -- everything else (settle, baseline capture, the checkout load
+    # burst, the summary) runs identically, so the checkout_duration it prints
+    # measures how much latency the orders-pool chokepoint + burst load add on
+    # their OWN, with no leak. Not a real memory-leak episode -- do not score it.
+    no_leak = os.environ.get("WARDENCE_MEMLEAK_NO_LEAK", "").strip().lower() not in ("", "0", "false", "no")
+
+    if no_leak:
+        print("  ** NO-LEAK CONTROL RUN (WARDENCE_MEMLEAK_NO_LEAK set) -- NOT sending GRAPH. "
+              "checkout_duration below = the chokepoint + burst's own contribution, leak-free. "
+              "This episode's ground truth is meaningless, do not score it.")
+    else:
+        cmd = (
+            f"GRAPH {MEMORY_LEAK_GRAPH_SLOTS_K} {MEMORY_LEAK_GRAPH_WRITES_K} "
+            f"{MEMORY_LEAK_GRAPH_EDGES} static={MEMORY_LEAK_TARGET_MB} ttl={ttl_s}"
+        )
+        print(f"  sending '{cmd}' to {pod} ({container})...")
+        if not _leak_agent_send_cmd(pod, cfg["namespace"], container, cmd):
+            print(f"  ABORT: kubectl exec failed writing the command file to {pod} -- "
+                  f"the leak agent may not be installed/loaded on this pod, or the pod is unreachable.")
+            return None
+
+        # Real confirmation, not fire-and-forget: the control thread only polls
+        # /agent-ctl/cmd once per second (LeakAgent.java's controlLoop), so give
+        # it a real window to pick up the command and report back via the
+        # status file before treating the ramp as started.
+        ramp_confirmed = False
+        for _ in range(10):
+            time.sleep(1)
+            status = _leak_agent_read_status(pod, cfg["namespace"], container)
+            if status is None:
+                continue
+            try:
+                graph_slots = int(status.get("graph_slots") or 0)
+            except (TypeError, ValueError):
+                graph_slots = 0
+            # GRAPH drives the static companion through applyStaticCompanion() so the
+            # state still passes through ALLOCATING/ALLOCATED; graph_slots>0 is the
+            # GRAPH-specific confirmation that the backbone is actually building.
+            if status.get("state") in ("ALLOCATING", "GOVERNED_HOLD", "ALLOCATED") or graph_slots > 0:
+                ramp_confirmed = True
+                print(f"  ramp confirmed: state={status.get('state')}, "
+                      f"graph_slots={status.get('graph_slots')}, "
+                      f"requested_mb={status.get('requested_mb')}, allocated_mb={status.get('allocated_mb')}")
+                break
+        if not ramp_confirmed:
+            print(f"  ABORT: sent '{cmd}' but the agent's own status file never reported an "
+                  f"ALLOCATING/GOVERNED_HOLD/ALLOCATED state within 10s -- treating this as an "
+                  f"unconfirmed ramp, not a successful one. Check `kubectl exec ... cat /agent-ctl/status` "
+                  f"and the pod's logs directly before retrying.")
+            return None
 
     print(f"  launching the checkout-journey load burst (concurrency={MEMORY_LEAK_LOAD_CONCURRENCY}, "
           f"duration={cfg['duration_s']}s) through front-end -> orders -> shipping...")
