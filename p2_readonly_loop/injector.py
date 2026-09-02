@@ -2530,8 +2530,13 @@ export default function () {
     ready = prep();
     if (!ready) { sleep(1); return; }
   }
+  // Clear the cart FIRST -- POST /cart bumps quantity on a reused session and
+  // /orders doesn't reliably clear it, so without this the cart accumulates
+  // 1->2->3... units until the total tops $100 and `payment` declines (406).
+  http.del(BASE + '/cart', null, H);
+  sleep(0.15);
   const add = http.post(BASE + '/cart', JSON.stringify({ id: itemId }), H);
-  sleep(0.2);  // let the carts-db write commit before /orders reads it
+  sleep(0.15);  // let the carts-db write commit before /orders reads it
   const co = http.post(BASE + '/orders', '{}', { headers: H.headers, tags: { name: 'checkout' } });
   checkoutDur.add(co.timings.duration);
   const good = ok(co);
