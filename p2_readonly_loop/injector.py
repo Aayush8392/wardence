@@ -782,6 +782,14 @@ MEMORY_LEAK_RISE_THRESHOLD_KB = 20000
 # `wardence.leak.governorCeilingMib` JVM system property, a deploy-time
 # JAVA_OPTS concern (patch_shipping_serialgc_leak.sh).
 MEMORY_LEAK_TARGET_MB = 360
+# Max seconds to wait for the static companion to actually REACH target before
+# starting the hold + load burst. LeakAgent allocates it at CHUNK_PACE_MS
+# (256KiB per 40ms = ~6.25MiB/s), a constant sized when the target was 95MiB
+# ("~15s ramp", per its own comment) -- at 360MiB that is ~58s. Without this
+# wait the burst starts the instant graph_slots>0, so roughly the first third
+# of a 180s hold runs against a half-built leak. 120s covers the real ~58s with
+# margin for a slow/contended ramp; NOT an abort if it expires (see below).
+MEMORY_LEAK_SATURATION_MAX_S = 120
 # GRAPH-mechanism params (2026-09-02, replacing ALLOCATE -- see wardence_worklog.md).
 # ALLOCATE's governed retained leak produced only a short-pause signal on prod's
 # stock G1GC; GRAPH (a dense, constantly-rewritten reference graph in old gen +
@@ -3564,6 +3572,48 @@ def _inject_and_verify_memory_leak(
                   f"unconfirmed ramp, not a successful one. Check `kubectl exec ... cat /agent-ctl/status` "
                   f"and the pod's logs directly before retrying.")
             return None
+
+        # SATURATION WAIT (2026-09-02). ramp_confirmed above only proves the
+        # agent STARTED -- graph_slots>0 fires as soon as the backbone begins
+        # building, while the static companion is still climbing at ~6.25MiB/s
+        # (LeakAgent's CHUNK_PACE_MS). Measured live: a mid-hold sample read
+        # allocated_mb=77 of 360 with post_gc_heap_mib=290 vs the ~535 the
+        # pressure sweep measured at target -- ~340MiB of headroom, which on the
+        # swept curve is the weak ~44%-duty/one-felt-pause-per-11s end, versus
+        # ~68% duty and one per 2.6s at target. The felt effect was
+        # correspondingly mild early in the hold and only obvious later.
+        # Waiting for real saturation FIRST means the whole hold runs at the
+        # swept operating point instead of ramping through it.
+        #
+        # Deliberately a WARNING, never an ABORT, if it expires: a partially
+        # ramped leak still diagnoses correctly (post-GC heap is far above the
+        # 20MiB MEMORY_LEAK_RISE_THRESHOLD_KB long before target), and the
+        # governor can legitimately clamp below target. Aborting a usable
+        # episode over a soft timing target would be strictly worse.
+        sat_target_mb = int(MEMORY_LEAK_TARGET_MB * 0.9)
+        saturated = False
+        for waited_s in range(MEMORY_LEAK_SATURATION_MAX_S):
+            status = _leak_agent_read_status(pod, cfg["namespace"], container)
+            if status is not None:
+                try:
+                    alloc_mb = int(status.get("allocated_mb") or 0)
+                except (TypeError, ValueError):
+                    alloc_mb = 0
+                if alloc_mb >= sat_target_mb:
+                    saturated = True
+                    print(f"  companion saturated after ~{waited_s}s: allocated_mb={alloc_mb} "
+                          f"(>= {sat_target_mb} = 90% of {MEMORY_LEAK_TARGET_MB}), "
+                          f"post_gc_heap_mib={status.get('post_gc_heap_mib')}, "
+                          f"state={status.get('state')} -- starting the hold at full strength.")
+                    break
+            time.sleep(1)
+        if not saturated:
+            print(f"  WARNING: companion did not reach {sat_target_mb}MiB within "
+                  f"{MEMORY_LEAK_SATURATION_MAX_S}s -- proceeding anyway with a partially "
+                  f"ramped leak. Diagnosis is unaffected (post-GC heap is already far above "
+                  f"the {MEMORY_LEAK_RISE_THRESHOLD_KB // 1000}MiB rise threshold), but the "
+                  f"felt effect will be weaker than the swept operating point. Check the "
+                  f"agent's governor_release_events/last_error if this recurs.")
 
     print(f"  launching the checkout-journey load burst (concurrency={MEMORY_LEAK_LOAD_CONCURRENCY}, "
           f"duration={cfg['duration_s']}s) through front-end -> orders -> shipping...")
