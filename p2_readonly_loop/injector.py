@@ -765,11 +765,15 @@ MEMORY_LEAK_TARGET_MB = 80
 MEMORY_LEAK_GRAPH_SLOTS_K = 200     # backbone slots, thousands (200k nodes)
 MEMORY_LEAK_GRAPH_WRITES_K = 100    # graph rewrites/sec, thousands (100k/s)
 MEMORY_LEAK_GRAPH_EDGES = 30        # refs per node
-# Synthetic load concurrency. The burst now drives the FULL checkout journey
-# (front-end -> orders -> shipping), 2 requests/iteration, so per-VU checkout
-# throughput is far lower than the old raw single POST /shipping -- default
-# raised 15 -> 25. Env-overridable for live tuning without a redeploy.
-MEMORY_LEAK_LOAD_CONCURRENCY = int(os.environ.get("WARDENCE_MEMLEAK_LOAD_CONCURRENCY", "25"))
+# Synthetic load concurrency for the checkout-journey burst. LOCKED at 14
+# (2026-09-02, live-tuned on wardence-prod): with `orders` on a 24-thread pool
+# (patch_orders_pool.sh) a shipping GC pause holds enough orders threads to
+# queue checkouts even at 14 VUs -- real-leak checkout p50 ~626ms / p95 ~1.14s,
+# vs a no-leak control (WARDENCE_MEMLEAK_NO_LEAK) at ~116ms, so ~82% of the lag
+# is the leak, not burst overhead. 25 VUs gave the SAME leak p50 but a 261ms
+# control (more stack-wide stress, dirtier attribution). Env-overridable for
+# further tuning without a redeploy.
+MEMORY_LEAK_LOAD_CONCURRENCY = int(os.environ.get("WARDENCE_MEMLEAK_LOAD_CONCURRENCY", "14"))
 # CPU limit constant from the old raw-loop node burst (2026-08-29). CURRENTLY
 # UNUSED: the burst is now a rate-limited k6 checkout journey (2026-09-02,
 # _launch_checkout_load_burst) which -- like cpu-throttle's uncapped 150-VU k6
