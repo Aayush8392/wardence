@@ -745,21 +745,43 @@ PAYMENT_READINESS_PATH_FAULT = "/wardence-fault-nonexistent"
 MEMORY_LEAK_SETTLE_SECONDS = 35  # real floor-capture wait before the leak agent starts ramping
 # 20 MiB, locked 2026-08-21 -- see wardence_buildlog.md for the real measurement chain.
 MEMORY_LEAK_RISE_THRESHOLD_KB = 20000
-# Static-companion size (MiB). Raised 80 -> 200 on 2026-09-02: the 80/246
-# GRAPH config produced only ~1.0s SerialGC pauses at ~37% duty cycle -- real,
-# gc.log-confirmed, but a lone checkout barely felt it (warm keep-alive
-# orders->shipping connection means a checkout request landing mid-pause eats
-# only the *remaining* freeze, ~0.5s avg, below the human notice threshold).
-# The lever for a felt lone-user effect is pause DURATION (mark+compact work on
-# the live set), not frequency. 200MiB static drives the compact phase;
-# MEMORY_LEAK_GRAPH_EDGES 30->85 drives the mark phase -> ~2.5-3.2s pauses.
-# Paired with patch_shipping_serialgc_leak.sh's -Xmx256->640 (k8s limit is 1Gi),
-# governorCeilingMib 246->540 (above the new ~370MiB post-GC working set),
-# NewSize 48m->32m + MaxTenuringThreshold=1 (Full GC ~1.5x more often).
+# Static-companion size (MiB). 80 -> 360, set 2026-09-02 from a real measured
+# sweep (`sweep_memory_leak_pressure.sh`), NOT from a predicted number -- the
+# preceding arc changed this and the heap flags several times on reasoning alone
+# and each change moved the felt effect sideways.
+#
+# The governing relation is the classic GC throughput/footprint tradeoff:
+#     STW duty cycle  ~  live_set / (heap_size - live_set)
+# i.e. HEADROOM is the lever, not heap size or pause length in isolation.
+# Growing -Xmx to lengthen pauses also makes them rarer, more than
+# proportionally: measured 1.0s every 2.8s = 36% duty at -Xmx256/live~183, vs
+# 2.0s every 9.7s = 21% at -Xmx640/live~300. That is why "bigger heap" failed.
+#
+# Real swept curve at -Xmx640 / NewSize 64m / graphEdges 85 / governor 600,
+# 45s measurement window per point (duty = delta stw_pause_ms / delta
+# gc_sampled_at_ms, the agent's own monotonic counter + JVM clock):
+#   static  headroom  duty%  pauses  >1s  felt-pause-every  governor-releases
+#     120     215Mi   43.8     41      4      11.3s          0
+#     200      91Mi   43.5     44      5       9.0s          0
+#     280      94Mi   47.4     39      9       5.0s          0
+#     360      64Mi   59.8     31     16       2.8s          0   <-- chosen
+#     440      38Mi   75.9     27     18       2.5s          2   <-- governor firing
+# Total pause count FALLS as static rises while the >1s count RISES (4->18):
+# sub-second pauses (invisible to a user) are replaced by felt ones, 10% of
+# pauses felt at static=120 vs 52% at 360. The metric that matters for a lone
+# visitor is the felt-pause RATE, not duty cycle alone.
+#
+# 360 is the highest point with zero governor releases and ~31MiB of margin
+# below the 600MiB ceiling. 440 is the measured ceiling, not a safe setting:
+# post-GC heap reached 595 of a 633MiB heap and the governor began releasing
+# (i.e. dismantling the leak mid-episode). Do not raise past 360 without
+# re-running the sweep -- and note reqsync was ON for every row above, so its
+# 40MiB bursts are already included; changing it invalidates these numbers.
+#
 # Governor ceiling is NOT set from here -- LeakAgent.java reads it from the
 # `wardence.leak.governorCeilingMib` JVM system property, a deploy-time
 # JAVA_OPTS concern (patch_shipping_serialgc_leak.sh).
-MEMORY_LEAK_TARGET_MB = 200
+MEMORY_LEAK_TARGET_MB = 360
 # GRAPH-mechanism params (2026-09-02, replacing ALLOCATE -- see wardence_worklog.md).
 # ALLOCATE's governed retained leak produced only a short-pause signal on prod's
 # stock G1GC; GRAPH (a dense, constantly-rewritten reference graph in old gen +
@@ -770,7 +792,7 @@ MEMORY_LEAK_TARGET_MB = 200
 # keys on post-GC heap elevated vs the per-episode baseline, which GRAPH
 # produces (static companion + graph structure) exactly as ALLOCATE did.
 MEMORY_LEAK_GRAPH_SLOTS_K = 200     # backbone slots, thousands (200k nodes)
-MEMORY_LEAK_GRAPH_WRITES_K = 100    # graph rewrites/sec, thousands (100k/s). Tried 200k 2026-09-02: shortened the inter-GC gap but also each pause (less garbage/cycle) -- duty cycle flat, cost smeared below the ~800ms felt threshold. Reverted; pause DURATION (heap/edges), not frequency, is the lever.
+MEMORY_LEAK_GRAPH_WRITES_K = 100    # graph rewrites/sec, thousands (100k/s). Tried 200k 2026-09-02: shortened the inter-GC gap but also each pause (less garbage/cycle) -- duty cycle flat, cost smeared below the ~800ms felt threshold. Reverted. (Superseded 2026-09-02 by the swept curve at MEMORY_LEAK_TARGET_MB: the real duty-cycle lever is HEADROOM, live_set/(heap-live_set) -- write rate changes neither.)
 MEMORY_LEAK_GRAPH_EDGES = 85        # refs per node. 30->85 on 2026-09-02: ~2.8x the (cache-unfriendly, pointer-chasing) mark-phase traversal -> longer SerialGC full-GC pause. Heap cost ~150MiB for the graph; fits the -Xmx640 old gen. Dial to ~65 for slow-never-broken, up to ~110 for harder freezes (watch the 5s orders Future.get cliff).
 # Synthetic load concurrency for the checkout-journey burst. LOCKED at 14
 # (2026-09-02, live-tuned on wardence-prod): with `orders` on a 24-thread pool
