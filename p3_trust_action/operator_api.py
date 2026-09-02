@@ -364,7 +364,17 @@ INJECT_SUBPROCESS_TIMEOUT_S = {
     # needed in production, per the established "production shipping is
     # always warm from real organic traffic" finding -- unlike the clone
     # harness, which needed its own warmup window before a clean measurement.
-    "memory-leak": 300,
+    # memory-leak: RECALIBRATED 300 -> 540, 2026-09-02, when
+    # MEMORY_LEAK_TARGET_MB went 80 -> 360 (the swept felt-effect optimum, see
+    # injector.py). The subprocess budget is settle 35s + companion ramp + hold
+    # 180s + release overhead. At an 80MiB companion the ramp was ~15s, so ~250s
+    # fit under 300 with room. A 360MiB companion plus a 200k-node/85-edge graph
+    # is 4.5x the allocation: a 60-90s ramp lands at 325s+, i.e. TimeoutExpired
+    # kills the episode mid-hold. 540 covers the sweep harness's own worst-case
+    # 150s ramp bound with real margin, and is an instant no-op in the common
+    # case (same shape as init-failure's 500). NOT a hold extension -- the hold
+    # is still LIVE_TRIGGER_DURATION_OVERRIDE_S["memory-leak"]=180.
+    "memory-leak": 540,
 }
 DEFAULT_INJECT_SUBPROCESS_TIMEOUT_S = 300  # any class not yet in the dict above
 # The subprocess call below is wrapped in try/except TimeoutExpired, so
