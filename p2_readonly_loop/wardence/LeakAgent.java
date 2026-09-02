@@ -600,6 +600,17 @@ public class LeakAgent {
     private static volatile String lastError = "";
     private static volatile long cmdMtimeAtRead = 0L;
     private static volatile long cmdTtlS = 60L;
+    // mtime of the last RELEASE command actually acted on. The command file is
+    // NOT deleted after a successful read (only when stale, see controlLoop) --
+    // it is a persistent "current command", and every other handler
+    // de-duplicates by comparing the file mtime it was invoked with. The RELEASE
+    // branch did neither, so a RELEASE sitting in the file re-fired
+    // requestRelease() once per second forever: state -> RELEASING, worker ->
+    // IDLE, next tick -> RELEASING again. Observed live 2026-09-02, stuck in
+    // RELEASING for 16 minutes with allocated_mb=0 and graph_slots=0 (everything
+    // genuinely freed; only the reported state was wrong). This field restores
+    // the same mtime de-duplication the other commands already use.
+    private static volatile long lastReleaseCmdMtime = -1L;
 
     private static final File CTL_DIR = new File("/agent-ctl");
     private static final File CMD_FILE = new File(CTL_DIR, "cmd");
@@ -1317,7 +1328,13 @@ public class LeakAgent {
                             if (line.isEmpty()) {
                                 if (allocatedBytes > 0 || nativeAllocatedBytes > 0 || refLeakCount > 0 || codeLeakCount > 0 || churnLiveBytes > 0 || graphSlots > 0) requestRelease("empty command file");
                             } else if (line.equalsIgnoreCase("RELEASE")) {
-                                requestRelease("RELEASE command");
+                                // Act once per DISTINCT RELEASE command, matching how every
+                                // other handler treats mtime -- see lastReleaseCmdMtime's own
+                                // comment for the real stuck-in-RELEASING bug this fixes.
+                                if (mtime != lastReleaseCmdMtime) {
+                                    lastReleaseCmdMtime = mtime;
+                                    requestRelease("RELEASE command");
+                                }
                             } else if (line.toUpperCase().startsWith("ALLOCATE")) {
                                 handleAllocate(line, mtime);
                             } else if (line.toUpperCase().startsWith("NATIVE")) {
