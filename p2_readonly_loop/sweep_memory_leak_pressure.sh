@@ -19,6 +19,18 @@
 # MODES
 #   static <list>   sweep static-companion MiB at fixed edges  (headroom lever)
 #   edges  <list>   sweep refs-per-node at fixed static        (mark-cost lever)
+#   combo  <list>   sweep static:slots:edges triples           (shape lever)
+#                   For raising pause LENGTH once frequency is already solved.
+#                   A SerialGC full GC costs mark (proportional to EDGE COUNT --
+#                   pointer-chasing, cache-hostile, expensive per MiB) plus
+#                   mark-compact (proportional to BYTES -- cheap per MiB). The
+#                   static companion is flat bytes: cheap mass. At static=360 /
+#                   200k slots / 85 edges, ~360 of the ~543MiB live set is the
+#                   cheap kind and only ~82MiB is graph. These triples hold the
+#                   live set roughly CONSTANT (so duty/frequency is preserved)
+#                   while moving mass out of the companion and into the graph,
+#                   raising edge count 17M -> ~48M. Pick on maxMs / ">2s" with
+#                   DUTY% still >=65.
 #   hold <static> <edges> <seconds>
 #                   arm the SAME leak a real episode arms and hold it, printing
 #                   a rolling duty cycle, so the felt effect can be tested by
@@ -187,7 +199,44 @@ case "$MODE" in
     echo "  can feel. A high DUTY% built from sub-second pauses is invisible --"
     echo "  pick on BOTH columns. Felt-pause rate = ${SAMPLE_S}s / '>1s'."
     ;;
+  combo)
+    LIST="${2:-360:200:85 320:300:100 300:350:110 280:400:120}"
+    echo "  sweeping static:slots:edges : $LIST"
+    echo "  (iso-live-set by design -- mass moves from the flat companion into the graph,"
+    echo "   so duty/frequency should hold while pause LENGTH rises)"
+    echo "  ~$(( RAMP_MAX_S/3 + SAMPLE_S + DRAIN_S ))s+ per point"
+    echo ""
+    printf '%-16s %-7s %-9s %-8s %-8s %-7s %-6s %-6s %-7s %-6s\n' \
+      "static:slots:edg" "Medges" "postGC" "headrm" "DUTY%" "pauses" ">1s" ">2s" "maxMs" "govRel"
+    echo "  ---------------------------------------------------------------------------------------"
+    for V in $LIST; do
+      case "$V" in
+        *:*:*) ;;
+        *) echo "  bad triple '$V' -- expected static:slots:edges"; continue ;;
+      esac
+      ST_MB="${V%%:*}"; REST="${V#*:}"; SL="${REST%%:*}"; ED="${REST##*:}"
+      MEDGES=$(awk "BEGIN{printf \"%.1f\", $SL*1000*$ED/1000000}")
+      send_cmd "GRAPH $SL $WRITES_K $ED static=$ST_MB ttl=900" >/dev/null
+      if ! ramp "$ST_MB"; then
+        printf '%-16s %s\n' "$V" "-- skipped"; send_cmd "RELEASE" >/dev/null; sleep "$DRAIN_S"; continue
+      fi
+      read -r d c o1 o2 mx pg hr gr <<<"$(measure)"
+      printf '%-16s %-7s %-9s %-8s %-8s %-7s %-6s %-6s %-7s %-6s\n' \
+        "$V" "$MEDGES" "${pg}Mi" "${hr}Mi" "$d" "$c" "$o1" "$o2" "$mx" "$gr"
+      restart_check
+      send_cmd "RELEASE" >/dev/null; sleep "$DRAIN_S"
+    done
+    cleanup
+    echo ""
+    echo "  Pick on maxMs / '>2s' with DUTY% still >=65. Frequency is already solved at"
+    echo "  static=360 (68% duty, a felt pause every ~2.6s); the open problem is pause"
+    echo "  LENGTH. A warm keep-alive orders->shipping connection means a checkout eats"
+    echo "  only the REMAINDER of a pause (~half on average), so a 1.9s pause reads as"
+    echo "  ~0.95s felt -- which is why most checkouts still resolve under a second."
+    echo "  Target ~3-3.5s maxMs. Past ~4.5s, pauses cross orders' 5s Future.get and"
+    echo "  checkouts ERROR instead of lagging -- that is the ceiling, not a target."
+    ;;
   *)
-    echo "unknown mode '$MODE' -- use: static <list> | edges <list> | hold <static> <edges> <secs>" >&2
+    echo "unknown mode '$MODE' -- use: static <list> | edges <list> | combo <list> | hold <static> <edges> <secs>" >&2
     exit 2 ;;
 esac
