@@ -753,22 +753,29 @@ MEMORY_LEAK_RISE_THRESHOLD_KB = 20000
 # already), so it's a deploy-time JAVA_OPTS concern (install_shipping_leak_agent.py),
 # not something injector.py sends over the control-file protocol.
 MEMORY_LEAK_TARGET_MB = 80
-# Real locked concurrency (measurement 4/review 59, wardence_buildlog.md):
-# the only value real production traffic (0.667 req/s, measurement 1)
-# cannot reproduce -- the synthetic burst below is what makes the felt
-# effect real, not decoration.
-MEMORY_LEAK_LOAD_CONCURRENCY = 15
-# CPU limit on the DEDICATED load-burst pod (2026-08-29, Oracle demo-visibility
-# investigation). The burst used to run via `kubectl exec` INSIDE the live
-# front-end pod, which pinned front-end at its own 300m CPU limit for the whole
-# hold -- degrading add-to-cart / browse / every front-end-proxied request
-# regardless of shipping (a symptom a real shipping heap leak would never
-# cause) and pushing the 2-vCPU Oracle node to ~98%. The burst now runs in its
-# own pod (front-end's image, for a `node` runtime) with this cap, so the load
-# stays on shipping's own request path and its node footprint is bounded.
-# Tunable: raise if concurrency can't be sustained under it, lower if the node
-# is still too hot during a hold.
-SHIPPING_LOAD_BURST_CPU_LIMIT = "250m"
+# GRAPH-mechanism params (2026-09-02, replacing ALLOCATE -- see wardence_worklog.md).
+# ALLOCATE's governed retained leak produced only a short-pause signal on prod's
+# stock G1GC; GRAPH (a dense, constantly-rewritten reference graph in old gen +
+# the static=MEMORY_LEAK_TARGET_MB companion) drives the long stop-the-world
+# pauses the felt effect needs. Requires shipping to be on the SerialGC config
+# that patch_shipping_serialgc_leak.sh applies. Validated in
+# check_memory_leak_churn.sh (graph mode). Diagnosis is unchanged -- it still
+# keys on post-GC heap elevated vs the per-episode baseline, which GRAPH
+# produces (static companion + graph structure) exactly as ALLOCATE did.
+MEMORY_LEAK_GRAPH_SLOTS_K = 200     # backbone slots, thousands (200k nodes)
+MEMORY_LEAK_GRAPH_WRITES_K = 100    # graph rewrites/sec, thousands (100k/s)
+MEMORY_LEAK_GRAPH_EDGES = 30        # refs per node
+# Synthetic load concurrency. The burst now drives the FULL checkout journey
+# (front-end -> orders -> shipping), 2 requests/iteration, so per-VU checkout
+# throughput is far lower than the old raw single POST /shipping -- default
+# raised 15 -> 25. Env-overridable for live tuning without a redeploy.
+MEMORY_LEAK_LOAD_CONCURRENCY = int(os.environ.get("WARDENCE_MEMLEAK_LOAD_CONCURRENCY", "25"))
+# CPU limit constant from the old raw-loop node burst (2026-08-29). CURRENTLY
+# UNUSED: the burst is now a rate-limited k6 checkout journey (2026-09-02,
+# _launch_checkout_load_burst) which -- like cpu-throttle's uncapped 150-VU k6
+# pod -- doesn't need a cap. Kept as a documented re-cap value in case the k6
+# burst ever does need bounding.
+SHIPPING_LOAD_BURST_CPU_LIMIT = "500m"
 
 # catalogue-db's max_connections is 151 (confirmed still unchanged,
 # 2026-07-25). baseline Threads_connected was ~2-3 on 2026-07-21;
@@ -2459,113 +2466,122 @@ export default function () {{
     return pod_name, proc
 
 
-def _launch_shipping_load_burst(namespace: str, concurrency: int, duration_s: int):
-    """Non-blocking launch of the real synthetic load burst memory-leak's
-    production design was measured against (check_shipping_synthetic_load_no_leak.sh,
-    2026-08-21 session) -- identical payload/mechanism: closed-loop POST
-    /shipping, CONCURRENCY workers each awaiting their own response before the
-    next. Real measurement confirmed organic traffic alone (0.667 req/s) cannot
-    reproduce the validated felt effect; this burst is the real reason the
-    effect is felt at all, not decoration.
+# k6 checkout-journey load, fed to `k6 run -` over stdin (2026-09-02, replaces
+# the raw closed-loop POST /shipping burst). Placeholders: __NS__ __VUS__ __DUR__.
+# Per-VU one-time prep (register/address/card + catalogue pick -- module-scope
+# vars are per-VU in k6), then every iteration = add-to-cart + POST /orders
+# tagged `checkout`, no sleeps. The custom `checkout_duration` Trend + the
+# `checkout_failed` Rate are what the injector greps out of k6's end-of-run
+# summary -- that IS the real checkout p50/p95/p99 for the hold, through the
+# actual front-end -> orders -> shipping path (raw POST /shipping bypassed
+# orders entirely, so it could never move real checkout latency).
+_CHECKOUT_K6_TEMPLATE = """
+import http from 'k6/http';
+import { sleep } from 'k6';
+import { Trend, Rate } from 'k6/metrics';
 
-    Runs in a DEDICATED, CPU-capped pod (front-end's own image, which carries a
-    `node` runtime) -- NOT `kubectl exec` into the live front-end pod. The
-    original in-front-end approach (2026-08-21) was found on Oracle (2026-08-29)
-    to pin front-end at its own 300m CPU limit for the whole hold, degrading
-    every request front-end proxies (add-to-cart, browse) regardless of
-    shipping -- a symptom a real shipping heap leak would never produce -- and
-    pushing the 2-vCPU node to ~98%. A dedicated pod keeps the load on
-    shipping's own request path only; SHIPPING_LOAD_BURST_CPU_LIMIT bounds its
-    node footprint.
+const BASE = 'http://front-end.__NS__.svc.cluster.local';
+const checkoutDur = new Trend('checkout_duration', true);
+const checkoutFail = new Rate('checkout_failed');
+const H = { headers: { 'Content-Type': 'application/json' } };
 
-    Returns (pod_name, Popen). Caller reaps the Popen AND deletes the pod --
-    --rm/--attach is best-effort; the explicit delete in the caller's `finally`
-    is the real cleanup, per this project's fault-injection cleanup discipline.
-    Returns (None, None) (logs why, never raises) if shipping's pod/IP or
-    front-end's image can't be resolved."""
-    shipping_pod = _current_pod_name("shipping", namespace)
-    if shipping_pod is None:
-        print(f"  ABORT: no Running shipping pod found in {namespace} -- cannot resolve a pod IP "
-              f"to target the synthetic load burst at.")
-        return None, None
-    ip_result = subprocess.run(
-        ["kubectl", "get", "pod", shipping_pod, "-n", namespace, "-o", "jsonpath={.status.podIP}"],
-        capture_output=True, text=True,
+export const options = {
+  scenarios: { checkout: { executor: 'constant-vus', vus: __VUS__, duration: '__DUR__s' } },
+  summaryTrendStats: ['avg', 'min', 'med', 'p(90)', 'p(95)', 'p(99)', 'max'],
+};
+
+let ready = false;
+let itemId = null;
+
+function prep() {
+  const s = Math.random().toString(36).slice(2, 10);
+  const r = http.post(BASE + '/register', JSON.stringify({
+    username: 'wl_' + s, password: 'wardencePass123', email: 'wl_' + s + '@example.com',
+    firstName: 'W', lastName: 'L' }), H);
+  if (r.status !== 200) return false;
+  http.post(BASE + '/addresses', JSON.stringify({
+    street: '1 Wardence Way', number: '1', country: 'UK', city: 'London', postcode: 'W1 1AA' }), H);
+  http.post(BASE + '/cards', JSON.stringify({
+    longNum: '1234567890123456', expires: '12/2030', ccv: '123' }), H);
+  const c = http.get(BASE + '/catalogue?size=10');
+  try {
+    const items = JSON.parse(c.body);
+    if (Array.isArray(items) && items.length > 0) itemId = items[0].id;
+  } catch (e) { /* unexpected shape -- prep fails, retried next iter */ }
+  return itemId !== null;
+}
+
+export default function () {
+  if (!ready) {
+    ready = prep();
+    if (!ready) { sleep(1); return; }
+  }
+  http.post(BASE + '/cart', JSON.stringify({ id: itemId }), H);
+  const co = http.post(BASE + '/orders', '{}', { headers: H.headers, tags: { name: 'checkout' } });
+  checkoutDur.add(co.timings.duration);
+  checkoutFail.add(co.status !== 200);
+}
+"""
+
+
+def _launch_checkout_load_burst(namespace: str, concurrency: int, duration_s: int):
+    """Non-blocking (Popen) launch of the real checkout-journey load burst.
+
+    Drives the FULL customer path -- front-end -> orders -> shipping -- so that a
+    shipping GC pause holds a real `orders` worker thread for the pause duration,
+    which (with a shrunk orders pool, patch_orders_pool.sh) is what makes real
+    checkout p50/p95 move rather than only the tail. The old burst hit
+    POST /shipping directly, bypassing orders entirely.
+
+    Real measurement (2026-08-21) confirmed organic traffic (0.667 req/s) cannot
+    reproduce the felt effect -- this burst is the real reason it is felt, not
+    decoration.
+
+    Same proven Popen / `kubectl run -i` / `k6 run --quiet -` pattern as
+    _launch_cpu_throttle_login_load (which runs k6 uncapped at 150 VUs), with one
+    deliberate difference: no --rm, so the pod is kept for the caller to
+    `kubectl logs` its summary (the real checkout percentiles) before deleting.
+    Not CPU-capped: 25 VUs of a response-blocked checkout journey is a fraction
+    of cpu-throttle's load, and the old memory-leak CPU-cap history
+    (SHIPPING_LOAD_BURST_CPU_LIMIT) was about an unbounded raw-loop node burst,
+    not a rate-limited k6 run.
+
+    Returns (pod_name, Popen), or (None, None) (logs why, never raises).
+    Caller MUST reap with proc.wait() -- NOT communicate(): stdin is a closed
+    PIPE and communicate() re-flushes it -> ValueError on Python 3.12 (the exact
+    bug that crashed the injector on Oracle 2026-08-27 for the cpu-throttle
+    burst). DEVNULL stdout/stderr means wait() can't deadlock.
+
+    NOTE if the first live run shows no summary in `kubectl logs`: drop --quiet
+    (k6 --quiet suppresses the progress bar, not the end summary -- but verify)."""
+    k6_dur = max(30, duration_s - 8)  # finish + print the summary before the caller reaps
+    script = (
+        _CHECKOUT_K6_TEMPLATE
+        .replace("__NS__", namespace)
+        .replace("__VUS__", str(concurrency))
+        .replace("__DUR__", str(k6_dur))
     )
-    shipping_ip = ip_result.stdout.strip()
-    if not shipping_ip:
-        print(f"  ABORT: shipping pod {shipping_pod} has no podIP yet -- cannot start the load burst.")
-        return None, None
-
-    image_result = subprocess.run(
-        ["kubectl", "get", "deployment", "front-end", "-n", namespace,
-         "-o", "jsonpath={.spec.template.spec.containers[0].image}"],
-        capture_output=True, text=True,
-    )
-    load_image = image_result.stdout.strip()
-    if not load_image:
-        print("  ABORT: could not resolve front-end's image for the load-burst pod "
-              "(needed only for its `node` runtime).")
-        return None, None
-
-    js = (
-        "'use strict';\n"
-        "var http = require('http');\n"
-        f"var IP = '{shipping_ip}';\n"
-        f"var CONCURRENCY = {concurrency};\n"
-        f"var DURATION_MS = {duration_s * 1000};\n"
-        "var sent = 0, failed = 0;\n"
-        "function oneRequest(seq) {\n"
-        "  return new Promise(function (resolve) {\n"
-        "    var body = JSON.stringify({ id: 'wardence-loadtest-' + seq + '-' + Date.now(), "
-        "name: 'wardence-loadtest' });\n"
-        "    var req = http.request({ hostname: IP, port: 80, path: '/shipping', method: 'POST',\n"
-        "      headers: { 'Content-Type': 'application/json', "
-        "'Content-Length': Buffer.byteLength(body) } },\n"
-        "      function (res) { res.on('data', function () {}); "
-        "res.on('end', function () { sent++; resolve(); }); });\n"
-        "    req.on('error', function () { failed++; sent++; resolve(); });\n"
-        "    req.write(body); req.end();\n"
-        "  });\n"
-        "}\n"
-        "var deadline = Date.now() + DURATION_MS;\n"
-        "function loop() {\n"
-        "  if (Date.now() >= deadline) return Promise.resolve();\n"
-        "  return oneRequest(sent).then(loop);\n"
-        "}\n"
-        "var workers = [];\n"
-        "for (var w = 0; w < CONCURRENCY; w++) workers.push(loop());\n"
-        "Promise.all(workers).then(function () {\n"
-        "  console.log('[loadresult] sent=' + sent + ' failed=' + failed);\n"
-        "});\n"
-    )
-    pod_name = f"wardence-shipping-load-{uuid.uuid4().hex[:8]}"
-    overrides = json.dumps({
-        "apiVersion": "v1",
-        "spec": {
-            "restartPolicy": "Never",
-            "containers": [{
-                "name": pod_name,
-                "image": load_image,
-                "imagePullPolicy": "IfNotPresent",
-                "command": ["node", "-e", js],
-                "resources": {
-                    "limits": {"cpu": SHIPPING_LOAD_BURST_CPU_LIMIT, "memory": "128Mi"},
-                    "requests": {"cpu": "50m", "memory": "64Mi"},
-                },
-            }],
-        },
-    })
+    pod_name = f"wardence-checkout-load-{uuid.uuid4().hex[:8]}"
     proc = subprocess.Popen(
         [
-            "kubectl", "run", pod_name, "--rm", "--attach", "--restart=Never",
-            "-n", namespace, "--image", load_image, "--image-pull-policy=IfNotPresent",
-            "--overrides", overrides,
+            "kubectl", "run", pod_name, "-i", "--restart=Never",
+            "-n", namespace, f"--image={K6_IMAGE}", "--image-pull-policy=IfNotPresent",
+            "--", "run", "--quiet", "-",
         ],
-        # stdout/stderr -> DEVNULL: output is never read; lets the caller reap
-        # with terminate()+communicate() with no pipe-buffer risk.
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
+        # stdin PIPE for the script; DEVNULL out/err so the caller reaps with
+        # proc.wait() (never communicate() -- see the docstring).
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True,
     )
+    try:
+        proc.stdin.write(script)
+        proc.stdin.close()
+    except Exception as e:
+        print(f"  ABORT: could not feed the k6 script to {pod_name} ({e}).")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return None, None
     return pod_name, proc
 
 
@@ -3447,7 +3463,10 @@ def _inject_and_verify_memory_leak(
 
     container = cfg["container"]
     ttl_s = cfg["duration_s"] + 30  # real margin over the hold, same shape as the clone's "HOLD_S + 30"
-    cmd = f"ALLOCATE {MEMORY_LEAK_TARGET_MB} ttl={ttl_s}"
+    cmd = (
+        f"GRAPH {MEMORY_LEAK_GRAPH_SLOTS_K} {MEMORY_LEAK_GRAPH_WRITES_K} "
+        f"{MEMORY_LEAK_GRAPH_EDGES} static={MEMORY_LEAK_TARGET_MB} ttl={ttl_s}"
+    )
     print(f"  sending '{cmd}' to {pod} ({container})...")
     if not _leak_agent_send_cmd(pod, cfg["namespace"], container, cmd):
         print(f"  ABORT: kubectl exec failed writing the command file to {pod} -- "
@@ -3462,11 +3481,19 @@ def _inject_and_verify_memory_leak(
     for _ in range(10):
         time.sleep(1)
         status = _leak_agent_read_status(pod, cfg["namespace"], container)
-        if status is not None and status.get("state") in (
-            "ALLOCATING", "GOVERNED_HOLD", "ALLOCATED",
-        ):
+        if status is None:
+            continue
+        try:
+            graph_slots = int(status.get("graph_slots") or 0)
+        except (TypeError, ValueError):
+            graph_slots = 0
+        # GRAPH drives the static companion through applyStaticCompanion() so the
+        # state still passes through ALLOCATING/ALLOCATED; graph_slots>0 is the
+        # GRAPH-specific confirmation that the backbone is actually building.
+        if status.get("state") in ("ALLOCATING", "GOVERNED_HOLD", "ALLOCATED") or graph_slots > 0:
             ramp_confirmed = True
             print(f"  ramp confirmed: state={status.get('state')}, "
+                  f"graph_slots={status.get('graph_slots')}, "
                   f"requested_mb={status.get('requested_mb')}, allocated_mb={status.get('allocated_mb')}")
             break
     if not ramp_confirmed:
@@ -3476,20 +3503,20 @@ def _inject_and_verify_memory_leak(
               f"and the pod's logs directly before retrying.")
         return None
 
-    print(f"  launching the synthetic load burst (concurrency={MEMORY_LEAK_LOAD_CONCURRENCY}, "
-          f"duration={cfg['duration_s']}s) against shipping...")
-    load_pod, load_proc = _launch_shipping_load_burst(
+    print(f"  launching the checkout-journey load burst (concurrency={MEMORY_LEAK_LOAD_CONCURRENCY}, "
+          f"duration={cfg['duration_s']}s) through front-end -> orders -> shipping...")
+    load_pod, load_proc = _launch_checkout_load_burst(
         cfg["namespace"], MEMORY_LEAK_LOAD_CONCURRENCY, cfg["duration_s"]
     )
     if load_proc is None:
-        print("  ABORT: could not start the synthetic load burst -- proceeding to inject without "
+        print("  ABORT: could not start the checkout load burst -- proceeding to inject without "
               "it would silently reproduce the exact 'organic traffic alone' no-fault condition "
               "measurement 1 already confirmed cannot show the real felt effect, making any "
               "resulting diagnosis untrustworthy. Releasing the already-ramping agent before "
               "aborting.")
         _leak_agent_send_cmd(pod, cfg["namespace"], container, "RELEASE")
         return None
-    print(f"  synthetic load burst started (pid={load_proc.pid}), running for the full "
+    print(f"  checkout load burst started (pid={load_proc.pid}), running for the full "
           f"{cfg['duration_s']}s hold in the background.")
 
     # Real evidence point: the ramp is already confirmed (agent genuinely
@@ -3526,17 +3553,45 @@ def _inject_and_verify_memory_leak(
         # no reason. Neither reap is allowed to raise past this point --
         # this path must always reach RELEASE, restart or not, interrupted
         # or not, since a real leak is sitting on production either way.
-        print("  reaping the synthetic load burst...")
+        print("  reaping the checkout load burst...")
         try:
             load_proc.terminate()
-            load_proc.communicate(timeout=15)
+            # wait(), NOT communicate(): stdin was a closed PIPE and communicate()
+            # re-flushes it -> ValueError on Python 3.12 (crashed the injector on
+            # Oracle 2026-08-27). DEVNULL stdout/stderr means wait() can't deadlock.
+            load_proc.wait(timeout=15)
         except Exception as e:
-            print(f"  load burst reap: terminate/communicate failed ({e}), forcing kill...")
+            print(f"  load burst reap: terminate/wait failed ({e}), forcing kill...")
             try:
                 load_proc.kill()
             except Exception:
                 pass
         if load_pod is not None:
+            # Pull k6's end-of-run summary BEFORE deleting the pod -- checkout_duration
+            # (a custom Trend) + checkout_failed (a Rate) are the real checkout
+            # p50/p90/p95/p99 + fail rate for this hold, through the real
+            # front-end -> orders -> shipping path. Best-effort; never raises.
+            try:
+                summary = subprocess.run(
+                    ["kubectl", "logs", load_pod, "-n", cfg["namespace"]],
+                    capture_output=True, text=True, timeout=20,
+                ).stdout
+                shown = [
+                    ln.strip() for ln in summary.splitlines()
+                    if any(k in ln for k in (
+                        "checkout_duration", "checkout_failed", "http_req_duration",
+                        "http_req_failed", "http_reqs", "iterations",
+                    ))
+                ]
+                if shown:
+                    print("  --- checkout load burst summary (real checkout latency for the hold) ---")
+                    for ln in shown:
+                        print(f"    {ln}")
+                else:
+                    print("  checkout load burst summary: k6 produced no summary lines "
+                          "(early stop / restart, or k6 still running at reap).")
+            except Exception as e:
+                print(f"  checkout load burst summary: could not read k6 logs ({e}).")
             print(f"  deleting the load-burst pod {load_pod}...")
             subprocess.run(
                 ["kubectl", "delete", "pod", load_pod, "-n", cfg["namespace"],
