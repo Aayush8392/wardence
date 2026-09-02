@@ -31,14 +31,16 @@
 
 [Unit]
 Description=Wardence Cloudflare Quick Tunnel -- Storefront (NodePort 30079)
-After=network-online.target k3s.service
+After=network-online.target systemd-resolved.service k3s.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:30079
+# --no-autoupdate + ExecStartPost: see cloudflared-operator-api.service for the why.
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://localhost:30079
 Restart=on-failure
 RestartSec=5
+ExecStartPost=/bin/sh -c 'sleep 15; systemctl start --no-block wardence-publish-endpoints.service'
 
 [Install]
 WantedBy=multi-user.target

@@ -39,14 +39,21 @@
 
 [Unit]
 Description=Wardence Cloudflare Quick Tunnel -- Operator API (port 8002)
-After=network-online.target wardence-operator-api.service
+# systemd-resolved.service: the 2026-09-01 churn was cloudflared's first DNS
+# lookup racing a resolved restart -> it exited 1 -> systemd restarted it -> new URL.
+After=network-online.target systemd-resolved.service wardence-operator-api.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared tunnel --url http://localhost:8002
+# --no-autoupdate: cloudflared self-updates + restarts every 24h by default, and
+# every restart churns the quick-tunnel URL. Pinning kills the biggest churn source.
+ExecStart=/usr/local/bin/cloudflared tunnel --no-autoupdate --url http://localhost:8002
 Restart=on-failure
 RestartSec=5
+# ~15s after (re)start, once cloudflared has printed the new URL, push it to R2 so
+# the frontend picks it up without a Vercel redeploy. --no-block: don't wait on it.
+ExecStartPost=/bin/sh -c 'sleep 15; systemctl start --no-block wardence-publish-endpoints.service'
 # No User= set deliberately -- cloudflared needs no elevated access and
 # no repo/venv paths, runs fine as the default systemd-assigned user.
 # If this unit is ever adjusted to run as a specific non-root user,

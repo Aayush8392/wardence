@@ -2,11 +2,17 @@
 // against the real k3s cluster (NOT deployed to Vercel, unlike the R2
 // static data). Must be running: uvicorn operator_api:app --reload
 // --app-dir p3_trust_action --port 8002
-const BASE_URL = import.meta.env.VITE_OPERATOR_API_URL;
+//
+// The base URL is resolved at call time (not module load) from runtimeConfig --
+// the operator tunnel's hostname churns on every cloudflared restart, and
+// runtimeConfig picks up the current one from R2. Falls back to
+// VITE_OPERATOR_API_URL.
+import { operatorBaseUrl } from "./runtimeConfig";
 
 async function request(path, { method = "GET", token, body, params } = {}) {
+  const BASE_URL = operatorBaseUrl();
   if (!BASE_URL) {
-    throw new Error("VITE_OPERATOR_API_URL is not set (check p4_frontend/.env)");
+    throw new Error("operator API URL not set (no runtime_config.json and no VITE_OPERATOR_API_URL)");
   }
   const url = new URL(`${BASE_URL}${path}`);
   if (params) {
@@ -104,8 +110,9 @@ export function fetchLiveStatus(episodeId, token) {
 // operator_api.py's trigger_reasoning_stream docstring for why --
 // EventSource structurally cannot set custom headers).
 export function reasoningStreamUrl(episodeId, token) {
+  const BASE_URL = operatorBaseUrl();
   if (!BASE_URL) {
-    throw new Error("VITE_OPERATOR_API_URL is not set (check p4_frontend/.env)");
+    throw new Error("operator API URL not set (no runtime_config.json and no VITE_OPERATOR_API_URL)");
   }
   const url = new URL(`${BASE_URL}/trigger/reasoning-stream/${episodeId}`);
   url.searchParams.set("token", token);

@@ -12,6 +12,7 @@ import {
   promoteClass,
   demoteClass,
 } from "../../api/operator";
+import { storefrontUrl as resolveStorefrontUrl } from "../../api/runtimeConfig";
 import { AUTO_FIX_CLASSES } from "../../constants/faultClasses";
 import SystemStatusRibbon from "../../components/operator/SystemStatusRibbon";
 import FaultGrid from "../../components/operator/FaultGrid";
@@ -282,7 +283,7 @@ export default function Operator() {
     }
   };
 
-  const storefrontUrl = import.meta.env.VITE_STOREFRONT_URL || "http://localhost:8079";
+  const storefrontUrl = resolveStorefrontUrl();
 
   return (
     <div className="flex items-start gap-0">

@@ -1,0 +1,29 @@
+# Publishes the current Cloudflare quick-tunnel URLs to R2 (runtime_config.json)
+# so the Vercel frontend self-heals after a tunnel URL churn -- no manual
+# env-var edit + redeploy. See deploy/publish_endpoints.py for the full why.
+#
+# Oneshot. Driven by wardence-publish-endpoints.timer (every ~2 min) and by
+# ExecStartPost on each cloudflared-*.service (~15s after a restart).
+#
+# Install:
+#   sudo cp deploy/wardence-publish-endpoints.service /etc/systemd/system/
+#   sudo cp deploy/wardence-publish-endpoints.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now wardence-publish-endpoints.timer
+#   sudo systemctl start wardence-publish-endpoints.service   # publish once now
+#   journalctl -u wardence-publish-endpoints -n 20 --no-pager  # check it worked
+
+[Unit]
+Description=Wardence -- publish current tunnel URLs to R2 (runtime_config.json)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/wardence
+ExecStart=/home/ubuntu/wardence_venv/bin/python3 /home/ubuntu/wardence/deploy/publish_endpoints.py
+# The default 'ubuntu' user is in the 'adm' group on Ubuntu cloud images, which
+# grants system-journal read access -- journalctl works without sudo. If
+# ExecStart ever fails with a journal permission error, uncomment:
+#SupplementaryGroups=systemd-journal

@@ -1,0 +1,15 @@
+# Fires wardence-publish-endpoints.service every ~2 min. Worst-case staleness
+# after a tunnel URL churn is one interval; the ExecStartPost hooks on the
+# tunnel units cover the common case (a restart) much faster.
+
+[Unit]
+Description=Wardence -- republish tunnel URLs to R2 every 2 min
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=120s
+AccuracySec=15s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
