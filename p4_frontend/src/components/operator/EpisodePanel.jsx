@@ -3,7 +3,6 @@ import { reasoningStreamUrl, fetchFaultStatus } from "../../api/operator";
 import { fetchEpisodes, fetchRadarDossier } from "../../api/r2";
 import { useTickingElapsed } from "../../hooks/useTickingElapsed";
 import { CLASS_LABELS, INVISIBLE_CLASSES, STOREFRONT_SYMPTOM } from "../../constants/faultClasses";
-import { storefrontUrl as resolveStorefrontUrl } from "../../api/runtimeConfig";
 import LoadingDots from "../shared/LoadingDots";
 import RadarChart from "../charts/RadarChart";
 
@@ -315,7 +314,6 @@ export default function EpisodePanel({ faultClass, episodeId, live, token, onClo
     faultLiveNow &&
     !INVISIBLE_CLASSES.includes(faultClass) &&
     Boolean(storefrontSymptom);
-  const storefrontHref = resolveStorefrontUrl();
 
   return (
     // Real docked-sidebar behavior on desktop (per explicit ask -- an
@@ -417,17 +415,6 @@ export default function EpisodePanel({ faultClass, episodeId, live, token, onClo
             <p className="font-data-mono text-[11px] text-on-surface leading-snug">
               {storefrontSymptom}
             </p>
-            {storefrontHref && (
-              <a
-                href={storefrontHref}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1 mt-2 font-label-caps text-[10px] text-primary hover:underline"
-              >
-                OPEN STOREFRONT
-                <span className="material-symbols-outlined text-[13px]">open_in_new</span>
-              </a>
-            )}
           </div>
         )}
         <p className="font-label-caps text-[10px] text-on-surface-variant mb-2">LLM REASONING</p>
