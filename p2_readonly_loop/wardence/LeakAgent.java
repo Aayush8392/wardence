@@ -1126,7 +1126,22 @@ public class LeakAgent {
             try {
                 int slots = graphSlots;
                 if (slots <= 0) {
-                    if (graphBackbone != null) graphBackbone = null; // release -> GC reclaims
+                    if (graphBackbone != null) {
+                        graphBackbone = null; // release -> GC reclaims
+                        // Real fix (2026-09-03): workerLoop's own RELEASE-path System.gc()
+                        // is gated on allocatedBytes > 0 (the static companion only) -- it
+                        // never fires again once that's already 0, so a graph-only release
+                        // (or a second RELEASE after the static companion already drained)
+                        // left post_gc_heap_mib reporting a stale, pre-graph-nulling value
+                        // indefinitely, confirmed live: state=IDLE, allocated_mb=0,
+                        // graph_slots=0, post_gc_heap_mib=225 (real floor ~40-48MiB). This
+                        // thread is the one place that actually knows the exact instant the
+                        // backbone reference is dropped, so it fires the confirming GC
+                        // itself instead of relying on workerLoop to notice -- no race, no
+                        // shared flag, exactly once per release (guarded by the same
+                        // graphBackbone != null check the null-out itself already used).
+                        System.gc();
+                    }
                     Thread.sleep(100);
                     lastTick = System.currentTimeMillis();
                     continue;

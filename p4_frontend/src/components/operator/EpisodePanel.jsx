@@ -155,7 +155,24 @@ function InvisibleClassEvidence({ faultClass, token }) {
 export default function EpisodePanel({ faultClass, episodeId, live, token, onClose, onViewReplay }) {
   const episodeState = live?.episode_state ?? null;
   const stepIndex = STEPS.indexOf(episodeState);
-  const elapsedS = useTickingElapsed(live?.elapsed_in_state_s, Boolean(episodeId) && episodeState != null);
+  // Real fix (2026-09-03): elapsed_in_state_s counts from the instant the
+  // episode entered "holding" (injector.py launch), not from the real hold
+  // start -- for classes with a settle/ramp/confirm phase first
+  // (memory-leak's saturation wait is the worst case, ~79s), that made a
+  // correctly-running 180s hold display up to 78s "ahead" of itself. The
+  // backend now surfaces `hold_started_at` (from injector.py's own
+  // evidence-file timestamp) once the real hold has actually begun; until
+  // then it's null and this falls back to the previous elapsed_in_state_s
+  // behavior, which is what the settle/ramp/confirm phase itself should
+  // still show.
+  const holdStartedAtS = live?.hold_started_at
+    ? (Date.now() - new Date(live.hold_started_at).getTime()) / 1000
+    : null;
+  const showingHoldElapsed = episodeState === "holding" && holdStartedAtS != null;
+  const elapsedS = useTickingElapsed(
+    showingHoldElapsed ? holdStartedAtS : live?.elapsed_in_state_s,
+    Boolean(episodeId) && episodeState != null
+  );
 
   const [dossierOpen, setDossierOpen] = useState(!episodeId);
 
@@ -343,7 +360,9 @@ export default function EpisodePanel({ faultClass, episodeId, live, token, onClo
             <div className="flex items-center justify-between">
               <span className="font-label-caps text-[10px] text-on-surface-variant">
                 {(episodeState ?? "injecting").replace("_", " ").toUpperCase()}
-                {elapsedS != null && ` · ${elapsedS}s`}
+                {elapsedS != null && showingHoldElapsed && live?.hold_duration_s != null
+                  ? ` · ${elapsedS}s / ${live.hold_duration_s}s`
+                  : elapsedS != null && ` · ${elapsedS}s`}
               </span>
               {episodeState === "resolved" && live?.republished_at && (
                 <button

@@ -417,6 +417,26 @@ def patch_deployment() -> None:
         sys.exit(1)
     print(f"  {apply.stdout.strip()}")
 
+    # Real bug found and fixed (2026-09-03): the `if "-javaagent" in
+    # orig_java_opts` branch above deliberately leaves JAVA_OPTS untouched
+    # on a re-run (e.g. rebuilding the jar after a LeakAgent.java change,
+    # ConfigMap already refreshed by preflight_validate() above) -- but if
+    # nothing ELSE in the pod spec changed either, the `kubectl apply` just
+    # above is then a genuine no-op: no new rollout, the existing pod's
+    # initContainer never re-runs, so the OLD jar keeps running while this
+    # script goes on to report success. wait_and_verify() below then reads
+    # the STILL-RUNNING old pod as "the real new pod" -- a real, silent
+    # trap, confirmed live (a 3h31m-old pod reported as fresh). Force a
+    # rollout restart unconditionally here so a jar-only rebuild always
+    # gets a genuinely fresh pod (idempotent/cheap on a real first install,
+    # since `kubectl apply` just above already triggers one there too).
+    print("=== Forcing a rollout restart (guarantees a fresh pod + fresh initContainer jar copy, "
+          "even when JAVA_OPTS itself didn't change on this run) ===")
+    restart = run(["kubectl", "rollout", "restart", f"deployment/{TARGET}", "-n", NAMESPACE])
+    if restart.returncode != 0:
+        print(f"ABORT: kubectl rollout restart failed: {restart.stderr}")
+        sys.exit(1)
+
 
 def wait_and_verify() -> None:
     """Real rollout wait + the same real active-HTTP-readiness poll the
@@ -440,6 +460,24 @@ def wait_and_verify() -> None:
         print("ABORT: rollout reported success but no real Running pod/podIP could be resolved.")
         sys.exit(1)
     print(f"  real new pod: {pod} ({pod_ip})")
+
+    # Real check added 2026-09-03, closing the trap the unconditional
+    # rollout restart above already guards against structurally -- this is
+    # the direct verification, not just relying on "a restart happened."
+    # Confirms the in-pod jar the initContainer actually copied matches
+    # what was just built, not the stale jar the restart exists to replace.
+    local_jar_bytes = Path(LOCAL_JAR).stat().st_size
+    in_pod_size = kubectl_exec(pod, CONTAINER, ["wc", "-c", "/agent/leak-agent.jar"])
+    in_pod_bytes_str = in_pod_size.stdout.split()[0] if in_pod_size.stdout.split() else None
+    if in_pod_bytes_str is None or int(in_pod_bytes_str) != local_jar_bytes:
+        print(f"ABORT: in-pod jar size mismatch on the real new pod {pod} "
+              f"(expected {local_jar_bytes} bytes from this run's build, "
+              f"found {in_pod_bytes_str!r} at /agent/leak-agent.jar). The initContainer did "
+              f"not copy the freshly built jar -- do NOT trust this install. Inspect "
+              f"`kubectl logs {pod} -n {NAMESPACE} -c agent-jar-copy` before retrying. "
+              f"The real pre-install backup is still on disk -- run --rollback if needed.")
+        sys.exit(1)
+    print(f"  in-pod jar size confirmed matching this run's build ({local_jar_bytes} bytes).")
 
     front_end_result = run(["kubectl", "get", "pod", "-n", NAMESPACE, "-l", f"name={FRONT_END_LABEL}",
                              "-o", "jsonpath={.items[0].metadata.name}"])

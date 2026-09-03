@@ -790,6 +790,15 @@ MEMORY_LEAK_TARGET_MB = 300
 # of a 180s hold runs against a half-built leak. 120s covers the real ~58s with
 # margin for a slow/contended ramp; NOT an abort if it expires (see below).
 MEMORY_LEAK_SATURATION_MAX_S = 120
+# Real, live-measured floor for a genuinely clean/idle shipping pod's
+# post_gc_heap_mib (~40-48MiB per the 2026-08-21/22 baseline-capture design
+# notes). Used only as a soft warning line in _ensure_memory_leak_baseline's
+# pre-injection clean check -- a real reading above this after
+# state/allocated_mb/graph_slots all confirm clean means a stale pre-GC
+# value, not that the pod is actually still leaking. NOT a hard gate (never
+# ABORTs on it) -- same "warn, don't block a usable episode" reasoning as
+# the saturation wait below.
+MEMORY_LEAK_CLEAN_FLOOR_WARN_MIB = 60
 # GRAPH-mechanism params (2026-09-02, replacing ALLOCATE -- see wardence_worklog.md).
 # ALLOCATE's governed retained leak produced only a short-pause signal on prod's
 # stock G1GC; GRAPH (a dense, constantly-rewritten reference graph in old gen +
@@ -2142,26 +2151,91 @@ def _ensure_memory_leak_baseline(cfg: dict) -> None:
     if status is None:
         return  # agent not loaded/reachable -- same reasoning as above
 
+    # Real, live-confirmed bug (2026-09-03, episode b5586860 and a direct
+    # status check): state=IDLE/allocated_mb=0 was being treated as fully
+    # clean even with graph_slots>0 (GRAPH mode's actual leak structure,
+    # nulled by a separate thread -- see LeakAgent.java's graphLoop) still
+    # holding a stale graph, AND even after graph_slots genuinely reached 0
+    # -- post_gc_heap_mib could still report a pre-release value, since
+    # workerLoop's own System.gc() only ever fired for the static
+    # companion (allocatedBytes), never re-firing once that was already 0.
+    # Direct live check confirmed this in production: state=IDLE,
+    # allocated_mb=0, graph_slots=0, post_gc_heap_mib=225MiB against a real
+    # floor of ~40-48MiB -- a genuinely "clean" pod by the old check,
+    # contaminating the next episode's baseline by ~180MiB. Fixed at the
+    # root in LeakAgent.java (graphLoop now fires its own System.gc() the
+    # instant it actually nulls the backbone) -- this check is widened to
+    # match: also require graph_slots==0, and wait for a fresh
+    # post_gc_heap_mib reading near the known floor before declaring clean.
     state = status.get("state")
     allocated_mb = status.get("allocated_mb")
-    if state in ("IDLE", "READY") and allocated_mb in (None, "0"):
-        return  # already clean, the common case
+    graph_slots = status.get("graph_slots")
 
-    print(f"  {pod}'s leak agent is not clean before injecting (state={state}, "
-          f"allocated_mb={allocated_mb}) -- a prior episode likely didn't release cleanly "
-          f"(e.g. injector.py was killed mid-hold). Forcing RELEASE before proceeding...")
+    def _is_clean(s: dict[str, str]) -> bool:
+        return (
+            s.get("state") in ("IDLE", "READY")
+            and s.get("allocated_mb") in (None, "0")
+            and s.get("graph_slots") in (None, "0")
+        )
+
+    if _is_clean(status):
+        try:
+            post_gc = float(status.get("post_gc_heap_mib") or -1)
+        except ValueError:
+            post_gc = -1.0
+        if 0 <= post_gc <= MEMORY_LEAK_CLEAN_FLOOR_WARN_MIB:
+            return  # already clean, the common case
+        if post_gc < 0:
+            return  # GC-notification listener unavailable on this JDK build -- nothing more to check here
+        print(f"  {pod}'s leak agent reports state/allocated_mb/graph_slots clean, but "
+              f"post_gc_heap_mib={post_gc:.1f}MiB is still above the "
+              f"{MEMORY_LEAK_CLEAN_FLOOR_WARN_MIB}MiB expected-floor warning line -- likely a "
+              f"stale reading from before a prior release's confirming GC. Forcing one more "
+              f"RELEASE to get a fresh reading...")
+    else:
+        print(f"  {pod}'s leak agent is not clean before injecting (state={state}, "
+              f"allocated_mb={allocated_mb}, graph_slots={graph_slots}) -- a prior episode "
+              f"likely didn't release cleanly (e.g. injector.py was killed mid-hold). "
+              f"Forcing RELEASE before proceeding...")
+
     _leak_agent_send_cmd(pod, cfg["namespace"], cfg["container"], "RELEASE")
 
     for _ in range(10):
         time.sleep(1)
         status = _leak_agent_read_status(pod, cfg["namespace"], cfg["container"])
-        if status is not None and status.get("state") in ("IDLE", "READY") \
-                and status.get("allocated_mb") in (None, "0"):
-            print(f"  confirmed clean: state={status.get('state')}, allocated_mb={status.get('allocated_mb')}")
-            return
-    print("  WARNING: sent RELEASE but the agent's status never confirmed IDLE/allocated_mb=0 "
-          "within 10s -- proceeding anyway; the ramp step's own ABORT path will catch a real "
-          "problem if this leaves the agent in a genuinely bad state.")
+        if status is not None and _is_clean(status):
+            print(f"  confirmed clean: state={status.get('state')}, "
+                  f"allocated_mb={status.get('allocated_mb')}, graph_slots={status.get('graph_slots')}")
+            break
+    else:
+        print("  WARNING: sent RELEASE but the agent's status never confirmed "
+              "IDLE/allocated_mb=0/graph_slots=0 within 10s -- proceeding anyway; the ramp "
+              "step's own ABORT path will catch a real problem if this leaves the agent in a "
+              "genuinely bad state.")
+        return
+
+    # Real state confirmed clean -- now wait a further, short window for
+    # LeakAgent's own confirming System.gc() (fired the instant graphLoop
+    # nulled the backbone, see LeakAgent.java) to actually land a fresh
+    # post_gc_heap_mib reading. Best-effort: a WARNING, not an ABORT, if it
+    # doesn't settle -- same "don't block a usable episode over a soft
+    # timing target" reasoning as the saturation wait below.
+    for _ in range(10):
+        status = _leak_agent_read_status(pod, cfg["namespace"], cfg["container"])
+        if status is not None:
+            try:
+                post_gc = float(status.get("post_gc_heap_mib") or -1)
+            except ValueError:
+                post_gc = -1.0
+            if post_gc < 0 or post_gc <= MEMORY_LEAK_CLEAN_FLOOR_WARN_MIB:
+                print(f"  confirmed drained: post_gc_heap_mib={post_gc:.1f}MiB")
+                return
+        time.sleep(1)
+    print(f"  WARNING: state/allocated_mb/graph_slots confirmed clean, but post_gc_heap_mib "
+          f"never settled at/below {MEMORY_LEAK_CLEAN_FLOOR_WARN_MIB}MiB within 10s of the "
+          f"confirming RELEASE -- proceeding anyway. This episode's baseline capture may still "
+          f"be contaminated; check the captured memory_leak_baseline_heap_kb against the known "
+          f"~40-48MiB floor if this episode's diagnosis looks off.")
 
 
 def _clear_stale_oom_sticky_flag(cfg: dict):

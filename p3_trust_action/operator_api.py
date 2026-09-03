@@ -1760,6 +1760,35 @@ def trigger_live_status(episode_id: str, payload: dict = Depends(require_role("a
     if state_entered_at is not None:
         entered = datetime.datetime.fromisoformat(state_entered_at)
         elapsed_s = round((datetime.datetime.now(datetime.timezone.utc) - entered).total_seconds())
+
+    # Real fix (2026-09-03): `elapsed_in_state_s` above is time-since-
+    # entering "holding", which is stamped the instant injector.py's
+    # subprocess is launched (see _run_live_episode_inner) -- NOT the
+    # moment the real hold actually begins. For every class with a real
+    # settle/ramp/confirm phase before its hold (memory-leak's own
+    # saturation wait is the worst case, ~79s), the panel's counter looked
+    # up to 78s "ahead" of the real 180s hold. injector.py already writes a
+    # real epoch timestamp to the evidence file at exactly the moment each
+    # holding class's own verification first confirms the fault is at real
+    # strength (_write_evidence_file_once) -- operator_api.py already reads
+    # this same file for snapshot_at anchoring elsewhere in this module, so
+    # this reuses it rather than adding new plumbing. crash-loop is the one
+    # holding class with no evidence file (WRAPPER_POLLED_EVIDENCE_CLASSES)
+    # -- its own hold genuinely does begin the instant injection lands (see
+    # HOLDING_CLASSES's docstring), so elapsed_in_state_s is already
+    # correct for it and hold_started_at is left null.
+    hold_started_at = None
+    if state == "holding" and fault_class in EVIDENCE_FILE_CLASSES:
+        evidence_file = _evidence_file_path(episode_id)
+        if evidence_file.exists():
+            try:
+                evidence_epoch = float(evidence_file.read_text().strip())
+                hold_started_at = datetime.datetime.fromtimestamp(
+                    evidence_epoch, tz=datetime.timezone.utc
+                ).isoformat()
+            except (ValueError, OSError):
+                pass  # evidence file mid-write or unreadable -- leave hold_started_at null, harmless
+
     return {
         "episode_id": episode_id,
         "episode_state": state,
@@ -1801,6 +1830,7 @@ def trigger_live_status(episode_id: str, payload: dict = Depends(require_role("a
         # has a real duration to count down from.
         "hold_duration_s": LIVE_TRIGGER_DURATION_OVERRIDE_S.get(fault_class),
         "abandon_ceiling_s": ABANDON_CEILING_S,
+        "hold_started_at": hold_started_at,
     }
 
 
