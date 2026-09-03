@@ -103,7 +103,7 @@ export const STOREFRONT_SYMPTOM = {
   "network-latency": "Checkout stalls ~6s, then completes.",
   "network-partition": "Checkout hangs and never completes.",
   "connection-pool-exhaustion": "The catalogue / product pages fail intermittently.",
-  "session-cart-failure": "The home and catalogue pages load but show no product content.",
+  "session-cart-failure": "Signing in hangs and never completes.",
   "init-failure": "Checkout fails.",
   "memory-leak": "Checkout is delayed by roughly 2 seconds.",
 };
