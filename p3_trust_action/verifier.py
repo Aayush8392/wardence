@@ -185,48 +185,6 @@ def _restart_count(pod_name: str, namespace: str) -> int:
     return sum(int(float(entry["value"][1])) for entry in result)
 
 
-CRASH_LOOP_ROLLOUT_WAIT_TIMEOUT_S = 90
-
-
-def _wait_for_deployment_rollout(name: str, namespace: str, timeout_s: int = CRASH_LOOP_ROLLOUT_WAIT_TIMEOUT_S) -> bool:
-    """
-    Waits for a real, complete rollout via kubectl's own `rollout status`
-    -- reuses kubectl's built-in wait rather than reimplementing pod-count/
-    readiness polling, since this already IS the canonical way to wait for
-    a Deployment's rollout to genuinely finish (new ReplicaSet's pod(s)
-    Ready, old one gone).
-
-    REAL BUG FIXED (2026-07-27, confirmed via direct repro, not assumed):
-    restart_deployment (actions.py, crash-loop's fix) returns the instant
-    the API accepts the patch -- confirmed empirically: it returned in
-    0.06s, and the pod list was completely UNCHANGED immediately
-    afterward (same pod name/age); the real rollout (new pod created, old
-    one terminated) only finished several seconds later, confirmed
-    separately via `kubectl rollout status`. Without this wait,
-    _current_pod_name_live_with_retry (called right after the fix
-    returns, in verify_durability's crash-loop branch) can resolve to the
-    OLD, about-to-be-replaced pod: a single-replica rolling update can
-    still report a pod as Running right up until the instant it's
-    terminated, so this is NOT the zero-Running-pods gap that function's
-    own retry loop was built to survive. The durability check then binds
-    its baseline restart-count to the wrong pod's identity for its entire
-    window -- a real, timing-sensitive race (usually wins, occasionally
-    loses), matching the "0 demotions in one full run, 3 in the next"
-    pattern actually observed. Same root-cause class as disk-full/
-    under-provisioned-replicas/bad-rollout's own "API acceptance != real
-    completion" fixes -- crash-loop's restart_deployment was the one
-    action in the roster that had never gotten this wait added, until now.
-    Returns False on timeout rather than raising; caller decides how to
-    treat a rollout that couldn't be confirmed within a real margin.
-    """
-    result = subprocess.run(
-        ["kubectl", "rollout", "status", f"deployment/{name}", "-n", namespace, f"--timeout={timeout_s}s"],
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
-
-
 def _crash_loop_backoff_now(pod_name: str, namespace: str) -> bool:
     query = (
         f'kube_pod_container_status_waiting_reason{{namespace="{namespace}", '
@@ -716,12 +674,19 @@ def verify_durability(fault_class: str, target: str, namespace: str = "sock-shop
         # mis-resolution, undetected whenever the hash comparison
         # happened to still favor the right pod.
         #
-        # Real completion wait added 2026-07-27 -- see
-        # _wait_for_deployment_rollout's docstring for the confirmed bug
-        # this closes (restart_deployment returns before the rollout has
-        # even started, let alone finished, so pod_name below could
-        # otherwise resolve to the OLD pod being replaced).
-        _wait_for_deployment_rollout(target, namespace)
+        # A `kubectl rollout status deployment/{target} --timeout=90s`
+        # wait used to sit here (added 2026-07-27 to stop pod_name below
+        # resolving to the OLD pod while restart_deployment's rollout was
+        # still in flight). Removed 2026-09-04: under the warm-standby
+        # Model A design the crash-loop fix is a Service-selector flip to
+        # carts-warm, not a `carts` rollout, so waiting on `carts` was
+        # both pointless AND a guaranteed 90s timeout every episode
+        # (`carts`' real boot is 266-533s), coupling episode resolution
+        # to a cold start the warm-standby design exists to avoid. The
+        # original pod-identity race it guarded is already handled by
+        # _current_pod_name_live_with_retry on its own -- it excludes
+        # Terminating pods via deletionTimestamp and picks the newest by
+        # creationTimestamp, with its own 30s-max retry.
         pod_name = _current_pod_name_live_with_retry(target, namespace)
         baseline = _restart_count(pod_name, namespace)
         check_fn = _make_crash_loop_check(pod_name, baseline)
