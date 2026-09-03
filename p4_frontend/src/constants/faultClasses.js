@@ -86,6 +86,28 @@ export const CLASS_LABELS = {
   "session-cart-failure": "Session/Cart-store Failure",
 };
 
+// What a visitor can see for themselves on the real storefront while this
+// fault is live -- shown as a "verify it yourself" hint in the Operator
+// episode panel during an active episode. Phrasing is the real observed
+// symptom from the 2026-09-0x Oracle dashboard sweeps (wardence_worklog.md),
+// not the mechanism. `disk-full` has none by design (no synchronous
+// coupling to any user-facing path -- the panel shows the live-status
+// readout instead, see INVISIBLE_CLASSES).
+export const STOREFRONT_SYMPTOM = {
+  "crash-loop": "Add an item to your cart — it fails.",
+  oom: "The catalogue page is up and down — reload a few times and you'll hit both.",
+  "disk-full": null,
+  "cpu-throttling": "Signing in is noticeably delayed (~1s+).",
+  "under-provisioned-replicas": "The catalogue / product pages load slowly.",
+  "bad-rollout": "The storefront is down entirely.",
+  "network-latency": "Checkout stalls ~6s, then completes.",
+  "network-partition": "Checkout hangs and never completes.",
+  "connection-pool-exhaustion": "The catalogue / product pages fail intermittently.",
+  "session-cart-failure": "The home and catalogue pages load but show no product content.",
+  "init-failure": "Checkout fails.",
+  "memory-leak": "Checkout is delayed by roughly 2 seconds.",
+};
+
 // Real per-service groupings, derived directly from FAULT_TARGETS above --
 // not a separately-maintained list, so a target change can't silently
 // desync the two.

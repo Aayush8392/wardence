@@ -2,7 +2,8 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import { reasoningStreamUrl, fetchFaultStatus } from "../../api/operator";
 import { fetchEpisodes, fetchRadarDossier } from "../../api/r2";
 import { useTickingElapsed } from "../../hooks/useTickingElapsed";
-import { CLASS_LABELS, INVISIBLE_CLASSES } from "../../constants/faultClasses";
+import { CLASS_LABELS, INVISIBLE_CLASSES, STOREFRONT_SYMPTOM } from "../../constants/faultClasses";
+import { storefrontUrl as resolveStorefrontUrl } from "../../api/runtimeConfig";
 import LoadingDots from "../shared/LoadingDots";
 import RadarChart from "../charts/RadarChart";
 
@@ -304,6 +305,18 @@ export default function EpisodePanel({ faultClass, episodeId, live, token, onClo
 
   const currentProvider = providerLog[providerLog.length - 1];
 
+  // "Verify it yourself" hint -- only while the fault is genuinely still
+  // present on the storefront (injected, not yet being fixed). Skipped for
+  // the invisible class (disk-full), which has its own live-status readout.
+  const faultLiveNow = ["injecting", "holding", "awaiting_fix"].includes(episodeState);
+  const storefrontSymptom = STOREFRONT_SYMPTOM[faultClass];
+  const showStorefrontHint =
+    Boolean(episodeId) &&
+    faultLiveNow &&
+    !INVISIBLE_CLASSES.includes(faultClass) &&
+    Boolean(storefrontSymptom);
+  const storefrontHref = resolveStorefrontUrl();
+
   return (
     // Real docked-sidebar behavior on desktop (per explicit ask -- an
     // earlier `fixed` overlay covered grid cards behind it): at sm+ this
@@ -396,6 +409,27 @@ export default function EpisodePanel({ faultClass, episodeId, live, token, onClo
           terminal status. Phase-specific accents (ripple/handshake/
           resolution banner) render ABOVE the log, not instead of it. */}
       <div className="flex-1 min-h-0 flex flex-col p-4 overflow-y-auto">
+        {showStorefrontHint && (
+          <div className="mb-3 border border-warning-amber/40 bg-warning-amber/5 p-3">
+            <p className="font-label-caps text-[10px] text-warning-amber mb-1">
+              VERIFY ON THE STOREFRONT
+            </p>
+            <p className="font-data-mono text-[11px] text-on-surface leading-snug">
+              {storefrontSymptom}
+            </p>
+            {storefrontHref && (
+              <a
+                href={storefrontHref}
+                target="_blank"
+                rel="noreferrer"
+                className="inline-flex items-center gap-1 mt-2 font-label-caps text-[10px] text-primary hover:underline"
+              >
+                OPEN STOREFRONT
+                <span className="material-symbols-outlined text-[13px]">open_in_new</span>
+              </a>
+            )}
+          </div>
+        )}
         <p className="font-label-caps text-[10px] text-on-surface-variant mb-2">LLM REASONING</p>
 
         {phase === "idle" && !reasoningLog && (
