@@ -544,9 +544,27 @@ def main():
     # LLM's OWN believed class is already Dimension-A can_act; otherwise
     # it's a cheap local DB check and a no-op, not a real LLM call).
     llm_diag = (result.get("llm_result") or {}).get("llm_diagnosis")
+    # Ground-truth safety-net trigger, added 2026-09-03 (episode e40e4e24
+    # found the gap): the AUTHORITATIVE diagnosis (result["diagnosis"] --
+    # whichever of stub/LLM is actually driving production this episode,
+    # per the user's own explicit scope call) saying "none"/report-only
+    # used to mean /act was never even called, so p3_agent.py's own
+    # dispatch_gate-based cross-class redirect never got a chance to run
+    # -- that mechanism only ever fires on a WRONG proposed action, and a
+    # "none" call proposes nothing. DETERMINISTIC_ACTION_MAP membership
+    # is used only as a cheap local classification (report-only vs
+    # auto-fix, same roster as the real production ACTION_MAP -- see
+    # dispatch_gate.py's own docstring for why the two maps are never
+    # conflated for the actual dispatch decision, only here for "is it
+    # worth even calling /act"). p3_agent.py's own fresh trust_state/
+    # safety_hold check is what actually decides whether a real dispatch
+    # happens -- this only avoids a wasted round-trip when actual_class
+    # is itself report-only or a genuine "none" (the common case).
+    predicted_has_no_action = result.get("diagnosis") not in DETERMINISTIC_ACTION_MAP
+    ground_truth_worth_trying = predicted_has_no_action and actual_class in DETERMINISTIC_ACTION_MAP
     worth_calling_act = result.get("eligible_for_action") or (
         llm_diag is not None and llm_diag in DETERMINISTIC_ACTION_MAP
-    )
+    ) or ground_truth_worth_trying
     if worth_calling_act:
         act_req = {
             "target": target, "namespace": namespace,

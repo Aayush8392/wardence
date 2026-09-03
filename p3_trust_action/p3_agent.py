@@ -888,6 +888,64 @@ def act(req: ActRequest):
     # became independent of it, not real dispatch).
     mapping = ACTION_MAP.get(req.predicted)
     if mapping is None:
+        # Ground-truth safety net -- added 2026-09-03, closing a real gap
+        # found live (episode e40e4e24): dispatch_gate.py's existing
+        # cross-class redirect only ever fires when the agent proposed
+        # SOME action to redirect -- a "none"/report-only AUTHORITATIVE
+        # diagnosis proposes nothing at all, so a genuinely can_act class
+        # left completely unfixed on a wrong "none" call was structurally
+        # invisible to that mechanism, not a case it was ever built to
+        # cover. This is the direct extension: if ground truth itself is
+        # a real, currently-trusted auto-fix class, dispatch ITS real fix
+        # anyway -- same principle as dispatch_gate's redirect (diagnosis
+        # is scored exactly as wrong either way; this only changes what
+        # hits the cluster), just triggered by "nothing was proposed"
+        # instead of "the wrong thing was proposed". Never fires for a
+        # genuinely report-only class or a real "none" episode -- those
+        # have no ACTION_MAP entry for actual_class either, so this stays
+        # a no-op, matching the user's own explicit scope: only auto-fix
+        # ground truth gets this treatment, a report-only miss is just a
+        # wrong diagnosis, nothing more to correct.
+        if req.actual_class is not None and req.actual_class != req.predicted:
+            gt_mapping = ACTION_MAP.get(req.actual_class)
+            if gt_mapping is not None:
+                gt_fault_class, gt_action_name, gt_kwargs_fn = gt_mapping
+                gt_trust_state = get_trust_state(conn, gt_fault_class)
+                gt_safety_hold = get_safety_hold(conn, gt_fault_class)
+                if gt_trust_state["state"] == "can_act" and not gt_safety_hold["active"]:
+                    gt_params = gt_kwargs_fn(req.target, req.namespace)
+                    dispatch_gate.log_intervention(
+                        conn, req.episode_id, req.predicted, req.actual_class,
+                        "none", gt_action_name,
+                        f"ground-truth safety net: authoritative diagnosis {req.predicted!r} "
+                        f"proposed no action at all, but actual_class {req.actual_class!r} is "
+                        f"genuinely can_act -- dispatching its real fix directly, never scored "
+                        f"as an agent action.",
+                    )
+                    conn.close()
+                    action_fn = ALLOWED_ACTIONS[gt_action_name]
+                    action_result = action_fn(**gt_params)
+                    response["action_taken"] = gt_action_name
+                    response["action_result"] = action_result
+                    # Deliberately distinct from every agent-driven source
+                    # ("llm"/"stub"/"gate_substituted") -- this is an
+                    # operational backstop, never evidence the agent did
+                    # anything right. p3_scorer.py must never let this
+                    # value feed Dimension A/B/C promotion streaks.
+                    response["action_source"] = "ground_truth_safety_net"
+                    response["gate_substitution"] = {
+                        "predicted_class": req.predicted,
+                        "actual_class": req.actual_class,
+                        "proposed_tool": None,
+                        "proposed_params": None,
+                        "substituted_tool": gt_action_name,
+                        "substituted_params": gt_params,
+                        "reason": "ground_truth_safety_net: no action was proposed for a "
+                                  "report-only/none diagnosis, but the real fault is a "
+                                  "currently-trusted auto-fix class",
+                    }
+                    _maybe_flip_carts_warm(gt_action_name)
+                    return response
         conn.close()
         return response
 
