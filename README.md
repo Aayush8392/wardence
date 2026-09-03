@@ -61,3 +61,7 @@ deploy/              Oracle Cloud (ARM64) deployment scripts and runbook
 ```
 
 This is a solo portfolio project, not (yet) accepting contributions.
+
+## License
+
+[MIT](LICENSE)
