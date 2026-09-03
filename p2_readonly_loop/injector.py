@@ -2990,13 +2990,26 @@ def _verify_bad_rollout_effect(namespace: str) -> bool:
     return False
 
 
-def _inject_and_verify_bad_rollout(cfg: dict) -> bool:
+def _inject_and_verify_bad_rollout(cfg: dict, evidence_file: str | None = None) -> bool:
     """Patches front-end's image to a nonexistent tag via a strategic-
     merge kubectl patch, same mechanism class as init-failure/oom (a
     pod-template change that triggers a real RollingUpdate). Unlike
     init-failure (report-only, self-reverts), this is an AUTO-FIX
     class -- ground truth is left broken for the agent's own real fix
-    (rollback_deployment) to resolve later, no self-revert here."""
+    (rollback_deployment) to resolve later, no self-revert here.
+
+    evidence_file added 2026-09-03 -- real, live-confirmed bug (episode
+    e40e4e24): operator_api.py's snapshot_at used to be a blind t0+35s,
+    but front-end's own maxSurge:0%/maxUnavailable:100% rollout-strategy
+    patch (applied separately to make this class storefront-visible)
+    means the old pod must fully terminate before the new broken one is
+    even scheduled -- a real extra delay that can push the genuine
+    ImagePullBackOff past 35s, landing the diagnosis query's window
+    before any evidence existed and producing a "none" misdiagnosis
+    regardless of which diagnoser reads it (stub and LLM share the same
+    frozen tool_output). Writing the real confirmed-instant here lets
+    operator_api.py anchor snapshot_at to it instead, same fix already
+    applied for oom/disk-full/cpu-throttling."""
     _ensure_front_end_image_baseline(cfg)
     namespace = cfg["namespace"]
 
@@ -3006,6 +3019,7 @@ def _inject_and_verify_bad_rollout(cfg: dict) -> bool:
         _patch_front_end_image(cfg, FRONT_END_IMAGE_FAULT)
         verified = _verify_bad_rollout_effect(namespace)
         if verified:
+            _write_evidence_file_once(evidence_file)
             return True
         suffix = ", retrying" if attempt < MAX_INJECT_ATTEMPTS else ""
         print(f"  attempt {attempt}: ImagePullBackOff/ErrImagePull never appeared{suffix}")
@@ -5029,7 +5043,7 @@ def main():
                 cfg, stop_file=args.stop_file, evidence_file=args.evidence_file
             )
         elif fault_class == "bad-rollout":
-            verified = _inject_and_verify_bad_rollout(cfg)
+            verified = _inject_and_verify_bad_rollout(cfg, evidence_file=args.evidence_file)
             chaos_name = "manual-patch" if verified else None
         elif fault_class == "oom":
             # Real bug found 2026-08-06, live: oom and under-provisioned-

@@ -1211,7 +1211,7 @@ def _attempt_resolve(episode_id: str, triggered_by: str) -> bool:
     # snapshot_at = the evidence epoch exactly (settle_add = 0). Anything
     # a stale passive metric would show at that instant is irrelevant now
     # that the probe wins.
-    if fault_class in ("oom", "disk-full", "cpu-throttling", "network-latency", "network-partition"):
+    if fault_class in ("oom", "disk-full", "cpu-throttling", "network-latency", "network-partition", "bad-rollout"):
         evidence_file = _evidence_file_path(episode_id)
         settle_add = 0 if fault_class in ("network-latency", "network-partition") else SETTLE_SECONDS
         if evidence_file.exists():
@@ -1396,7 +1396,23 @@ def _run_live_episode_inner(episode_id: str, fault_class: str, cfg: dict) -> Non
     # purely so injector.py gets handed an --evidence-file path, for
     # _attempt_resolve's real-confirmation-timestamp fix below (2026-08-27),
     # not because it supports a hold/early-stop flow.
-    evidence_file_class = fault_class in EVIDENCE_FILE_CLASSES or fault_class == "disk-full"
+    # bad-rollout added 2026-09-03, same reasoning as disk-full: not a
+    # holding class (single-shot patch, no hold to interrupt), but needs
+    # --evidence-file so _attempt_resolve can anchor snapshot_at to the
+    # real evidence-confirmed instant instead of a blind t0+35s -- real,
+    # live-confirmed bug (episode e40e4e24): the maxSurge:0%/
+    # maxUnavailable:100% rollout-strategy patch (applied to make this
+    # class storefront-visible) means the old pod must fully terminate
+    # before the new broken one is even scheduled, a real extra delay
+    # that can push genuine ImagePullBackOff past the blind 35s settle --
+    # landing the diagnosis query's window before any evidence existed,
+    # producing a "none" misdiagnosis regardless of how much later the
+    # LLM (or the stub -- both read the same frozen tool_output) actually
+    # runs. Same root-cause shape already fixed for oom/disk-full/
+    # cpu-throttling, just never previously extended to this class.
+    evidence_file_class = (
+        fault_class in EVIDENCE_FILE_CLASSES or fault_class in ("disk-full", "bad-rollout")
+    )
 
     if fault_class == "memory-leak":
         _memory_leak_recency_wait(episode_id)
