@@ -271,3 +271,8 @@ p2_readonly_loop/check_shipping_synthetic_load_no_leak.sh
 p2_readonly_loop/check_shipping_requestcount_timing.sh
 p2_readonly_loop/ThreadPoolTimingProbe.java
 p3_trust_action/.venv/
+
+# Chaos primer — private, never shared (locked 2026-09-04/05), plus its local-server launcher
+wardence_chaos_primer.html
+read_primer.ps1
+read_primer.bat
